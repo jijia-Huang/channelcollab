@@ -1,0 +1,10 @@
+{
+  "name": "channelcollab",
+  "version": "0.1.1",
+  "description": "讓 Discord 上的人和 Bot 一起協作：每位成員一個 Bot，背後是自己電腦上的 Claude Code。內含設定精靈、頻道綁定、啟動／停止／狀態、協作守則與建 Bot 工具。",
+  "author": { "name": "channelcollab" },
+  "homepage": "https://github.com/jijia-Huang/channelcollab",
+  "repository": "https://github.com/jijia-Huang/channelcollab",
+  "license": "UNLICENSED",
+  "keywords": ["discord", "collaboration", "bot"]
+}

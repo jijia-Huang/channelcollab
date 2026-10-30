@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "bots": [
+    {
+      "botId": "100000000000000001",
+      "botName": "小明Bot",
+      "ownerName": "小明",
+      "ownerDiscordId": "200000000000000001",
+      "role": "engineer"
+    },
+    {
+      "botId": "100000000000000002",
+      "botName": "小華Bot",
+      "ownerName": "小華",
+      "ownerDiscordId": "200000000000000002",
+      "role": "planner"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+*.log
+*.stackdump
+
+# 本機實驗與測試資料，不進 repo
+sandbox/
+spike/
+
+# 名冊放在各人的 HOME，不放在 plugin 裡（防止誤加）
+plugin/roster.json
+
+# plugin/runtime/ 與 package-lock.json 要進 repo，不要加進來

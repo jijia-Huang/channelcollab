@@ -1,0 +1,12 @@
+{
+  "name": "channelcollab",
+  "owner": { "name": "channelcollab" },
+  "description": "channelcollab：多人 × 多 Bot 的 Discord 協作工具",
+  "plugins": [
+    {
+      "name": "channelcollab",
+      "source": "./plugin",
+      "description": "讓 Discord 上的人和 Bot 一起協作：每位成員一個 Bot，背後是自己電腦上的 Claude Code。"
+    }
+  ]
+}

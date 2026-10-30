@@ -1,0 +1,26 @@
+{
+  "name": "channelcollab",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Multi-user, multi-bot Discord collaboration for Claude Code",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "spike:hello": "tsx spike/sdk-hello.ts",
+    "start": "node --import tsx src/main.ts",
+    "stop": "node --import tsx src/stop.ts",
+    "build:plugin": "node scripts/build-plugin.mjs",
+    "test:plugin": "node plugin/scripts/channelcollab.mjs --self-test && node plugin/skills/create-bot/scripts/create-bot.mjs --self-test"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.314",
+    "discord.js": "^14.27.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
