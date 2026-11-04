@@ -74,14 +74,14 @@ function resolve(config2, channelId, ch, what) {
 
 // src/discord/bot.ts
 import {
-  ActionRowBuilder as ActionRowBuilder6,
-  ButtonBuilder as ButtonBuilder5,
-  ButtonStyle as ButtonStyle5,
+  ActionRowBuilder as ActionRowBuilder7,
+  ButtonBuilder as ButtonBuilder6,
+  ButtonStyle as ButtonStyle6,
   ChannelType,
   Client,
   Events,
   GatewayIntentBits,
-  MessageFlags as MessageFlags6,
+  MessageFlags as MessageFlags7,
   Partials,
   ThreadAutoArchiveDuration
 } from "discord.js";
@@ -475,6 +475,17 @@ function findSession(key, sessionId) {
   if (key !== DM_KEY) return state.threads[key]?.sessionId === sessionId ? state.threads[key] : void 0;
   return [state.dm, ...state.dmHistory ?? []].find((d) => d?.sessionId === sessionId);
 }
+var folderKey = (cwd) => path4.resolve(cwd).toLowerCase();
+function rememberSkills(cwd, items) {
+  const key = folderKey(cwd);
+  const prev = state.skills?.[key];
+  if (prev && JSON.stringify(prev.items) === JSON.stringify(items)) return;
+  state.skills = { ...state.skills ?? {}, [key]: { at: (/* @__PURE__ */ new Date()).toISOString(), items } };
+  saveState();
+}
+function skillsFor(cwd) {
+  return state.skills?.[folderKey(cwd)]?.items;
+}
 
 // src/discord/approvals-ui.ts
 import {
@@ -553,15 +564,16 @@ async function deliverCard(send, onDmError) {
 
 // src/discord/commands.ts
 var COMMANDS = {
-  help: { dmOnly: false, takesArg: false, desc: "\u5217\u51FA\u6307\u4EE4" },
-  clear: { dmOnly: true, takesArg: false, desc: "\u7D50\u675F\u76EE\u524D\u7684\u5C0D\u8A71\uFF0C\u4E0B\u4E00\u5247\u8A0A\u606F\u958B\u65B0\u7684" },
-  resume: { dmOnly: true, takesArg: false, desc: "\u5F9E\u6E05\u55AE\u9078\u4E00\u6BB5\u4EE5\u524D\u7684\u5C0D\u8A71\u63A5\u56DE\u4F86" },
-  stop: { dmOnly: false, takesArg: false, desc: "\u4E2D\u65B7 Claude \u6B63\u5728\u505A\u7684\u9019\u4E00\u8F2A\uFF08\u540C \u{1F6D1}\uFF09" },
-  status: { dmOnly: false, takesArg: false, desc: "\u5DE5\u4F5C\u76EE\u9304\u3001\u6A21\u578B\u3001\u6A21\u5F0F\u3001\u82B1\u8CBB\u3001\u4E0A\u4E0B\u6587\u548C\u984D\u5EA6" },
-  model: { dmOnly: false, takesArg: true, desc: "\u63DB\u6A21\u578B\uFF08haiku\uFF0Fsonnet\uFF0Fopus\uFF09\uFF0C\u4F8B\u5982 !model sonnet" },
-  plan: { dmOnly: false, takesArg: false, desc: "\u5207\u5230\u8A08\u756B\u6A21\u5F0F\uFF08\u53EA\u8A0E\u8AD6\u4E0D\u52D5\u624B\uFF09\uFF0C\u518D\u6253\u4E00\u6B21\u5207\u56DE" },
-  compact: { dmOnly: false, takesArg: false, desc: "\u58D3\u7E2E\u4E0A\u4E0B\u6587\uFF0C\u8B93\u5C0D\u8A71\u53EF\u4EE5\u7E7C\u7E8C" },
-  retry: { dmOnly: false, takesArg: false, desc: "\u628A\u4E0A\u4E00\u5247\u8A0A\u606F\u539F\u6A23\u91CD\u9001\u4E00\u6B21" }
+  help: { dmOnly: false, takesArg: false, private: true, desc: "\u5217\u51FA\u6307\u4EE4" },
+  clear: { dmOnly: true, takesArg: false, private: false, desc: "\u7D50\u675F\u76EE\u524D\u7684\u5C0D\u8A71\uFF0C\u4E0B\u4E00\u5247\u8A0A\u606F\u958B\u65B0\u7684" },
+  resume: { dmOnly: true, takesArg: false, private: true, desc: "\u5F9E\u6E05\u55AE\u9078\u4E00\u6BB5\u4EE5\u524D\u7684\u5C0D\u8A71\u63A5\u56DE\u4F86" },
+  stop: { dmOnly: false, takesArg: false, private: false, desc: "\u4E2D\u65B7 Claude \u6B63\u5728\u505A\u7684\u9019\u4E00\u8F2A\uFF08\u540C \u{1F6D1}\uFF09" },
+  status: { dmOnly: false, takesArg: false, private: true, desc: "\u5DE5\u4F5C\u76EE\u9304\u3001\u6A21\u578B\u3001\u6A21\u5F0F\u3001\u82B1\u8CBB\u3001\u4E0A\u4E0B\u6587\u548C\u984D\u5EA6" },
+  model: { dmOnly: false, takesArg: true, private: false, desc: "\u63DB\u6A21\u578B\uFF08haiku\uFF0Fsonnet\uFF0Fopus\uFF09", example: "sonnet" },
+  plan: { dmOnly: false, takesArg: false, private: false, desc: "\u5207\u5230\u8A08\u756B\u6A21\u5F0F\uFF08\u53EA\u8A0E\u8AD6\u4E0D\u52D5\u624B\uFF09\uFF0C\u518D\u7528\u4E00\u6B21\u5207\u56DE" },
+  compact: { dmOnly: false, takesArg: false, private: false, desc: "\u58D3\u7E2E\u4E0A\u4E0B\u6587\uFF0C\u8B93\u5C0D\u8A71\u53EF\u4EE5\u7E7C\u7E8C" },
+  retry: { dmOnly: false, takesArg: false, private: false, desc: "\u628A\u4E0A\u4E00\u5247\u8A0A\u606F\u539F\u6A23\u91CD\u9001\u4E00\u6B21" },
+  skill: { dmOnly: false, takesArg: true, private: false, desc: "\u57F7\u884C Claude Code \u7684 skill \u6216\u81EA\u8A02\u6307\u4EE4", example: "<\u540D\u7A31> [\u53C3\u6578]" }
 };
 var MODEL_CHOICES = [
   { alias: "haiku", label: "Haiku", note: "\u6700\u5FEB\u3001\u6700\u4FBF\u5B9C" },
@@ -572,7 +584,10 @@ function stripMentions(text) {
   return text.replace(/<@[!&]?\d+>/g, " ").replace(/\s+/g, " ").trim();
 }
 function parseCommand(text) {
-  const m = /^!([a-z]+)(?:\s+(\S+))?$/i.exec(stripMentions(text));
+  const clean = stripMentions(text);
+  const sk = /^!skill(?:\s+(\S+)(?:\s+(.+))?)?$/i.exec(clean);
+  if (sk) return { name: "skill", ...sk[1] !== void 0 ? { arg: sk[1] } : {}, ...sk[2] !== void 0 ? { rest: sk[2] } : {} };
+  const m = /^!([a-z]+)(?:\s+(\S+))?$/i.exec(clean);
   if (!m) return void 0;
   const name = m[1].toLowerCase();
   const spec = COMMANDS[name];
@@ -586,11 +601,93 @@ function normalizeModel(arg) {
   return /^claude-[a-z0-9.[\]-]+$/.test(a) ? a : void 0;
 }
 function helpText(kind) {
-  const lines = Object.entries(COMMANDS).filter(([, s]) => kind === "dm" || !s.dmOnly).map(([n, s]) => `\`!${n}\`\u3000${s.desc}`);
-  const who = kind === "dm" ? "" : "\n\u8A0E\u8AD6\u4E32\u88E1\u53EA\u6709 Bot \u7684\u4E3B\u4EBA\u6216\u63D0\u51FA\u9700\u6C42\u7684\u4EBA\u80FD\u7528\uFF1B`!clear`\u3001`!resume` \u53EA\u80FD\u5728\u79C1\u8A0A\u7528\u3002";
-  return `**\u6307\u4EE4**\uFF08\u8A0A\u606F\u53EA\u6253\u6307\u4EE4\u624D\u7B97\uFF0C\u5927\u5C0F\u5BEB\u90FD\u53EF\u4EE5\uFF09
-${lines.join("\n")}${who}`;
+  const lines = Object.entries(COMMANDS).filter(([, s]) => kind === "dm" || !s.dmOnly).map(([n, s]) => `\`/${n}\`${s.example ? ` ${s.example}` : ""}\u3000${s.desc}`);
+  const who = kind === "dm" ? "" : "\n\u8A0E\u8AD6\u4E32\u88E1\u53EA\u6709 Bot \u7684\u4E3B\u4EBA\u6216\u63D0\u51FA\u9700\u6C42\u7684\u4EBA\u80FD\u7528\uFF1B`/clear`\u3001`/resume` \u53EA\u80FD\u5728\u79C1\u8A0A\u7528\u3002";
+  return [
+    "**\u6307\u4EE4**\uFF1A\u6253 `/` \u6703\u8DF3\u51FA\u9078\u55AE\uFF0C\u540C\u4E00\u500B\u4F3A\u670D\u5668\u6709\u597D\u5E7E\u96BB Bot \u6642\uFF0C\u8ACB\u9078\u9019\u96BB Bot \u5E95\u4E0B\u7684\u6307\u4EE4\u3002",
+    "\u4E5F\u53EF\u4EE5\u6253 `!` \u958B\u982D\u7684\u5099\u7528\u5BEB\u6CD5\uFF08\u4F8B\u5982 `!model sonnet`\u3001`!skill <\u540D\u7A31> [\u53C3\u6578]`\uFF0C\u8A0A\u606F\u53EA\u6253\u6307\u4EE4\u624D\u7B97\uFF09\u3002",
+    ...lines,
+    "`/skill` \u7684\u540D\u7A31\u6703\u5F9E\u6E05\u55AE\u9078\uFF1B\u6E05\u55AE\u662F\u9019\u500B\u5DE5\u4F5C\u8CC7\u6599\u593E\u4E0A\u6B21\u958B\u5C0D\u8A71\u6642 Claude Code \u63D0\u4F9B\u7684 skill \u548C\u81EA\u8A02\u6307\u4EE4\uFF08\u9084\u6C92\u958B\u904E\u5C0D\u8A71\u6642\uFF0C\u5148\u50B3\u4E00\u5247\u8A0A\u606F\uFF09\u3002skill \u7528\u5230\u7684\u5DE5\u5177\u4E00\u6A23\u8981\u6309\u6B0A\u9650\u6309\u9215\u3002"
+  ].join("\n") + who;
 }
+var CHAT_INPUT = 1;
+var STRING = 3;
+var CONTEXT_GUILD = 0;
+var CONTEXT_BOT_DM = 1;
+var GUILD_INSTALL = 0;
+function slashDefinitions() {
+  return Object.entries(COMMANDS).map(([name, s]) => {
+    const def = {
+      type: CHAT_INPUT,
+      name,
+      description: s.desc.slice(0, 100),
+      contexts: s.dmOnly ? [CONTEXT_BOT_DM] : [CONTEXT_GUILD, CONTEXT_BOT_DM],
+      integration_types: [GUILD_INSTALL]
+    };
+    if (name === "model") {
+      def.options = [{ type: STRING, name: "name", description: "\u8981\u63DB\u6210\u7684\u6A21\u578B\uFF08\u4E0D\u9078\u5C31\u986F\u793A\u6309\u9215\uFF09", required: false, choices: MODEL_CHOICES.map((m) => ({ name: `${m.label}\uFF08${m.note}\uFF09`, value: m.alias })) }];
+    }
+    if (name === "skill") {
+      def.options = [
+        { type: STRING, name: "name", description: "skill \u6216\u81EA\u8A02\u6307\u4EE4\u7684\u540D\u7A31\uFF08\u5F9E\u6E05\u55AE\u9078\uFF09", required: true, autocomplete: true, max_length: 100 },
+        { type: STRING, name: "args", description: "\u8981\u4EA4\u7D66\u5B83\u7684\u53C3\u6578\uFF08\u9078\u586B\uFF09", required: false, max_length: 1500 }
+      ];
+    }
+    return def;
+  });
+}
+function commandFromSlash(name, options = {}) {
+  if (!(name in COMMANDS)) return void 0;
+  const n = name;
+  if (n === "model") return options.name ? { name: n, arg: options.name } : { name: n };
+  if (n === "skill") return { name: n, ...options.name ? { arg: options.name } : {}, ...options.args?.trim() ? { rest: options.args.trim() } : {} };
+  return { name: n };
+}
+function commandGate(f) {
+  if (f.locked) return "locked";
+  if (f.where === "dm") {
+    const a = dmAccess({ authorId: f.actorId, ownerId: f.ownerId, dmEnabled: !!f.dmEnabled });
+    if (a === "not-owner") return "dm-not-owner";
+    if (a === "disabled") return "dm-disabled";
+    if (!f.pinSet) return "dm-no-pin";
+    if (!f.pinUnlocked) return "dm-pin-needed";
+    return void 0;
+  }
+  if (!f.bound) return "unbound";
+  if (f.notAllowed) return "not-allowed";
+  if (f.where !== "thread") return "not-thread";
+  if (COMMANDS[f.cmd].dmOnly) return "dm-only";
+  if (!canAct("stop", f.actorId, { ownerId: f.ownerId, requesterId: f.requesterId })) return "not-actor";
+  return void 0;
+}
+function gateText(r, f) {
+  const c = `${f.slash ? "/" : "!"}${f.cmd}`;
+  switch (r) {
+    case "locked":
+      return "\u{1F512} \u5DF2\u9396\u5B9A\uFF08PIN \u8F38\u932F\u592A\u591A\u6B21\uFF09\u3002\u8ACB\u5728\u96FB\u8166\u4E0A\u57F7\u884C unlock \u6216\u91CD\u555F Bot \u89E3\u9664\u3002";
+    case "unbound":
+      return "\u9019\u500B\u983B\u9053\u6C92\u6709\u7D81\u5B9A\u9019\u96BB Bot\uFF0C\u6307\u4EE4\u53EA\u80FD\u5728\u7D81\u5B9A\u983B\u9053\u7684\u8A0E\u8AD6\u4E32\u88E1\uFF08\u6216\u79C1\u8A0A Bot\uFF09\u4F7F\u7528\u3002";
+    case "not-allowed":
+      return "\u4F60\u4E0D\u5728\u9019\u96BB Bot \u7684\u767D\u540D\u55AE\u88E1\uFF0C\u8ACB Bot \u7684\u4E3B\u4EBA\u628A\u4F60\u52A0\u9032\u540D\u518A\u3002";
+    case "not-thread":
+      return "\u6307\u4EE4\u8ACB\u5728\u8A0E\u8AD6\u4E32\u88E1\uFF08\u6216\u79C1\u8A0A Bot\uFF09\u4F7F\u7528\u3002";
+    case "dm-only":
+      return `\`${c}\` \u53EA\u80FD\u5728\u79C1\u8A0A Bot \u6642\u4F7F\u7528\u3002`;
+    case "not-actor": {
+      const names = [f.requesterId, f.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
+      return `\u53EA\u6709 ${names.join(" \u6216 ") || "Bot \u7684\u4E3B\u4EBA"} \u53EF\u4EE5\u5728\u9019\u500B\u8A0E\u8AD6\u4E32\u7528\u6307\u4EE4\u3002`;
+    }
+    case "dm-not-owner":
+      return "\u9019\u96BB Bot \u53EA\u63A5\u53D7\u4E3B\u4EBA\u79C1\u8A0A\u3002";
+    case "dm-disabled":
+      return "\u79C1\u8A0A\u672A\u958B\u555F\uFF1A\u8ACB\u5728\u96FB\u8166\u4E0A\u7528 /channelcollab:bind \u958B\u555F\u79C1\u8A0A\uFF08\u8981\u5148\u8A2D\u5B9A PIN\uFF09\u3002";
+    case "dm-no-pin":
+      return NO_PIN_TEXT;
+    case "dm-pin-needed":
+      return "\u{1F512} \u79C1\u8A0A\u8981\u5148\u8F38\u5165 PIN \u89E3\u9396\uFF0C\u89E3\u9396\u5F8C\u518D\u7528\u4E00\u6B21\u6307\u4EE4\u3002";
+  }
+}
+var NO_PIN_TEXT = "\u79C1\u8A0A\u8981\u5148\u8A2D\u5B9A PIN \u624D\u80FD\u7528\uFF1A\u8ACB\u5728\u96FB\u8166\u4E0A\u57F7\u884C channelcollab \u7684 set-pin\uFF08\u6216\u5728 Claude Code \u7528 /channelcollab:bind \u8A2D\u5B9A PIN\uFF09\u3002";
 function dmAccess(f) {
   if (!f.ownerId || f.authorId !== f.ownerId) return "not-owner";
   return f.dmEnabled ? "run" : "disabled";
@@ -949,6 +1046,44 @@ function recordRateLimit(info) {
 }
 function latestRateLimit() {
   return latestRate;
+}
+
+// src/runner/skills.ts
+var NAME = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$/;
+function validSkillName(name) {
+  return NAME.test(name);
+}
+function skillCatalog(offered, skills = [], terminal = []) {
+  const isSkill = new Set(skills);
+  const noTerminal = new Set(terminal);
+  const seen = /* @__PURE__ */ new Map();
+  for (const c of offered) {
+    if (!validSkillName(c.name) || noTerminal.has(c.name)) continue;
+    if (c.builtin && !isSkill.has(c.name)) continue;
+    if (!seen.has(c.name)) seen.set(c.name, { name: c.name, description: (c.description ?? "").trim(), hint: (c.argumentHint ?? "").trim() });
+  }
+  for (const s of skills) if (validSkillName(s) && !noTerminal.has(s) && !seen.has(s)) seen.set(s, { name: s, description: "", hint: "" });
+  return [...seen.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+var MAX_CHOICES = 25;
+var NO_LIST = "__none__";
+var NO_LIST_TEXT = "\u5148\u50B3\u4E00\u5247\u8A0A\u606F\u958B\u59CB\u5C0D\u8A71\uFF0C\u4E4B\u5F8C\u5C31\u80FD\u9078 skill";
+function skillChoices(list, typed) {
+  if (!list?.length) return [{ name: NO_LIST_TEXT, value: NO_LIST }];
+  const q = typed.trim().toLowerCase().replace(/^\//, "");
+  const score = (s) => !q ? 1 : s.name.toLowerCase().startsWith(q) ? 0 : s.name.toLowerCase().includes(q) ? 1 : s.description.toLowerCase().includes(q) ? 2 : 3;
+  return list.map((s) => ({ s, n: score(s) })).filter((x) => x.n < 3).sort((a, b) => a.n - b.n || a.s.name.localeCompare(b.s.name)).slice(0, MAX_CHOICES).map(({ s }) => {
+    const label = s.description ? `${s.name} \u2014 ${s.description.replace(/\s+/g, " ")}` : s.name;
+    return { name: label.length > 100 ? `${label.slice(0, 99)}\u2026` : label, value: s.name };
+  });
+}
+var MAX_SKILL_ARGS = 1500;
+function skillPrompt(list, name, args = "") {
+  if (!list?.length) return { ok: false, reason: "no-list" };
+  const n = name.trim().replace(/^\//, "");
+  if (n === NO_LIST || !validSkillName(n) || !list.some((s) => s.name === n)) return { ok: false, reason: "unknown" };
+  const a = args.replace(/\s+/g, " ").trim().slice(0, MAX_SKILL_ARGS);
+  return { ok: true, prompt: a ? `/${n} ${a}` : `/${n}` };
 }
 
 // src/runner/session.ts
@@ -1414,9 +1549,16 @@ var LiveSession = class {
       if (!this.model) {
         const cc = msg.mcp_servers.find((s) => s.name === "channelcollab");
         log(this.tag, `init after ${Date.now() - started} ms pid=${this.pid ?? "-"} session=${msg.session_id} model=${msg.model} mode=${msg.permissionMode} apiKeySource=${msg.apiKeySource} cc_version=${msg.claude_code_version} channelcollab=${cc?.status} replyListed=${msg.tools.includes(REPLY_TOOL)} skills=${msg.skills.length} plugins=${msg.plugins.length}`);
+        this.offered = { skills: msg.skills, terminal: msg.terminal_slash_commands ?? [] };
+        this.q.supportedCommands().then((list) => this.recordSkills(list)).catch((e) => {
+          log(this.tag, `supportedCommands failed (${e.message}); /skill lists the init skills only`);
+          this.recordSkills([]);
+        });
       }
       this.sessionId = msg.session_id;
       this.model = msg.model;
+    } else if (msg.type === "system" && msg.subtype === "commands_changed") {
+      this.recordSkills(msg.commands);
     } else if (msg.type === "rate_limit_event") {
       const info = msg.rate_limit_info;
       log(this.tag, `rate limit ${brief(info, 400)}`);
@@ -1442,6 +1584,14 @@ var LiveSession = class {
     } else if (msg.type === "result") {
       this.finishTurn(msg);
     }
+  }
+  /** What the init message said about skills; the /skill list is built from it and the command list. */
+  offered = { skills: [], terminal: [] };
+  /** Keep the /skill list for this folder (state.json), for autocomplete before the next session starts. */
+  recordSkills(list) {
+    const items = skillCatalog(list, this.offered.skills, this.offered.terminal);
+    rememberSkills(this.cwd, items);
+    log(this.tag, `skills for /skill: ${items.length} (${brief(items.map((s) => s.name).join(" "), 200)})`);
   }
   finishTurn(result, error) {
     const t = this.turn;
@@ -2233,7 +2383,7 @@ ${prompt}`;
       await status.set(turn.ok ? "done" : "failed");
       return;
     }
-    if (turn.ok && turn.replies === 0 && trigger.author.bot) {
+    if ((kind === "normal" || kind === "approved") && turn.ok && turn.replies === 0 && trigger.author.bot) {
       log("silent", `${c.key} no reply to bot ${trigger.author.username} ${brief(turn.lastText, 200)}`);
       await progressMessage?.delete().catch(() => {
       });
@@ -2478,14 +2628,13 @@ var modeName = (m) => MODE_NAMES[m] ?? m;
 var k = (n) => n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n);
 var menus = /* @__PURE__ */ new Map();
 var seq3 = 0;
-function remember(conv, who, candidates) {
+function remember(conv, who, slash, candidates) {
   const now = Date.now();
   for (const [id2, m] of menus) if (now - m.at > 15 * 60 * 1e3) menus.delete(id2);
   const id = `${now.toString(36)}${(++seq3).toString(36)}`;
-  menus.set(id, { conv, who, candidates, at: now });
+  menus.set(id, { conv, who, slash, candidates, at: now });
   return id;
 }
-var say = (message, content) => message.reply({ content, allowedMentions: { parse: [] } });
 async function applyModel(c, model) {
   const ts = convState(c);
   ts.model = model;
@@ -2521,11 +2670,20 @@ async function statusText(c) {
   ];
   return lines.join("\n");
 }
-async function queueTurn(c, message, who, prompt, kind) {
-  const status = new StatusReactions(message);
+async function queueTurn(c, io, who, prompt, kind, label) {
+  const trigger = await io.anchor(label);
+  const status = new StatusReactions(trigger);
   await status.set("received");
-  const { queued } = enqueue(c.key, () => runTurn(c, message, status, who, { prompt, kind }));
+  const { queued } = enqueue(c.key, () => runTurn(c, trigger, status, who, { prompt, kind }));
   if (queued) await status.set("waiting");
+}
+function skillListText(list, slash) {
+  if (!list?.length) return `${NO_LIST_TEXT}\u3002`;
+  const shown = list.slice(0, 40).map((s) => `\`${s.name}\`${s.hint ? ` ${s.hint}` : ""}${s.description ? `\u3000${s.description.replace(/\s+/g, " ").slice(0, 80)}` : ""}`);
+  const more = list.length > shown.length ? `
+\u2026\u9084\u6709 ${list.length - shown.length} \u500B` : "";
+  return `**\u53EF\u4EE5\u7528\u7684 skill\uFF0F\u81EA\u8A02\u6307\u4EE4**\uFF08${slash ? "`/skill` \u9078\u540D\u7A31" : "`!skill <\u540D\u7A31> [\u53C3\u6578]`"}\uFF09
+${shown.join("\n")}${more}`;
 }
 function resumeCandidates() {
   const config2 = loadConfig();
@@ -2542,40 +2700,37 @@ function resumeCandidates() {
   }
   return resumeList(out);
 }
-async function runCommand(cmd, c, message, who) {
+async function runCommand(cmd, c, io, who) {
   const ts = convState(c);
-  log("command", `${c.key} !${cmd.name}${cmd.arg ? ` ${cmd.arg}` : ""} by ${message.author.username}`);
+  const p = io.slash ? "/" : "!";
+  log("command", `${c.key} ${p}${cmd.name}${cmd.arg ? ` ${cmd.arg}` : ""}${cmd.rest ? ` ${brief(cmd.rest, 80)}` : ""} by ${io.actor.name}`);
   switch (cmd.name) {
     case "help":
-      await say(message, helpText(c.kind));
+      await io.tell(helpText(c.kind));
       return;
     case "status":
-      await say(message, await statusText(c));
+      await io.tell(await statusText(c));
       return;
     case "stop": {
       const s = liveSession(c.key);
-      if (s?.busy && await s.interrupt(message.author.displayName || message.author.username)) await message.react("\u23F9\uFE0F").catch(() => {
-      });
-      else await say(message, "\u76EE\u524D\u6C92\u6709\u5728\u57F7\u884C\u7684\u5DE5\u4F5C\u3002");
+      if (s?.busy && await s.interrupt(io.actor.name)) await io.ack("\u23F9\uFE0F", `\u23F9\uFE0F ${io.actor.name} \u505C\u6B62\u4E86\u9019\u4E00\u8F2A\u3002`);
+      else await io.tell("\u76EE\u524D\u6C92\u6709\u5728\u57F7\u884C\u7684\u5DE5\u4F5C\u3002");
       return;
     }
     case "model": {
       if (cmd.arg) {
         const model = normalizeModel(cmd.arg);
-        await say(message, model ? await applyModel(c, model) : `\u4E0D\u8A8D\u5F97\u300C${cmd.arg}\u300D\u3002\u53EF\u4EE5\u7528 haiku\u3001sonnet\u3001opus\u3002`);
+        if (model) await io.note(await applyModel(c, model));
+        else await io.tell(`\u4E0D\u8A8D\u5F97\u300C${cmd.arg}\u300D\u3002\u53EF\u4EE5\u7528 haiku\u3001sonnet\u3001opus\u3002`);
         return;
       }
-      const id = remember(c, who);
+      const id = remember(c, who, io.slash);
       const current = ts.model ?? effective(c, ts).model ?? "Claude Code \u9810\u8A2D";
-      await message.reply({
-        content: `\u76EE\u524D\u7684\u6A21\u578B\uFF1A**${current}**\u3002\u8981\u63DB\u6210\u54EA\u4E00\u500B\uFF1F`,
-        components: [
-          new ActionRowBuilder5().addComponents(
-            ...MODEL_CHOICES.map((m) => new ButtonBuilder4().setCustomId(`ccmd:model:${id}:${m.alias}`).setLabel(`${m.label}\uFF08${m.note}\uFF09`).setStyle(m.alias === current ? ButtonStyle4.Primary : ButtonStyle4.Secondary))
-          )
-        ],
-        allowedMentions: { parse: [] }
-      });
+      await io.tell(`\u76EE\u524D\u7684\u6A21\u578B\uFF1A**${current}**\u3002\u8981\u63DB\u6210\u54EA\u4E00\u500B\uFF1F`, [
+        new ActionRowBuilder5().addComponents(
+          ...MODEL_CHOICES.map((m) => new ButtonBuilder4().setCustomId(`ccmd:model:${id}:${m.alias}`).setLabel(`${m.label}\uFF08${m.note}\uFF09`).setStyle(m.alias === current ? ButtonStyle4.Primary : ButtonStyle4.Secondary))
+        )
+      ]);
       return;
     }
     case "plan": {
@@ -2587,36 +2742,50 @@ async function runCommand(cmd, c, message, who) {
           await s.setMode(mode);
         } catch (e) {
           log("command", `${c.key} setMode ${mode} failed: ${e.message}`);
-          await say(message, "\u26A0\uFE0F \u5207\u63DB\u5931\u6557\uFF0C\u6A21\u5F0F\u6C92\u6709\u6539\u8B8A\u3002");
+          await io.tell("\u26A0\uFE0F \u5207\u63DB\u5931\u6557\uFF0C\u6A21\u5F0F\u6C92\u6709\u6539\u8B8A\u3002");
           return;
         }
       }
       ts.plan = next || void 0;
       saveState();
-      await say(message, next ? `\u{1F4DD} \u5DF2\u5207\u5230\u8A08\u756B\u6A21\u5F0F\uFF1AClaude \u53EA\u8A0E\u8AD6\u3001\u4E0D\u6539\u6A94\u4E5F\u4E0D\u57F7\u884C\u6307\u4EE4\u3002\u518D\u6253\u4E00\u6B21 !plan \u5207\u56DE\uFF08${modeName(c.base.permissionMode)}\uFF09\u3002` : `\u25B6\uFE0F \u5DF2\u5207\u56DE${modeName(mode)}\uFF0CClaude \u53EF\u4EE5\u52D5\u624B\u4E86\u3002`);
+      await io.note(next ? `\u{1F4DD} \u5DF2\u5207\u5230\u8A08\u756B\u6A21\u5F0F\uFF1AClaude \u53EA\u8A0E\u8AD6\u3001\u4E0D\u6539\u6A94\u4E5F\u4E0D\u57F7\u884C\u6307\u4EE4\u3002\u518D\u7528\u4E00\u6B21 ${p}plan \u5207\u56DE\uFF08${modeName(c.base.permissionMode)}\uFF09\u3002` : `\u25B6\uFE0F \u5DF2\u5207\u56DE${modeName(mode)}\uFF0CClaude \u53EF\u4EE5\u52D5\u624B\u4E86\u3002`);
       return;
     }
     case "compact":
-      if (!ts.sessionId) return void await say(message, "\u9084\u6C92\u6709\u5C0D\u8A71\uFF0C\u4E0D\u9700\u8981\u58D3\u7E2E\u3002");
-      await queueTurn(c, message, who, "/compact", "compact");
+      if (!ts.sessionId) return void await io.tell("\u9084\u6C92\u6709\u5C0D\u8A71\uFF0C\u4E0D\u9700\u8981\u58D3\u7E2E\u3002");
+      await queueTurn(c, io, who, "/compact", "compact", `\u{1F5DC}\uFE0F ${io.actor.name} \u8981\u6C42\u58D3\u7E2E\u4E0A\u4E0B\u6587\u3002`);
       return;
     case "retry":
-      if (!ts.lastPrompt) return void await say(message, "\u6C92\u6709\u53EF\u4EE5\u91CD\u9001\u7684\u8A0A\u606F\u3002");
-      await queueTurn(c, message, who, ts.lastPrompt, "retry");
+      if (!ts.lastPrompt) return void await io.tell("\u6C92\u6709\u53EF\u4EE5\u91CD\u9001\u7684\u8A0A\u606F\u3002");
+      await queueTurn(c, io, who, ts.lastPrompt, "retry", `\u{1F501} ${io.actor.name} \u8981\u6C42\u628A\u4E0A\u4E00\u5247\u8A0A\u606F\u91CD\u9001\u4E00\u6B21\u3002`);
       return;
+    case "skill": {
+      const list = skillsFor(effective(c, ts).cwd);
+      if (!cmd.arg) return void await io.tell(skillListText(list, io.slash));
+      const r = skillPrompt(list, cmd.arg, cmd.rest);
+      if (!r.ok) {
+        log("command", `${c.key} ${p}skill ${brief(cmd.arg, 60)} refused (${r.reason})`);
+        await io.tell(r.reason === "no-list" ? `${NO_LIST_TEXT}\u3002` : `\u6C92\u6709\u53EB\u300C${cmd.arg.slice(0, 60)}\u300D\u7684 skill\u3002${io.slash ? "\u8ACB\u5F9E\u9078\u55AE\u9078\u4E00\u500B\u3002" : "\u6253 `!skill` \u770B\u6E05\u55AE\u3002"}`);
+        return;
+      }
+      ts.lastPrompt = r.prompt;
+      saveState();
+      await queueTurn(c, io, who, r.prompt, "skill", `\u{1F9E9} ${io.actor.name} \u57F7\u884C \`${r.prompt.slice(0, 200)}\``);
+      return;
+    }
     case "clear": {
-      if (liveSession(c.key)?.busy || isPending(c.key)) return void await say(message, "Claude \u9084\u5728\u8655\u7406\uFF0C\u5148\u6253 !stop \u505C\u4E0B\u4F86\uFF0C\u518D\u6253 !clear\u3002");
+      if (liveSession(c.key)?.busy || isPending(c.key)) return void await io.tell(`Claude \u9084\u5728\u8655\u7406\uFF0C\u5148\u7528 ${p}stop \u505C\u4E0B\u4F86\uFF0C\u518D\u7528 ${p}clear\u3002`);
       await release(c.key, "clear");
       switchDm();
-      await say(message, "\u{1F195} \u5DF2\u7D50\u675F\u76EE\u524D\u7684\u5C0D\u8A71\uFF08\u4E4B\u5F8C\u53EF\u4EE5\u7528 !resume \u63A5\u56DE\uFF09\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u958B\u65B0\u7684\u5C0D\u8A71\u3002");
+      await io.note(`\u{1F195} \u5DF2\u7D50\u675F\u76EE\u524D\u7684\u5C0D\u8A71\uFF08\u4E4B\u5F8C\u53EF\u4EE5\u7528 ${p}resume \u63A5\u56DE\uFF09\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u958B\u65B0\u7684\u5C0D\u8A71\u3002`);
       return;
     }
     case "resume": {
       const list = resumeCandidates();
-      if (!list.length) return void await say(message, "\u9084\u6C92\u6709\u53EF\u4EE5\u63A5\u56DE\u7684\u5C0D\u8A71\u3002");
+      if (!list.length) return void await io.tell("\u9084\u6C92\u6709\u53EF\u4EE5\u63A5\u56DE\u7684\u5C0D\u8A71\u3002");
       for (const cand of list) {
         if (cand.kind !== "thread" || getThread(cand.id)?.name) continue;
-        const ch = await message.client.channels.fetch(cand.id).catch(() => null);
+        const ch = await io.client.channels.fetch(cand.id).catch(() => null);
         if (ch && "name" in ch && ch.name) {
           cand.source = ch.name;
           if (!cand.summary || cand.summary.startsWith("\u8A0E\u8AD6\u4E32 ")) cand.summary = ch.name;
@@ -2624,19 +2793,33 @@ async function runCommand(cmd, c, message, who) {
         }
       }
       saveState();
-      const id = remember(c, who, list);
-      await message.reply({
-        content: "\u8981\u63A5\u56DE\u54EA\u4E00\u6BB5\u5C0D\u8A71\uFF1F\uFF08\u8A0E\u8AD6\u4E32\u7684\u5C0D\u8A71\u6703\u8907\u88FD\u4E00\u4EFD\u5206\u652F\u4F86\u63A5\uFF0C\u4E0D\u5F71\u97FF\u8A0E\u8AD6\u4E32\u672C\u8EAB\uFF09",
-        components: [
-          new ActionRowBuilder5().addComponents(
-            new StringSelectMenuBuilder3().setCustomId(`ccmd:resume:${id}`).setPlaceholder("\u9078\u4E00\u6BB5\u5C0D\u8A71").addOptions(list.map((cand, n) => ({ ...resumeOption(cand), value: String(n) })))
-          )
-        ],
-        allowedMentions: { parse: [] }
-      });
+      const id = remember(c, who, io.slash, list);
+      await io.tell("\u8981\u63A5\u56DE\u54EA\u4E00\u6BB5\u5C0D\u8A71\uFF1F\uFF08\u8A0E\u8AD6\u4E32\u7684\u5C0D\u8A71\u6703\u8907\u88FD\u4E00\u4EFD\u5206\u652F\u4F86\u63A5\uFF0C\u4E0D\u5F71\u97FF\u8A0E\u8AD6\u4E32\u672C\u8EAB\uFF09", [
+        new ActionRowBuilder5().addComponents(
+          new StringSelectMenuBuilder3().setCustomId(`ccmd:resume:${id}`).setPlaceholder("\u9078\u4E00\u6BB5\u5C0D\u8A71").addOptions(list.map((cand, n) => ({ ...resumeOption(cand), value: String(n) })))
+        )
+      ]);
       return;
     }
   }
+}
+function messageIO(message) {
+  const reply = async (content, components) => {
+    await message.reply({ content, ...components ? { components } : {}, allowedMentions: { parse: [] } });
+  };
+  return {
+    actor: { id: message.author.id, name: message.author.displayName || message.author.username },
+    client: message.client,
+    slash: false,
+    tell: reply,
+    note: reply,
+    ack: async (emoji) => void await message.react(emoji).catch(() => {
+    }),
+    anchor: async () => message
+  };
+}
+async function publicNote(c, content) {
+  await c.room.send({ content, allowedMentions: { parse: [] } }).catch((e) => log("command", `${c.key} note failed: ${e.message}`));
 }
 function isCommandInteraction(i) {
   return (i.isButton() || i.isStringSelectMenu()) && i.customId.startsWith("ccmd:");
@@ -2657,13 +2840,14 @@ async function handleCommandInteraction(i) {
     menus.delete(id);
     const text = await applyModel(m.conv, arg);
     await i.update({ content: text, components: [] });
+    if (m.slash) await publicNote(m.conv, `${text}\uFF08${i.user.displayName || i.user.username}\uFF09`);
     return;
   }
   if (what === "resume" && i.isStringSelectMenu()) {
     const pick = m.candidates?.[Number(i.values[0])];
     if (!pick) return;
     if (liveSession(DM_KEY)?.busy || isPending(DM_KEY)) {
-      await i.reply({ content: "Claude \u9084\u5728\u8655\u7406\uFF0C\u5148\u6253 !stop \u505C\u4E0B\u4F86\u518D\u63A5\u56DE\u3002", flags: MessageFlags5.Ephemeral });
+      await i.reply({ content: "Claude \u9084\u5728\u8655\u7406\uFF0C\u5148\u7528 /stop\uFF08\u6216 !stop\uFF09\u505C\u4E0B\u4F86\u518D\u63A5\u56DE\u3002", flags: MessageFlags5.Ephemeral });
       return;
     }
     menus.delete(id);
@@ -2671,6 +2855,7 @@ async function handleCommandInteraction(i) {
     try {
       const text = await resumeInto(i.client, pick);
       await i.editReply({ content: text });
+      if (m.slash) await publicNote(m.conv, text);
     } catch (e) {
       log("error", `resume ${pick.sessionId}: ${e.stack ?? e}`);
       await i.editReply({ content: `\u274C \u63A5\u56DE\u5931\u6557\uFF1A${e.message.slice(0, 200)}` });
@@ -2702,6 +2887,136 @@ async function resumeInto(_client, pick) {
   });
   log("command", `dm forked thread ${pick.id} session ${pick.sessionId} -> ${fork.sessionId} cwd=${pick.cwd}`);
   return `\u21A9\uFE0F \u5DF2\u5F9E\u8A0E\u8AD6\u4E32\u300C${pick.source}\u300D\u8907\u88FD\u4E00\u4EFD\u5C0D\u8A71\u63A5\u56DE\uFF08\u8A0E\u8AD6\u4E32\u672C\u8EAB\u4E0D\u53D7\u5F71\u97FF\uFF09\u3002\u5DE5\u4F5C\u76EE\u9304\uFF1A\`${pick.cwd}\`\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u804A\u3002`;
+}
+
+// src/discord/slash.ts
+import {
+  ActionRowBuilder as ActionRowBuilder6,
+  ButtonBuilder as ButtonBuilder5,
+  ButtonStyle as ButtonStyle5,
+  MessageFlags as MessageFlags6
+} from "discord.js";
+async function starterHuman(thread) {
+  const starter = await thread.fetchStarterMessage().catch(() => null);
+  return starter && !starter.author.bot ? starter.author.id : void 0;
+}
+async function threadWho(thread, ownerId) {
+  return { ownerId, requesterId: running.get(thread.id)?.requesterId ?? await starterHuman(thread) };
+}
+async function registerSlashCommands(client2) {
+  const defs = slashDefinitions();
+  try {
+    const r = await client2.application.commands.set(defs.map((d) => ({ toJSON: () => d })));
+    log("commands", `registered ${r.size} global slash commands: ${[...r.values()].map((c) => `/${c.name}`).join(" ")}`);
+  } catch (e) {
+    log("commands", `slash command registration failed: ${e.message}`);
+  }
+}
+async function place(i, cmd, config2, light = false) {
+  const me = i.client.user.id;
+  const ownerId = botOwner(config2.discord.owner_id, me);
+  const base = { cmd, actorId: i.user.id, ownerId, locked: pinGate.locked };
+  if (!i.inGuild()) {
+    let dm;
+    try {
+      dm = resolveDm(config2);
+    } catch (e) {
+      log("config", e.message);
+    }
+    const facts2 = { ...base, where: "dm", dmEnabled: !!dm, pinSet: pinGate.configured, pinUnlocked: pinGate.unlocked };
+    const ok = !commandGate(facts2);
+    const cwd = dm ? getDm().cwd ?? dm.cwd : void 0;
+    return { where: "dm", facts: facts2, who: { ownerId }, cwd, conv: ok && !light ? await convFor(i.client, DM_KEY) : void 0 };
+  }
+  const ch = i.channel ?? (light ? null : await i.client.channels.fetch(i.channelId).catch(() => null));
+  const inThread = !!ch?.isThread();
+  const baseId = inThread ? ch.parentId ?? "" : i.channelId;
+  let channel;
+  try {
+    channel = resolveChannel(config2, baseId);
+  } catch (e) {
+    log("config", e.message);
+  }
+  const bound = !!channel && (!config2.discord.guild_id || i.guildId === config2.discord.guild_id);
+  const notAllowed = config2.access.roster_only && !allowedTrigger(i.user.id, ownerId, loadRosterFile());
+  const who = inThread && bound && !notAllowed ? light ? { ownerId, requesterId: running.get(ch.id)?.requesterId } : await threadWho(ch, ownerId) : { ownerId };
+  const facts = { ...base, where: inThread ? "thread" : "channel", bound, notAllowed, requesterId: who.requesterId };
+  if (commandGate(facts) || !inThread || !channel) return { where: inThread ? "thread" : "channel", facts, who };
+  const thread = ch;
+  return { where: "thread", facts, who, cwd: channel.cwd, conv: { key: thread.id, kind: "thread", room: thread, base: channel, selfId: me } };
+}
+function slashIO(i) {
+  let answered = false;
+  const publicNote2 = async (content) => {
+    const m = await i.followUp({ content, allowedMentions: { parse: [] } });
+    return m;
+  };
+  return {
+    actor: { id: i.user.id, name: i.user.displayName || i.user.username },
+    client: i.client,
+    slash: true,
+    tell: async (content, components) => {
+      answered = true;
+      await i.editReply({ content, ...components ? { components } : {}, allowedMentions: { parse: [] } });
+    },
+    note: async (content) => void await publicNote2(content),
+    ack: async (_emoji, content) => void await publicNote2(content),
+    anchor: publicNote2,
+    // The ephemeral "thinking…" placeholder is removed when only public notes were posted.
+    finish: async () => {
+      if (!answered) await i.deleteReply().catch(() => {
+      });
+    }
+  };
+}
+function refusalText(r, p) {
+  return gateText(r, { cmd: p.facts.cmd, ownerId: p.who.ownerId, requesterId: p.who.requesterId, slash: true });
+}
+var unlockRow = () => new ActionRowBuilder6().addComponents(new ButtonBuilder5().setCustomId("dmunlock").setLabel("\u89E3\u9396").setEmoji("\u{1F513}").setStyle(ButtonStyle5.Primary));
+async function handleSlashCommand(i) {
+  if (i.applicationId !== i.client.application.id) return;
+  await i.deferReply({ flags: MessageFlags6.Ephemeral });
+  const cmd = commandFromSlash(i.commandName, { name: i.options.getString("name") ?? void 0, args: i.options.getString("args") ?? void 0 });
+  if (!cmd) return void await i.editReply({ content: "\u9019\u96BB Bot \u4E0D\u8A8D\u5F97\u9019\u500B\u6307\u4EE4\u3002" });
+  let config2;
+  try {
+    config2 = loadConfig();
+  } catch (e) {
+    log("config", e.message);
+    return void await i.editReply({ content: "Bot \u7684\u8A2D\u5B9A\u6A94\u8B80\u4E0D\u5230\uFF0C\u8ACB\u4E3B\u4EBA\u5728\u96FB\u8166\u4E0A\u7528 /channelcollab:status \u6AA2\u67E5\u3002" });
+  }
+  const p = await place(i, cmd.name, config2);
+  const refusal = commandGate(p.facts);
+  if (refusal) {
+    log("command", `/${cmd.name} refused ${i.user.username} (${i.user.id}) ${refusal} channel=${i.channelId ?? "dm"}`);
+    await i.editReply({ content: refusalText(refusal, p), ...refusal === "dm-pin-needed" ? { components: [unlockRow()] } : {}, allowedMentions: { parse: [] } });
+    return;
+  }
+  if (!p.conv) return void await i.editReply({ content: "\u627E\u4E0D\u5230\u9019\u6BB5\u5C0D\u8A71\uFF0C\u8ACB\u7A0D\u5F8C\u518D\u8A66\u3002" });
+  if (p.conv.kind === "thread") {
+    const thread = p.conv.room;
+    if (!getThread(thread.id)) {
+      registerThread(thread.id, thread.parentId ?? "", thread.name);
+      log("thread", `adopted ${thread.id} "${thread.name}" (slash command)`);
+    }
+  }
+  const who = p.where === "dm" ? { ownerId: p.who.ownerId } : { ownerId: p.who.ownerId, requesterId: i.user.id === p.who.ownerId ? p.who.requesterId : i.user.id };
+  const io = slashIO(i);
+  await runCommand(cmd, p.conv, io, who);
+  await io.finish();
+}
+async function handleSlashAutocomplete(i) {
+  if (i.applicationId !== i.client.application.id || i.commandName !== "skill") return;
+  let config2;
+  try {
+    config2 = loadConfig();
+  } catch {
+    return void await i.respond([]);
+  }
+  const p = await place(i, "skill", config2, true);
+  const r = commandGate(p.facts);
+  if (r && r !== "not-actor" || !p.cwd) return void await i.respond([]);
+  await i.respond(skillChoices(skillsFor(p.cwd), String(i.options.getFocused() ?? "")));
 }
 
 // src/discord/bot.ts
@@ -2738,10 +3053,6 @@ async function threadHops(thread, trigger, maxHops) {
     before = batch.at(-1).id;
   }
 }
-async function starterHuman(thread) {
-  const starter = await thread.fetchStarterMessage().catch(() => null);
-  return starter && !starter.author.bot ? starter.author.id : void 0;
-}
 function createBot() {
   const client2 = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
@@ -2765,6 +3076,9 @@ function createBot() {
     const dm = config2 && resolveDm(config2);
     log("dm", `intent DirectMessages on; ${dm ? `dm configured cwd=${dm.cwd} mode=${dm.permissionMode} model=${dm.model ?? "-"} launcher=${dm.launcher || "builtin"}${pinGate.configured ? "" : " (closed until a PIN is set)"}` : "dm not configured (direct messages closed)"}`);
     log("security", `pin=${pinGate.configured ? "set" : "not set"} unlock_minutes=${config2?.security.pin_unlock_minutes ?? "-"} roster_only=${config2?.access.roster_only ?? "-"} owner_wait_minutes=${config2?.defaults.owner_wait_minutes ?? "-"}`);
+    const channels = Object.keys(config2?.channels ?? {}).length;
+    log("mode", channels && dm ? `channels (${channels}) and direct messages` : channels ? `channels only (${channels})` : dm ? "direct messages only (no channel bound)" : "nothing configured: bind a channel or turn on direct messages");
+    void registerSlashCommands(c);
   });
   client2.on(Events.InteractionCreate, (i) => {
     onInteraction(i).catch((e) => log("error", `interaction ${"customId" in i ? i.customId : i.type}: ${e.stack ?? e}`));
@@ -2772,7 +3086,9 @@ function createBot() {
   return client2;
 }
 async function onInteraction(i) {
-  if (i.isButton() && isDetailsButton(i.customId)) {
+  if (i.isChatInputCommand()) await handleSlashCommand(i);
+  else if (i.isAutocomplete()) await handleSlashAutocomplete(i);
+  else if (i.isButton() && isDetailsButton(i.customId)) {
     log("details", `${i.customId} clicked by ${i.user.username}`);
     await handleDetailsClick(i);
   } else if (isPromptInteraction(i)) await handlePromptInteraction(i);
@@ -2829,7 +3145,7 @@ async function onMessage(message) {
   }
   const cmd = fromBot ? void 0 : parseCommand(message.content);
   if (cmd && decision.action === "open-thread") {
-    await message.reply({ content: "\u6307\u4EE4\u8ACB\u5728\u8A0E\u8AD6\u4E32\u88E1\uFF08\u6216\u79C1\u8A0A Bot\uFF09\u4F7F\u7528\u3002", allowedMentions: { parse: [] } });
+    await message.reply({ content: gateText("not-thread", { cmd: cmd.name }), allowedMentions: { parse: [] } });
     return;
   }
   let thread;
@@ -2880,18 +3196,14 @@ async function onMessage(message) {
   }
 }
 async function threadCommand(cmd, conv, thread, message, ownerId) {
-  if (COMMANDS[cmd.name].dmOnly) {
-    await message.reply({ content: `\`!${cmd.name}\` \u53EA\u80FD\u5728\u79C1\u8A0A Bot \u6642\u4F7F\u7528\u3002`, allowedMentions: { parse: [] } });
+  const who = await threadWho(thread, ownerId);
+  const refusal = commandGate({ cmd: cmd.name, where: "thread", actorId: message.author.id, ownerId, locked: pinGate.locked, bound: true, notAllowed: false, requesterId: who.requesterId });
+  if (refusal) {
+    log("command", `${conv.key} !${cmd.name} refused ${message.author.username} (${refusal})`);
+    await message.reply({ content: gateText(refusal, { cmd: cmd.name, ownerId, requesterId: who.requesterId }), allowedMentions: { parse: [] } });
     return;
   }
-  const who = { ownerId, requesterId: running.get(conv.key)?.requesterId ?? await starterHuman(thread) };
-  if (!canAct("stop", message.author.id, who)) {
-    log("command", `${conv.key} !${cmd.name} refused ${message.author.username}`);
-    const names = [who.requesterId, who.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
-    await message.reply({ content: `\u53EA\u6709 ${names.join(" \u6216 ") || "Bot \u7684\u4E3B\u4EBA"} \u53EF\u4EE5\u5728\u9019\u500B\u8A0E\u8AD6\u4E32\u7528\u6307\u4EE4\u3002`, allowedMentions: { parse: [] } });
-    return;
-  }
-  await runCommand(cmd, conv, message, { ownerId, requesterId: message.author.id === ownerId ? who.requesterId : message.author.id });
+  await runCommand(cmd, conv, messageIO(message), { ownerId, requesterId: message.author.id === ownerId ? who.requesterId : message.author.id });
 }
 var refused = /* @__PURE__ */ new Map();
 var held = [];
@@ -2935,7 +3247,7 @@ async function onDirectMessage(message) {
   }
   if (!pinGate.configured) {
     log("ignore", `${message.id} dm-no-pin`);
-    return answer("\u79C1\u8A0A\u8981\u5148\u8A2D\u5B9A PIN \u624D\u80FD\u7528\uFF1A\u8ACB\u5728\u96FB\u8166\u4E0A\u57F7\u884C channelcollab \u7684 set-pin\uFF08\u6216\u96D9\u64CA\u684C\u9762\u7684\u300C\u8A2D\u5B9A channelcollab PIN.bat\u300D\uFF09\u3002");
+    return answer(NO_PIN_TEXT);
   }
   if (!pinGate.unlocked) {
     if (held.length < HELD_MAX) held.push(message);
@@ -2946,7 +3258,7 @@ async function onDirectMessage(message) {
       unlockPrompted = Date.now();
       await room.send({
         content: `\u{1F512} \u79C1\u8A0A\u8981\u5148\u8F38\u5165 PIN \u89E3\u9396\uFF08\u89E3\u9396\u5F8C ${config2.security.pin_unlock_minutes} \u5206\u9418\u5167\u4E0D\u7528\u518D\u8F38\u5165\uFF09\u3002\u525B\u525B\u7684\u8A0A\u606F\u6703\u5728\u89E3\u9396\u5F8C\u63A5\u8457\u8655\u7406\u3002`,
-        components: [new ActionRowBuilder6().addComponents(new ButtonBuilder5().setCustomId("dmunlock").setLabel("\u89E3\u9396").setEmoji("\u{1F513}").setStyle(ButtonStyle5.Primary))]
+        components: [new ActionRowBuilder7().addComponents(new ButtonBuilder6().setCustomId("dmunlock").setLabel("\u89E3\u9396").setEmoji("\u{1F513}").setStyle(ButtonStyle6.Primary))]
       });
     }
     return;
@@ -2959,7 +3271,7 @@ async function handleDm(message, dm, ownerId) {
   const conv = { key: DM_KEY, kind: "dm", room, base: dm, selfId: message.client.user.id };
   const who = { ownerId };
   const cmd = parseCommand(message.content);
-  if (cmd) return runCommand(cmd, conv, message, who);
+  if (cmd) return runCommand(cmd, conv, messageIO(message), who);
   log("trigger", `${message.id} dm author=${message.author.username} text=${brief(message.content, 120)}`);
   const status = new StatusReactions(message);
   await status.set("received");
@@ -2974,11 +3286,11 @@ async function handleDmUnlock(i) {
   const config2 = loadConfig();
   const ownerId = botOwner(config2.discord.owner_id, i.client.user.id);
   if (!canAct("permission", i.user.id, { ownerId })) {
-    await i.reply({ content: "\u53EA\u6709 Bot \u7684\u4E3B\u4EBA\u53EF\u4EE5\u89E3\u9396\u3002", flags: MessageFlags6.Ephemeral });
+    await i.reply({ content: "\u53EA\u6709 Bot \u7684\u4E3B\u4EBA\u53EF\u4EE5\u89E3\u9396\u3002", flags: MessageFlags7.Ephemeral });
     return;
   }
   if (pinGate.locked) {
-    await i.reply({ content: LOCKED_REPLY, flags: MessageFlags6.Ephemeral });
+    await i.reply({ content: LOCKED_REPLY, flags: MessageFlags7.Ephemeral });
     return;
   }
   if (i.isButton()) {

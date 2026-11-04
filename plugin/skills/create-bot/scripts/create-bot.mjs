@@ -298,13 +298,17 @@ export function upsertRoster(file, entry) {
 //   https://discord.com/oauth2/authorize?client_id=…&scope=bot%20applications.commands&permissions=…
 //   guild_id 預先選好伺服器；disable_guild_select=true 讓使用者不能改；integration_type=0 為安裝到伺服器
 // ---------------------------------------------------------------------------
-export function buildInviteUrl({ applicationId, guildId, lockGuild = false }) {
+// 只給自己私訊用（--dm-only）：私訊不受伺服器權限控制，Bot 只要和主人在同一個伺服器
+// （例如主人自己建的私人伺服器）就能收發私訊，所以權限整數是 0；scope 一樣要 bot（才有 Bot 使用者
+// 和共同伺服器）與 applications.commands（斜線指令；bot scope 本來就自動包含，寫明比較清楚）。
+// 之後要在那個伺服器綁頻道，再用一般的邀請網址重新邀請一次就好（不會踢掉 Bot）。
+export function buildInviteUrl({ applicationId, guildId, lockGuild = false, dmOnly = false }) {
   if (!isSnowflake(applicationId)) throw new CliError(`Application ID 格式不對：${applicationId}`);
   if (guildId !== undefined && !isSnowflake(guildId)) throw new CliError(`伺服器 ID 格式不對：${guildId}`);
   const url = new URL('https://discord.com/oauth2/authorize');
   url.searchParams.set('client_id', applicationId);
   url.searchParams.set('scope', 'bot applications.commands');
-  url.searchParams.set('permissions', permissionInteger().toString());
+  url.searchParams.set('permissions', dmOnly ? '0' : permissionInteger().toString());
   url.searchParams.set('integration_type', '0');
   if (guildId) {
     url.searchParams.set('guild_id', guildId);
@@ -684,8 +688,12 @@ async function cmdInvite(opts) {
     const { token } = loadToken(opts);
     ({ app: { id: applicationId } } = await fetchIdentity(token));
   }
-  const url = buildInviteUrl({ applicationId, guildId: opts['guild-id'], lockGuild: !!opts['lock-guild'] });
-  printPermissions();
+  const dmOnly = !!opts['dm-only'];
+  const url = buildInviteUrl({ applicationId, guildId: opts['guild-id'], lockGuild: !!opts['lock-guild'], dmOnly });
+  if (dmOnly) {
+    console.log('只給自己私訊用：權限整數 0（私訊不需要伺服器權限，只要和 Bot 在同一個伺服器）。');
+    console.log('授權頁選「你自己的伺服器」（沒有的話先在 Discord 按「＋ 新增伺服器 → 自己建立 → 給我和我的朋友」建一個）。');
+  } else printPermissions();
   console.log(`\n邀請網址：\n${url}`);
 }
 
@@ -806,6 +814,13 @@ async function selfTest() {
     const u = new URL(buildInviteUrl({ applicationId: APP, guildId: GUILD, lockGuild: true }));
     eq(u.searchParams.get('guild_id'), GUILD);
     eq(u.searchParams.get('disable_guild_select'), 'true');
+  });
+  await t('只給自己私訊用：權限 0，scope 一樣是 bot applications.commands', () => {
+    const u = new URL(buildInviteUrl({ applicationId: APP, dmOnly: true }));
+    eq(u.searchParams.get('permissions'), '0');
+    eq(u.searchParams.get('scope'), 'bot applications.commands');
+    eq(u.searchParams.get('integration_type'), '0');
+    eq(u.searchParams.has('guild_id'), false, '由使用者在授權頁選自己的伺服器');
   });
   await t('ID 格式錯誤會拒絕', () => {
     throws(() => buildInviteUrl({ applicationId: 'abc' }), /Application ID/);
@@ -1067,8 +1082,8 @@ const HELP = `用法：node create-bot.mjs <子命令> [選項]
                                                       把交付檔的 token、主人 ID 匯入自己的 HOME（名冊用合併）
   verify [--config <path> | --handoff <檔> | --from-clipboard]
          [--guild-id <id>] [--team-id <id>] [--json] 檢查 Bot 設定
-  invite (--app-id <id> | token 來源) [--guild-id <id>] [--lock-guild]
-                                                      產生邀請網址
+  invite (--app-id <id> | token 來源) [--guild-id <id>] [--lock-guild] [--dm-only]
+                                                      產生邀請網址（--dm-only：只給自己私訊用，權限 0）
   roster --owner-name <名稱> --owner-id <Discord ID> --role engineer|planner
          [--bot-id <id> --bot-name <名稱> --app-id <id> | token 來源] [--roster <path>] [--print]
                                                       寫進自己的名冊；token 來源是 --handoff 時，

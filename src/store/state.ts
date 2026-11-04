@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import path from 'node:path';
 import { DATA_DIR } from '../config.js';
 import type { Batch } from '../runner/approvals.js';
+import type { SkillItem } from '../runner/skills.js';
 
 export const STATE_PATH = path.join(DATA_DIR, 'state.json');
 
@@ -53,7 +54,10 @@ export type ThreadState = {
 /** A direct-message conversation. `cwd` is set when it continues a thread's session (that thread's folder). */
 export type DmState = ThreadState & { cwd?: string; source?: string };
 
-type State = { threads: Record<string, ThreadState>; dm?: DmState; dmHistory?: DmState[]; approvals?: Record<string, Batch> };
+/** The /skill list last reported by a session, per working folder. */
+type SkillList = { at: string; items: SkillItem[] };
+
+type State = { threads: Record<string, ThreadState>; dm?: DmState; dmHistory?: DmState[]; approvals?: Record<string, Batch>; skills?: Record<string, SkillList> };
 
 /** Key of the direct-message conversation in the session pool, the queue and the inbox. */
 export const DM_KEY = 'dm';
@@ -138,4 +142,20 @@ export function findSession(key: string, sessionId: string | undefined): ThreadS
   if (!sessionId) return undefined;
   if (key !== DM_KEY) return state.threads[key]?.sessionId === sessionId ? state.threads[key] : undefined;
   return [state.dm, ...(state.dmHistory ?? [])].find((d) => d?.sessionId === sessionId);
+}
+
+const folderKey = (cwd: string) => path.resolve(cwd).toLowerCase();
+
+/** Remember the skills a session in `cwd` offers (the latest list wins). Saves when it changed. */
+export function rememberSkills(cwd: string, items: SkillItem[]): void {
+  const key = folderKey(cwd);
+  const prev = state.skills?.[key];
+  if (prev && JSON.stringify(prev.items) === JSON.stringify(items)) return;
+  state.skills = { ...(state.skills ?? {}), [key]: { at: new Date().toISOString(), items } };
+  saveState();
+}
+
+/** The skills last seen for `cwd`, or undefined before any session ran there. */
+export function skillsFor(cwd: string): SkillItem[] | undefined {
+  return state.skills?.[folderKey(cwd)]?.items;
 }

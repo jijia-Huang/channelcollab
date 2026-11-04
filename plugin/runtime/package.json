@@ -1,6 +1,6 @@
 {
   "name": "channelcollab-runtime",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "private": true,
   "description": "channelcollab Bot 的執行環境（由 scripts/build-plugin.mjs 產生，不要手動修改）",
   "type": "module",

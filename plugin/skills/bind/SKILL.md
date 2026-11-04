@@ -7,7 +7,7 @@ allowed-tools: Bash(node:*), PowerShell(node:*)
 
 # 頻道綁定
 
-Bot 只回應綁定過的頻道（以及這些頻道底下的討論串、論壇貼文）。綁定存在 `<HOME>\config.json` 的 `channels`，**只透過下面的總控腳本修改**。config.json 裡有 Bot token：**不要用 Read、cat、Get-Content 等任何方式打開它，也不要手動編輯。**
+Bot 只回應綁定過的頻道（以及這些頻道底下的討論串、論壇貼文），和主人的私訊。**只用私訊的人不需要綁任何頻道**；之後想加入團隊頻道，在這裡綁頻道就好，不用重新 setup（Bot 要先被邀進那個伺服器：團隊伺服器請管理員邀；是自己的伺服器就用 `/channelcollab:create-bot` 產生一般的邀請網址重邀一次，不會踢掉 Bot）。綁定存在 `<HOME>\config.json` 的 `channels`，**只透過下面的總控腳本修改**。config.json 裡有 Bot token：**不要用 Read、cat、Get-Content 等任何方式打開它，也不要手動編輯。**
 
 ```
 node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind <選項>
@@ -67,10 +67,12 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind --dm --cwd "<工作�
 node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind --dm --remove
 ```
 
-- 工作資料夾沒指定時，建議用第一個綁定頻道的資料夾（先 `bind --list` 看）。
+- 工作資料夾沒指定時，建議用第一個綁定頻道的資料夾（先 `bind --list` 看）；只用私訊、沒有頻道時，請使用者指定（沒有特定資料夾就在「文件」底下建一個 `channelcollab-work`）。
+- 主人和 Bot 要有**共同的伺服器**，主人才能私訊 Bot（Discord 的限制；只有自己一個人的私人伺服器也可以）。
 - 只有主人能私訊；**沒設 PIN 時私訊不開放**。`bind --list` 會提醒；還沒設就請使用者執行下方的 set-pin。
 - 一樣不允許 `bypassPermissions`。
-- 告訴使用者：私訊等於在遠端操作自己的電腦，Discord 帳號務必開兩步驟驗證。
+- 告訴使用者：只有主人能用；私訊等於在遠端操作自己的電腦；Discord 帳號務必開兩步驟驗證。
+- 私訊裡打 `/` 會跳出這隻 Bot 的指令（`/help`、`/status`、`/clear`、`/resume`、`/skill` …），也可以打 `!help`。
 
 ## PIN（核准權限與私訊用）
 

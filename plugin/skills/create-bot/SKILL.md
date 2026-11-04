@@ -1,11 +1,13 @@
 ---
 name: create-bot
-description: 帶使用者建立團隊協作用的 Discord Bot，並檢查既有 Bot 的設定。流程是先收集資訊，再用瀏覽器自動化工具代為操作 Discord Developer Portal（登入、2FA、人機驗證、同意條款、按 Reset Token 與複製 token 都由使用者自己做）。token 從剪貼簿安全存檔，接著自動驗證設定、產生邀請網址、更新名冊。沒有瀏覽器自動化工具，或使用者不同意時，改成一步步引導。使用者說「建立 Bot」「建一個 Discord Bot」「幫某某建 Bot」「新增成員的 Bot」「Bot 設定檢查」「Bot 收不到訊息內容」「產生 Bot 邀請網址」「把 Bot 加進伺服器」「更新名冊」時使用。
+description: 帶使用者建立團隊協作用（或只給自己私訊用）的 Discord Bot，並檢查既有 Bot 的設定。流程是先收集資訊，再用瀏覽器自動化工具代為操作 Discord Developer Portal（登入、2FA、人機驗證、同意條款、按 Reset Token 與複製 token 都由使用者自己做）。token 從剪貼簿安全存檔，接著自動驗證設定、產生邀請網址、更新名冊。沒有瀏覽器自動化工具，或使用者不同意時，改成一步步引導。使用者說「建立 Bot」「建一個 Discord Bot」「幫某某建 Bot」「新增成員的 Bot」「只給自己私訊用的 Bot」「Bot 設定檢查」「Bot 收不到訊息內容」「產生 Bot 邀請網址」「把 Bot 加進伺服器」「更新名冊」時使用。
 ---
 
 # 建立 Discord Bot
 
-每位成員各有一個 Discord Bot，由他自己電腦上的 Claude Code 驅動。Bot 原則上由管理員在 Developer Portal 的 **Team** 底下統一建立，再把 token 私下交給成員。這個 skill 主要給管理員用；成員拿到交付檔後改用 `/channelcollab:setup` 匯入。
+每位成員各有一個 Discord Bot，由他自己電腦上的 Claude Code 驅動。團隊協作用的 Bot 原則上由管理員在 Developer Portal 的 **Team** 底下統一建立，再把 token 私下交給成員；成員拿到交付檔後改用 `/channelcollab:setup` 匯入。
+
+另一種情境是**只給自己私訊用**（把 Bot 當成手機上的私人 Claude，不參與團隊頻道）：使用者自己建 Bot、自己邀進**自己的伺服器**，不用交給管理員，也不用寫名冊。見第 10 節。
 
 輔助腳本是本 skill 資料夾裡的 `scripts/create-bot.mjs`，只需要 Node 22，不用安裝套件。執行方式（路徑一律加引號）：
 
@@ -34,7 +36,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" <子命令> [選項]
 
 | 項目 | 問法／說明 |
 |---|---|
-| 幫誰建 | 選擇題：「幫自己建」／「管理員幫某位成員建」。**幫自己建第二個 Bot（例如測試用）時，如果 `config.json` 已經有 `discord.token`，一律當成「幫成員建」走交付檔模式**，因為 `save-token --for self` 會直接覆蓋既有 token（只印一行「取代了舊的 token」）。先用 `verify` 看一下 config.json 目前是哪個 Bot |
+| 用途／幫誰建 | 選擇題：「只給自己私訊用」／「幫自己建（團隊協作）」／「管理員幫某位成員建」。**選「只給自己私訊用」時只要收集 Bot 顯示名稱和頭像，其餘項目略過，流程改看第 10 節。****幫自己建第二個 Bot（例如測試用）時，如果 `config.json` 已經有 `discord.token`，一律當成「幫成員建」走交付檔模式**，因為 `save-token --for self` 會直接覆蓋既有 token（只印一行「取代了舊的 token」）。先用 `verify` 看一下 config.json 目前是哪個 Bot |
 | 成員名稱 | 幫自己建時就是使用者本人的名字。這個名稱會寫進名冊的 `ownerName` |
 | 角色 | 選擇題：「工程師」／「企劃」 |
 | 成員的 Discord 使用者 ID | 17 到 20 位數字。不知道的話，教他依下方「取得 Discord ID」操作 |
@@ -216,7 +218,8 @@ node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" invite --guild-id <伺服器ID
 ```
 
 - 腳本會從 token 取得 application ID。幫成員建時要加 `--handoff "<交付檔路徑>"`，否則會讀到管理員自己 config.json 裡的 Bot。最簡單的做法是直接用 `save-token --json` 回傳的 `applicationId`，改成 `--app-id <ID>`，這樣不需要 token。
-- scopes：`bot applications.commands`。
+- scopes：`bot applications.commands`。`applications.commands` 讓 Bot 的斜線指令（`/help`、`/status`、`/skill` …）能用；依 Discord 官方文件，`bot` scope 本來就會自動包含它，所以 0.1.6 以前用這個網址邀請的 Bot 不用重邀。斜線指令選單沒出現時，可以用同一個網址再邀請一次（**不會把 Bot 踢出伺服器**）。
+- 只給自己私訊用時加 `--dm-only`：權限整數 0（見第 10 節）。
 - 權限整數 **326417632320** 由腳本計算，各 bit 依據 Discord 官方的 Bitwise Permission Flags 表：
   | 權限 | bit |
   |---|---|
@@ -303,3 +306,57 @@ node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" roster --owner-name "成員名
 | 授權頁面的伺服器欄位空白、無法選擇 | 伺服器 ID 錯了（常把頻道 ID 當成伺服器 ID），或開啟網址的人在該伺服器沒有「管理伺服器」權限。先確認 ID，仍不行就改由伺服器管理員開啟 |
 | New Application 對話框沒有 Team 下拉選單，或選單裡沒有想要的 Team | 使用者不屬於任何 Team／不是該 Team 的成員，或權限不足。請 Team 擁有者到 `https://discord.com/developers/teams` 邀請他 |
 | 公司網路連不到 Discord API | 腳本無法驗證。請改在可以連上 Discord 的網路中執行 |
+
+---
+
+## 10. 只給自己私訊用
+
+使用者想把 Bot 當成「手機上的私人 Claude」，不參與團隊頻道。和團隊流程的差別：
+
+| | 團隊協作 | 只給自己私訊用 |
+|---|---|---|
+| 誰建 | 管理員（Team 底下） | 使用者自己（個人帳號底下就可以） |
+| token 存哪 | 交付檔，私下交給成員 | 直接存進使用者自己的 HOME（`save-token --for self`） |
+| 邀進哪個伺服器 | 團隊伺服器（管理員邀） | **使用者自己的伺服器**（自己邀） |
+| 名冊 | 要寫 | 跳過 |
+| 邀請網址權限 | 326417632320（頻道、討論串需要的權限） | **0**（私訊不需要伺服器權限） |
+
+**為什麼還要伺服器**：Discord 規定使用者和 Bot 至少要在同一個伺服器，才能私訊 Bot。只有自己一個人的私人伺服器就可以。
+
+### 10-1 建 Bot
+
+照第 2～3 節（或第 4 節純引導）做 3-A 到 3-F，差別：
+
+- 3-B 的 Team 維持 Personal 即可（不用 Team）。
+- 3-E 一樣要打開 **Message Content Intent**、關閉 **Public Bot**（關掉後只有你自己能邀請它，比較安全；你是擁有者，所以仍然可以邀）。
+- 3-F 之後存 token 用：
+  ```
+  node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" save-token --for self --json
+  ```
+  **HOME 已經有別的 Bot 的 token 時**（先用 `verify` 看），不要覆蓋：改用另一個 HOME，例如 `--home "%USERPROFILE%\.channelcollab-personal"`（`%USERPROFILE%` 請換成實際路徑），之後 setup、start 等所有指令都加同一個 `--home`。
+
+### 10-2 準備自己的伺服器
+
+問使用者有沒有**自己能管理的伺服器**（自己建的，或在裡面有「管理伺服器」權限）。沒有的話教他建一個私人伺服器：
+
+1. Discord 左側伺服器列表最下面按「**＋**」（新增伺服器）。
+2. 選「**自己建立**」→「**給我和我的朋友**」。
+3. 取個名字（例如「我的 Claude」）→「建立」。只有自己一個人也沒關係。
+
+### 10-3 邀請 Bot
+
+```
+node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" invite --dm-only [--home "<HOME>"]
+```
+
+- 權限整數是 **0**：私訊不受伺服器權限控制，Bot 只要在伺服器裡就好。scope 一樣是 `bot applications.commands`（`applications.commands` 讓斜線指令能用；`bot` scope 本來就會自動包含它）。
+- 不帶 `--guild-id`，由使用者在授權頁的「新增至伺服器」選自己的伺服器 →「繼續」→「授權」→ 人機驗證，**都由使用者自己操作**（瀏覽器協助模式下也一樣，等他回覆「好了」）。
+- 之後如果想在這個伺服器綁頻道給 Bot 用，再用一般的 `invite`（不加 `--dm-only`）重新邀請一次，補上頻道需要的權限；**重新邀請不會把 Bot 踢出伺服器**。
+- 這個情境由使用者自己邀請，**不用交給管理員**。
+
+### 10-4 驗證與收尾
+
+1. `verify`（不帶 `--guild-id` 也可以；要檢查是否已在伺服器就帶自己伺服器的 ID）。有 ❌ 就修正。
+2. **跳過第 7 節的名冊**。
+3. 告訴使用者：Bot 名稱、Bot ID、token 存在哪個 HOME、已經邀進哪個伺服器；接著執行 `/channelcollab:setup` 選「**只用私訊**」（有用別的 HOME 時告訴 setup 用同一個 `--home`），會設定主人、PIN（必要）、私訊的工作資料夾，並啟動 Bot。
+4. 提醒資安：只有主人能私訊、私訊等於遠端操作這台電腦、Discord 帳號要開兩步驟驗證。

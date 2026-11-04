@@ -584,7 +584,7 @@ channelcollab 會在每個 session 附上一份協作守則（`--append-system-p
 
 ### 啟動與停止（兩種方式，效果相同）
 
-- **桌面雙擊**：setup 用總控 `shortcut` 在桌面產生「啟動 channelcollab Bot.bat」「停止 channelcollab Bot.bat」（桌面位置向系統查詢，OneDrive 重新導向也正確）。`.bat` 執行 `<HOME>\runtime\ctl.mjs`（總控腳本的複本，每次 start／install-runtime／shortcut 都會同步），所以 plugin 更新後路徑仍有效；node 用產生時的絕對路徑，找不到再用 PATH 上的。
+- **桌面雙擊**：setup 用總控 `shortcut` 在桌面產生「啟動 <Bot 名稱>.bat」「停止 <Bot 名稱>.bat」等（0.1.6 起檔名帶 Bot 名稱，見第 19 節；之前是固定的「啟動 channelcollab Bot.bat」）（桌面位置向系統查詢，OneDrive 重新導向也正確）。`.bat` 執行 `<HOME>\runtime\ctl.mjs`（總控腳本的複本，每次 start／install-runtime／shortcut 都會同步），所以 plugin 更新後路徑仍有效；node 用產生時的絕對路徑，找不到再用 PATH 上的。
 - **Claude Code 斜線指令**：`/channelcollab:start`、`/channelcollab:stop`、`/channelcollab:status`，呼叫 plugin 裡同一支總控腳本。
 - `start`：Bot 以 detached、隱藏視窗的子程序在背景執行，stdout／stderr 寫到 `<HOME>\bot.log`／`bot.err.log`（上一次的改名為 `bot.prev*.log`），等 log 出現 `[ready]`（最多 90 秒）後回報登入身分與綁定的頻道。已經在跑（停止用的 named pipe 連得上）就只回報「已在執行中」，不重複啟動。
   - 實測（0.1.2）：Bot 是 DETACHED_PROCESS（沒有 console），關閉 console 不會影響它；開發環境裡的程序都在一個工作階段層級的 job（允許 silent breakaway、沒有 KILL_ON_JOB_CLOSE），沒有會連帶結束 Bot 的 job。情境 A：在 headless Claude Code（`claude -p`）裡用 Bash 執行 `start`，Claude 結束 23 分鐘後 Bot 仍在線、log 沒有中斷，之後 `stop` 正常。情境 B：在 console 視窗執行啟動 `.bat`，上線後對視窗送 WM_CLOSE（等同按 X），cmd 與 console 都結束，Bot 仍在線。所以啟動方式維持 `spawn(detached)`，不需要另外脫離 job。
@@ -606,10 +606,10 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 ├─ src/                               Bot 本體（TypeScript）
 │   ├─ main.ts                        進入點（npm start）
 │   ├─ stop.ts                        npm run stop
-│   ├─ config.ts、log.ts、roster.ts、roster.test.ts、features.test.ts
-│   ├─ discord/                       收發、按鈕、選單、表情、詳細；conversation（討論串與私訊共用的一輪）、commands／command-run（! 指令）、approvals-ui（稍後核准）、pin-ui
+│   ├─ config.ts、log.ts、roster.ts、roster.test.ts、features.test.ts、slash.test.ts
+│   ├─ discord/                       收發、按鈕、選單、表情、詳細；conversation（討論串與私訊共用的一輪）、commands／command-run（! 與 / 指令共用的解析、gate、執行）、slash（斜線指令註冊與互動）、approvals-ui（稍後核准）、pin-ui
 │   ├─ router/                        觸發判斷、轉手計數、排隊
-│   ├─ runner/                        Agent SDK 驅動、啟動器、session 池；usage（上下文與額度提醒）、failure（錯誤訊息）、approvals（稍後核准）
+│   ├─ runner/                        Agent SDK 驅動、啟動器、session 池；usage（上下文與額度提醒）、failure（錯誤訊息）、approvals（稍後核准）、skills（/skill 清單）
 │   ├─ security/                      pin（核准用 PIN）、zones（禁區）、access（白名單）
 │   └─ store/                         本機狀態（state.json）
 ├─ plugin/                            plugin 根目錄
@@ -633,7 +633,8 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 成員電腦上的 HOME（%USERPROFILE%\.channelcollab 或 CHANNELCOLLAB_HOME）
 ├─ config.json                        含 token，只透過腳本修改
 ├─ roster.json                        名冊
-├─ state.json、bot.pid
+├─ state.json、bot.pid、pin.json
+├─ launchers.json                     shortcut 建立的 .bat 路徑（status 用）
 ├─ bot.log、bot.err.log、bot.prev*.log
 └─ runtime/                           bot.mjs、stop.mjs、ctl.mjs、node_modules、version.json
 ```
@@ -799,6 +800,56 @@ PreToolUse hook 最前面判斷（比 retry 放行、always allow、auto 分類�
 - SDK spike（`spike/v015-check*.ts`，SDK 0.3.314，haiku／sonnet）：`/compact`、`getContextUsage`、`setModel`、`setPermissionMode`（default↔plan、auto↔plan、以 plan 啟動再切 auto）、`forkSession` 後在同一 cwd 與**不同 cwd** resume 都能接回、`rate_limit_event` 的欄位。
 - 單元測試 `src/features.test.ts`（36 項）：指令解析、私訊權限、resume 清單、門檻只提醒一次與附註切段、額度提醒、bot role 觸發、錯誤訊息與遮罩、PIN（非主人不開 Modal、不累計；鎖定；免輸入時間）、白名單、禁區、稍後核准（2 分鐘延後、私訊卡片、私訊失敗退回討論串、retryKey 放行與參數不符、拒絕、過期）。總控 self-test 加了私訊設定、白名單、PIN 雜湊。
 - 尚未在 Discord 實測。
+
+---
+
+## 19. 0.1.6：只用私訊、斜線指令、/skill
+
+### 只用私訊（A）
+
+- 原本的假設：程式本身（`loadConfig` 只要求 token、`channels` 預設 `{}`、`guild_id` 選填、私訊路徑不看頻道）已經能在沒綁頻道時運作；假設「至少一個頻道」的是**周邊**：總控 `start`／`status`／`check` 一律印「綁定的頻道：（還沒有綁定任何頻道）」像是缺了什麼、setup 步驟 1 用「有 token 和頻道綁定」判斷設定好了、setup 流程一定要綁頻道、create-bot 只有團隊流程、Bot 的私訊回覆寫死「雙擊桌面的『設定 channelcollab PIN.bat』」。
+- 改法：`configSummary` 加 `mode`（`none`／`dm-only`／`channels`／`both`）。`start` 與 `status` 先印「模式：…」；只用私訊時頻道那行寫「無（只用私訊，不需要…）」；只有 `none` 才提示要設定。開了私訊卻沒 PIN 時 PIN 那行是 ❌。Bot 上線時 log `[mode] …`。
+- Discord 的限制：使用者和 Bot 至少要有一個共同的伺服器才能私訊。只用私訊的人可以用自己建的私人伺服器（只有自己一人也可以）。私訊不受伺服器權限控制，所以 `invite --dm-only` 的權限整數是 0；scope 仍是 `bot applications.commands`（要有共同伺服器、要有斜線指令）。之後在那個伺服器綁頻道，用一般網址重邀即可（不會踢掉 Bot）。`guild_id` 本來就選填；有設時只過濾伺服器頻道訊息，私訊不受影響。
+- create-bot 多一個「只給自己私訊用」：自己建、`save-token --for self`（HOME 已有 Bot 時用另一個 HOME）、`invite --dm-only` 邀進自己的伺服器（沒有就教他「＋ 新增伺服器 → 自己建立 → 給我和我的朋友」）、跳過名冊、不經管理員。
+- PIN、待核准卡片、白名單在沒有頻道時不受影響：PIN 與鎖定只看 `pin.json` 與記憶體；待核准卡片在私訊對話裡直接發在私訊；白名單只用在伺服器訊息。
+
+### setup 流程（B）
+
+開頭用 AskUserQuestion 問用途：只用私訊／團隊頻道協作／兩者都要。
+
+- **只用私訊**：Node → runtime → 交付檔（沒有就改走 create-bot「只給自己私訊用」）→ 主人 → **PIN（必要，不能跳過）** → 私訊工作資料夾＋權限模式＋模型 → 啟動 → 請使用者私訊 Bot 測一次 → 捷徑。跳過綁頻道和名冊；最後提醒之後要加入團隊頻道只要 `/channelcollab:bind`。
+- **團隊頻道協作**：原流程；PIN 建議；私訊可以選不開。
+- **兩者都要**：原流程加私訊，PIN 必要。
+- 選了私訊的流程都先講資安：只有主人能用、等於遠端操作自己的電腦、Discord 兩步驟驗證。
+
+### 兩個小修正（C）
+
+- **捷徑檔名**：0.1.5 的 .bat 檔名固定（「啟動 channelcollab Bot.bat」等），同一台電腦好幾個 HOME 時會互相覆蓋。改成帶 Bot 名稱（「啟動 <名稱>.bat」「停止 <名稱>.bat」「設定 <名稱> PIN.bat」「解除 <名稱> 鎖定.bat」）：名稱依序取 `--name`、名冊裡這隻 Bot 的 `botName`、bot.log 最後一次登入的名稱（去掉 `#1234`）、非預設 HOME 的資料夾名；都沒有才用舊檔名。建好的路徑記在 `<HOME>\launchers.json`；同一個資料夾裡指向同一個 HOME 的舊檔（舊固定檔名、改名前的）會刪掉，指向別的 HOME 的不動。status 的 PIN／解除鎖定提示指向實際存在的檔案（launchers.json 記錄的，或 `<HOME>\launchers` 裡的舊檔名），找不到就顯示 `node "<HOME>\runtime\ctl.mjs" set-pin --home "<HOME>"`。Bot 在私訊裡的提示不再寫檔名。
+- **「最近的錯誤」**：`allowedTools: [reply]` 加上 `canUseTool` 會讓 SDK 發 `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` 警告（Node 接著印一行 `` (Use `node --trace-warnings ...`…) ``），寫進 bot.err.log，status 當成錯誤。reply 一律放行是刻意的（plan 模式下 hook 的 allow 不涵蓋 reply，要靠 allowedTools／canUseTool），所以不改 allowedTools。源頭：`start` 用 `node --disable-warning=CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` 啟動 Bot（Node 22 支援），行為不變；status 另外用 `filterStderr` 過濾這行與緊接的 trace-warnings 提示（舊 log）。
+
+### 斜線指令（F）
+
+- 上線時 `client.application.commands.set(defs)`（PUT bulk overwrite，冪等）註冊 global commands：`/help /clear /resume /stop /status /model /plan /compact /retry /skill`。定義在 `commands.ts` 的 `slashDefinitions()`（純 JSON；以 `toJSON` 包著交給 discord.js，否則 `contexts`／`integration_types` 這些 snake_case 欄位會被丟掉）。`contexts`：`/clear`、`/resume` 只有 BotDM（1），其他 Guild（0）＋BotDM；`integration_types` 只有 guild install（0）。`/model` 的 `name` 是 choices（haiku／sonnet／opus，選填，不選就跳按鈕）。log：`[commands] registered N global slash commands: …`／`slash command registration failed: …`。
+- 查證（Discord 官方文件 Application Commands）：`applications.commands` scope「is also automatically included with the `bot` scope」；create-bot 的邀請網址也一直帶兩個 scope，所以既有 Bot 不用重邀（沒出現時用同一網址重邀，不會踢掉 Bot）。global commands 的生效時間文件沒寫確切數字（guild commands 即時；global 有 read-repair），文件寫「通常幾分鐘，重開 Discord 可刷新」。
+- **同一套處理**：斜線的名稱與選項經 `commandFromSlash` 轉成和 `parseCommand` 一樣的 `Command`；誰能用由同一個純函式 `commandGate` 判斷（伺服器：鎖定 → 綁定頻道且在設定的伺服器 → 白名單 → 必須在討論串 → 私訊限定 → 主人或提出需求的人；私訊：鎖定 → 只限主人 → 私訊開啟 → PIN 已設定 → PIN 已解鎖）；執行都是 `runCommand(cmd, conv, io, who)`，`io`（`CommandIO`）只負責怎麼回：`!` 是回覆訊息（和 0.1.5 一樣），斜線是 ephemeral。
+- 斜線的回覆：收到就 `deferReply` ephemeral（3 秒內）；拒絕原因、`/help`、`/status`、按鈕與選單都 edit 那則 ephemeral；會改變對話的（`/model`、`/plan`、`/stop`、`/clear`、`/compact`、`/retry`、`/skill`，以及從 ephemeral 選單選的模型、接回的對話）在對話裡用 followUp 公開留一則短紀錄，再刪掉 ephemeral 的「思考中」。`/compact`、`/retry`、`/skill` 以那則公開紀錄當狀態表情的對象（runTurn 的「Bot 觸發、沒 reply 就靜音」只套用在一般訊息與核准後的接續，所以這些一定會回報）。
+- 和 `!` 的差別只在無法不回的情況：`!` 在鎖定、未綁定、不在白名單時不回應（避免洗版），斜線回 ephemeral 說明。私訊未解鎖時 `!` 訊息會保留、解鎖後接著處理；斜線指令回一個「解鎖」按鈕，解鎖後再用一次。
+- 多隻 Bot 同伺服器：每隻註冊同名指令，Discord 選單依 App 分組；互動只送給被選的 App，程式另外比對 `interaction.applicationId`。
+- `!` 指令保留，當備用。
+
+### /skill（G）
+
+- `/skill name:<autocomplete> [args]`、`!skill <名稱> [參數]`（`!skill` 不帶名稱列出清單）：把「`/名稱 參數`」當使用者訊息送進該對話的 session（turn kind `skill`，排隊，`lastPrompt` 記下來給 `/retry`）。
+- 清單：session 第一次 init 後呼叫 `Query.supportedCommands()`（`SlashCommand[]`，有 `builtin` 標記與說明、參數提示），`system/commands_changed` 時更新；失敗時退回 init 的 `skills`。`skillCatalog` 保留 init `skills` 裡的（含 Claude Code 內建的 bundled skill）與沒有 `builtin` 的（自訂指令、plugin／MCP 的指令），排除內建指令與 `terminal_slash_commands`、不合法的名稱。存在 `state.json` 的 `skills`（以工作資料夾為 key，最新的覆蓋）。SDK 文件：init 的 `slash_commands` 只列不需要互動終端機的指令；`/compact`、`/clear` 是 SDK 裡可用的內建指令，channelcollab 用自己的 `/compact`、`/clear`，所以 `/skill` 不列內建指令。
+- autocomplete（3 秒內、不能 defer、不打 Discord API）：依輸入的前綴／包含／說明排序，最多 25 筆、名稱 ≤100 字；還沒有清單時回一筆提示「先傳一則訊息開始對話，之後就能選 skill」（值是哨兵，不會被接受）。autocomplete 套用同一個 gate，但討論串的「誰能用」要抓起始訊息，留到真正執行時再判斷。
+- 名稱驗證：必須在該對話工作資料夾的清單裡、符合 `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$`；參數合併成一行、最多 1500 字。避免把任意文字變成指令。
+- 權限：觸發條件同一般訊息；skill 執行時的工具一樣過 PreToolUse hook（禁區 → 模式 → 權限按鈕 → PIN）。非 auto 模式下 hook 對每個呼叫都給明確的 allow／ask／deny，所以 skill frontmatter 的 `allowed-tools` 不會繞過；auto 模式本來就交給分類器判斷，和 Claude 自己叫 Skill 時一樣。
+
+### 驗證
+
+- `src/slash.test.ts`（20 項，假的 Discord 物件，不連線）：只有 dm 設定時讀設定、上線（log 模式、整批註冊 10 個指令）、私訊處理（PIN 未解鎖先擋並送解鎖按鈕、別人私訊被擋、解鎖後 `!help`）；斜線和 `!` 解析成同一個 Command、`/model sonnet` 與 `!model sonnet` 結果相同；`/help`、`/status` ephemeral 且先 defer；權限拒絕回 ephemeral（私訊非主人、未綁定頻道）、別的 App 的互動不處理、鎖定時斜線回 ephemeral 而 `!` 不回；commandGate 各規則；註冊清單內容；skill 清單過濾、autocomplete、名稱驗證。
+- 總控 self-test 加：只用私訊的模式與 status 顯示、警告過濾、捷徑檔名與名稱來源、兩個 HOME 同資料夾不互相覆蓋並換掉舊檔、PIN 提示指向實際檔案或顯示指令。create-bot self-test 加 `--dm-only` 邀請網址。
+- 尚未在 Discord 實測：斜線指令實際出現與點擊、autocomplete 顯示、真實的只用私訊環境。
 
 ---
 

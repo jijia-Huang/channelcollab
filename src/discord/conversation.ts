@@ -52,7 +52,7 @@ export function effective(c: Conv, ts: ThreadState = convState(c)): ResolvedChan
 /** Who triggered the turn running in each conversation (thread commands follow the 🛑 rule). */
 export const running = new Map<string, Who>();
 
-export type TurnKind = 'normal' | 'compact' | 'retry' | 'approved';
+export type TurnKind = 'normal' | 'compact' | 'retry' | 'approved' | 'skill';
 
 /** Rebuild a conversation from its key (to continue it after a later approval). */
 export async function convFor(client: Client<true>, key: string): Promise<Conv | undefined> {
@@ -86,8 +86,9 @@ async function checkContext(c: Conv, session: LiveSession, ts: ThreadState): Pro
 
 /**
  * Run one turn. `prompt` replaces the prompt built from `trigger` (!compact
- * sends "/compact", !retry the last prompt); `trigger` still gets the status
- * reactions.
+ * sends "/compact", !retry the last prompt, !skill "/<name> <args>");
+ * `trigger` still gets the status reactions (for a slash command it is the
+ * bot's own public note).
  */
 export async function runTurn(c: Conv, trigger: Message, status: StatusReactions, who: Who, input: { prompt?: string; kind?: TurnKind; preapproved?: string[] } = {}): Promise<void> {
   const kind = input.kind ?? 'normal';
@@ -207,7 +208,7 @@ export async function runTurn(c: Conv, trigger: Message, status: StatusReactions
     }
     // Another bot got no answer on purpose (nothing to do): stay silent instead of
     // posting a summary, which would only add noise to the bot-to-bot exchange.
-    if (turn.ok && turn.replies === 0 && trigger.author.bot) {
+    if ((kind === 'normal' || kind === 'approved') && turn.ok && turn.replies === 0 && trigger.author.bot) {
       log('silent', `${c.key} no reply to bot ${trigger.author.username} ${brief(turn.lastText, 200)}`);
       await progressMessage?.delete().catch(() => {});
       await status.set('done');

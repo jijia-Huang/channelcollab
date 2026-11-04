@@ -1,8 +1,9 @@
 /**
- * Running `!` commands (parsing and the rules are in commands.ts). Commands
- * that act right away (!stop, !model, !plan, !status, !help, !clear, !resume)
- * never wait in the conversation's queue; !compact and !retry are turns and
- * queue like any message.
+ * Running `!` and `/` commands (parsing and the rules are in commands.ts; the
+ * slash side is slash.ts). Both come here through runCommand with a CommandIO.
+ * Commands that act right away (stop, model, plan, status, help, clear,
+ * resume) never wait in the conversation's queue; compact, retry and skill
+ * are turns and queue like any message.
  */
 import { forkSession } from '@anthropic-ai/claude-agent-sdk';
 import {
@@ -16,13 +17,14 @@ import {
   type Message,
 } from 'discord.js';
 import { loadConfig, resolveDm } from '../config.js';
-import { log } from '../log.js';
+import { brief, log } from '../log.js';
 import { enqueue, isPending } from '../router/queue.js';
 import { canAct } from '../runner/policy.js';
 import { liveSession, release } from '../runner/pool.js';
+import { NO_LIST_TEXT, skillPrompt, type SkillItem } from '../runner/skills.js';
 import { latestRateLimit, rateSummary } from '../runner/usage.js';
 import { pinGate } from '../security/pin.js';
-import { allThreads, DM_KEY, dmHistory, getThread, saveState, switchDm, type DmState } from '../store/state.js';
+import { allThreads, DM_KEY, dmHistory, getThread, saveState, skillsFor, switchDm, type DmState } from '../store/state.js';
 import { duration, helpText, MODEL_CHOICES, normalizeModel, resumeList, resumeOption, shortTime, type Command, type ResumeCandidate } from './commands.js';
 import { convState, effective, runTurn, type Conv } from './conversation.js';
 import type { Who } from './prompts.js';
@@ -40,17 +42,16 @@ const modeName = (m: PermissionModeName) => MODE_NAMES[m] ?? m;
 const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
 
 /** Pending menus and buttons from commands (model picker, resume list), kept 15 minutes. */
-const menus = new Map<string, { conv: Conv; who: Who; candidates?: ResumeCandidate[]; at: number }>();
+/** `slash`: the menu was an ephemeral answer, so the choice also gets a public note in the conversation. */
+const menus = new Map<string, { conv: Conv; who: Who; slash: boolean; candidates?: ResumeCandidate[]; at: number }>();
 let seq = 0;
-function remember(conv: Conv, who: Who, candidates?: ResumeCandidate[]): string {
+function remember(conv: Conv, who: Who, slash: boolean, candidates?: ResumeCandidate[]): string {
   const now = Date.now();
   for (const [id, m] of menus) if (now - m.at > 15 * 60 * 1000) menus.delete(id);
   const id = `${now.toString(36)}${(++seq).toString(36)}`;
-  menus.set(id, { conv, who, candidates, at: now });
+  menus.set(id, { conv, who, slash, candidates, at: now });
   return id;
 }
-
-const say = (message: Message, content: string) => message.reply({ content, allowedMentions: { parse: [] } });
 
 async function applyModel(c: Conv, model: string): Promise<string> {
   const ts = convState(c);
@@ -89,12 +90,41 @@ async function statusText(c: Conv): Promise<string> {
   return lines.join('\n');
 }
 
-/** Turn-shaped commands (!compact, !retry) queue behind whatever is running. */
-async function queueTurn(c: Conv, message: Message, who: Who, prompt: string, kind: 'compact' | 'retry'): Promise<void> {
-  const status = new StatusReactions(message);
+/**
+ * Where a command came from and how to answer it. A `!` message and a slash
+ * command each have one (messageIO here, slash.ts); runCommand only talks to this.
+ */
+export type CommandIO = {
+  /** Who used the command. */
+  actor: { id: string; name: string };
+  client: Client;
+  /** A slash command; else a `!` message. */
+  slash: boolean;
+  /** An answer only the person who used it needs (ephemeral for slash; a reply for `!`). */
+  tell(content: string, components?: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[]): Promise<void>;
+  /** A short public note in the conversation (the command changed something). */
+  note(content: string): Promise<void>;
+  /** A `!` message gets the reaction; a slash command, the note. */
+  ack(emoji: string, content: string): Promise<void>;
+  /** The message that carries the status reactions of a queued turn (the `!` message, or a public note). */
+  anchor(content: string): Promise<Message>;
+};
+
+/** Turn-shaped commands (!compact, !retry, !skill) queue behind whatever is running. */
+async function queueTurn(c: Conv, io: CommandIO, who: Who, prompt: string, kind: 'compact' | 'retry' | 'skill', label: string): Promise<void> {
+  const trigger = await io.anchor(label);
+  const status = new StatusReactions(trigger);
   await status.set('received');
-  const { queued } = enqueue(c.key, () => runTurn(c, message, status, who, { prompt, kind }));
+  const { queued } = enqueue(c.key, () => runTurn(c, trigger, status, who, { prompt, kind }));
   if (queued) await status.set('waiting');
+}
+
+/** `!skill` with no name: what can be run here. */
+function skillListText(list: SkillItem[] | undefined, slash: boolean): string {
+  if (!list?.length) return `${NO_LIST_TEXT}。`;
+  const shown = list.slice(0, 40).map((s) => `\`${s.name}\`${s.hint ? ` ${s.hint}` : ''}${s.description ? `　${s.description.replace(/\s+/g, ' ').slice(0, 80)}` : ''}`);
+  const more = list.length > shown.length ? `\n…還有 ${list.length - shown.length} 個` : '';
+  return `**可以用的 skill／自訂指令**（${slash ? '`/skill` 選名稱' : '`!skill <名稱> [參數]`'}）\n${shown.join('\n')}${more}`;
 }
 
 function resumeCandidates(): ResumeCandidate[] {
@@ -113,40 +143,38 @@ function resumeCandidates(): ResumeCandidate[] {
   return resumeList(out);
 }
 
-/** Run a command. Who may use it has been checked by the caller. */
-export async function runCommand(cmd: Command, c: Conv, message: Message, who: Who): Promise<void> {
+/** Run a command (`!` or `/`). Who may use it has been checked by the caller (commandGate). */
+export async function runCommand(cmd: Command, c: Conv, io: CommandIO, who: Who): Promise<void> {
   const ts = convState(c);
-  log('command', `${c.key} !${cmd.name}${cmd.arg ? ` ${cmd.arg}` : ''} by ${message.author.username}`);
+  const p = io.slash ? '/' : '!';
+  log('command', `${c.key} ${p}${cmd.name}${cmd.arg ? ` ${cmd.arg}` : ''}${cmd.rest ? ` ${brief(cmd.rest, 80)}` : ''} by ${io.actor.name}`);
   switch (cmd.name) {
     case 'help':
-      await say(message, helpText(c.kind));
+      await io.tell(helpText(c.kind));
       return;
     case 'status':
-      await say(message, await statusText(c));
+      await io.tell(await statusText(c));
       return;
     case 'stop': {
       const s = liveSession(c.key);
-      if (s?.busy && (await s.interrupt(message.author.displayName || message.author.username))) await message.react('⏹️').catch(() => {});
-      else await say(message, '目前沒有在執行的工作。');
+      if (s?.busy && (await s.interrupt(io.actor.name))) await io.ack('⏹️', `⏹️ ${io.actor.name} 停止了這一輪。`);
+      else await io.tell('目前沒有在執行的工作。');
       return;
     }
     case 'model': {
       if (cmd.arg) {
         const model = normalizeModel(cmd.arg);
-        await say(message, model ? await applyModel(c, model) : `不認得「${cmd.arg}」。可以用 haiku、sonnet、opus。`);
+        if (model) await io.note(await applyModel(c, model));
+        else await io.tell(`不認得「${cmd.arg}」。可以用 haiku、sonnet、opus。`);
         return;
       }
-      const id = remember(c, who);
+      const id = remember(c, who, io.slash);
       const current = ts.model ?? effective(c, ts).model ?? 'Claude Code 預設';
-      await message.reply({
-        content: `目前的模型：**${current}**。要換成哪一個？`,
-        components: [
-          new ActionRowBuilder<ButtonBuilder>().addComponents(
-            ...MODEL_CHOICES.map((m) => new ButtonBuilder().setCustomId(`ccmd:model:${id}:${m.alias}`).setLabel(`${m.label}（${m.note}）`).setStyle(m.alias === current ? ButtonStyle.Primary : ButtonStyle.Secondary)),
-          ),
-        ],
-        allowedMentions: { parse: [] },
-      });
+      await io.tell(`目前的模型：**${current}**。要換成哪一個？`, [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          ...MODEL_CHOICES.map((m) => new ButtonBuilder().setCustomId(`ccmd:model:${id}:${m.alias}`).setLabel(`${m.label}（${m.note}）`).setStyle(m.alias === current ? ButtonStyle.Primary : ButtonStyle.Secondary)),
+        ),
+      ]);
       return;
     }
     case 'plan': {
@@ -158,37 +186,51 @@ export async function runCommand(cmd: Command, c: Conv, message: Message, who: W
           await s.setMode(mode);
         } catch (e) {
           log('command', `${c.key} setMode ${mode} failed: ${(e as Error).message}`);
-          await say(message, '⚠️ 切換失敗，模式沒有改變。');
+          await io.tell('⚠️ 切換失敗，模式沒有改變。');
           return;
         }
       }
       ts.plan = next || undefined;
       saveState();
-      await say(message, next ? `📝 已切到計畫模式：Claude 只討論、不改檔也不執行指令。再打一次 !plan 切回（${modeName(c.base.permissionMode)}）。` : `▶️ 已切回${modeName(mode)}，Claude 可以動手了。`);
+      await io.note(next ? `📝 已切到計畫模式：Claude 只討論、不改檔也不執行指令。再用一次 ${p}plan 切回（${modeName(c.base.permissionMode)}）。` : `▶️ 已切回${modeName(mode)}，Claude 可以動手了。`);
       return;
     }
     case 'compact':
-      if (!ts.sessionId) return void (await say(message, '還沒有對話，不需要壓縮。'));
-      await queueTurn(c, message, who, '/compact', 'compact');
+      if (!ts.sessionId) return void (await io.tell('還沒有對話，不需要壓縮。'));
+      await queueTurn(c, io, who, '/compact', 'compact', `🗜️ ${io.actor.name} 要求壓縮上下文。`);
       return;
     case 'retry':
-      if (!ts.lastPrompt) return void (await say(message, '沒有可以重送的訊息。'));
-      await queueTurn(c, message, who, ts.lastPrompt, 'retry');
+      if (!ts.lastPrompt) return void (await io.tell('沒有可以重送的訊息。'));
+      await queueTurn(c, io, who, ts.lastPrompt, 'retry', `🔁 ${io.actor.name} 要求把上一則訊息重送一次。`);
       return;
+    case 'skill': {
+      const list = skillsFor(effective(c, ts).cwd);
+      if (!cmd.arg) return void (await io.tell(skillListText(list, io.slash)));
+      const r = skillPrompt(list, cmd.arg, cmd.rest);
+      if (!r.ok) {
+        log('command', `${c.key} ${p}skill ${brief(cmd.arg, 60)} refused (${r.reason})`);
+        await io.tell(r.reason === 'no-list' ? `${NO_LIST_TEXT}。` : `沒有叫「${cmd.arg.slice(0, 60)}」的 skill。${io.slash ? '請從選單選一個。' : '打 `!skill` 看清單。'}`);
+        return;
+      }
+      ts.lastPrompt = r.prompt;
+      saveState();
+      await queueTurn(c, io, who, r.prompt, 'skill', `🧩 ${io.actor.name} 執行 \`${r.prompt.slice(0, 200)}\``);
+      return;
+    }
     case 'clear': {
-      if (liveSession(c.key)?.busy || isPending(c.key)) return void (await say(message, 'Claude 還在處理，先打 !stop 停下來，再打 !clear。'));
+      if (liveSession(c.key)?.busy || isPending(c.key)) return void (await io.tell(`Claude 還在處理，先用 ${p}stop 停下來，再用 ${p}clear。`));
       await release(c.key, 'clear');
       switchDm();
-      await say(message, '🆕 已結束目前的對話（之後可以用 !resume 接回）。下一則訊息會開新的對話。');
+      await io.note(`🆕 已結束目前的對話（之後可以用 ${p}resume 接回）。下一則訊息會開新的對話。`);
       return;
     }
     case 'resume': {
       const list = resumeCandidates();
-      if (!list.length) return void (await say(message, '還沒有可以接回的對話。'));
+      if (!list.length) return void (await io.tell('還沒有可以接回的對話。'));
       // Old threads saved before 0.1.5 have no name yet: ask Discord.
       for (const cand of list) {
         if (cand.kind !== 'thread' || getThread(cand.id)?.name) continue;
-        const ch = await message.client.channels.fetch(cand.id).catch(() => null);
+        const ch = await io.client.channels.fetch(cand.id).catch(() => null);
         if (ch && 'name' in ch && ch.name) {
           cand.source = ch.name;
           if (!cand.summary || cand.summary.startsWith('討論串 ')) cand.summary = ch.name;
@@ -196,22 +238,39 @@ export async function runCommand(cmd: Command, c: Conv, message: Message, who: W
         }
       }
       saveState();
-      const id = remember(c, who, list);
-      await message.reply({
-        content: '要接回哪一段對話？（討論串的對話會複製一份分支來接，不影響討論串本身）',
-        components: [
-          new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
-            new StringSelectMenuBuilder()
-              .setCustomId(`ccmd:resume:${id}`)
-              .setPlaceholder('選一段對話')
-              .addOptions(list.map((cand, n) => ({ ...resumeOption(cand), value: String(n) }))),
-          ),
-        ],
-        allowedMentions: { parse: [] },
-      });
+      const id = remember(c, who, io.slash, list);
+      await io.tell('要接回哪一段對話？（討論串的對話會複製一份分支來接，不影響討論串本身）', [
+        new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(
+          new StringSelectMenuBuilder()
+            .setCustomId(`ccmd:resume:${id}`)
+            .setPlaceholder('選一段對話')
+            .addOptions(list.map((cand, n) => ({ ...resumeOption(cand), value: String(n) }))),
+        ),
+      ]);
       return;
     }
   }
+}
+
+/** The `!` side: every answer is a reply to the message, as before 0.1.6. */
+export function messageIO(message: Message): CommandIO {
+  const reply = async (content: string, components?: ActionRowBuilder<ButtonBuilder | StringSelectMenuBuilder>[]) => {
+    await message.reply({ content, ...(components ? { components } : {}), allowedMentions: { parse: [] } });
+  };
+  return {
+    actor: { id: message.author.id, name: message.author.displayName || message.author.username },
+    client: message.client,
+    slash: false,
+    tell: reply,
+    note: reply,
+    ack: async (emoji) => void (await message.react(emoji).catch(() => {})),
+    anchor: async () => message,
+  };
+}
+
+/** A public line in the conversation after a choice made in an ephemeral menu. */
+async function publicNote(c: Conv, content: string): Promise<void> {
+  await c.room.send({ content, allowedMentions: { parse: [] } }).catch((e) => log('command', `${c.key} note failed: ${(e as Error).message}`));
 }
 
 export function isCommandInteraction(i: Interaction): boolean {
@@ -234,13 +293,14 @@ export async function handleCommandInteraction(i: Interaction): Promise<void> {
     menus.delete(id);
     const text = await applyModel(m.conv, arg);
     await i.update({ content: text, components: [] });
+    if (m.slash) await publicNote(m.conv, `${text}（${i.user.displayName || i.user.username}）`);
     return;
   }
   if (what === 'resume' && i.isStringSelectMenu()) {
     const pick = m.candidates?.[Number(i.values[0])];
     if (!pick) return;
     if (liveSession(DM_KEY)?.busy || isPending(DM_KEY)) {
-      await i.reply({ content: 'Claude 還在處理，先打 !stop 停下來再接回。', flags: MessageFlags.Ephemeral });
+      await i.reply({ content: 'Claude 還在處理，先用 /stop（或 !stop）停下來再接回。', flags: MessageFlags.Ephemeral });
       return;
     }
     menus.delete(id);
@@ -249,6 +309,7 @@ export async function handleCommandInteraction(i: Interaction): Promise<void> {
     try {
       const text = await resumeInto(i.client, pick);
       await i.editReply({ content: text });
+      if (m.slash) await publicNote(m.conv, text);
     } catch (e) {
       log('error', `resume ${pick.sessionId}: ${(e as Error).stack ?? e}`);
       await i.editReply({ content: `❌ 接回失敗：${(e as Error).message.slice(0, 200)}` });

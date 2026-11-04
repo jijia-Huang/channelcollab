@@ -69,12 +69,13 @@ await t('!model 的參數：haiku／sonnet／opus 或完整模型名稱', () => 
   eq(commands.normalizeModel('claude-opus-5-5'), 'claude-opus-5-5');
   eq(commands.normalizeModel('gpt'), undefined);
 });
-await t('!help：私訊列出全部；討論串不列 !clear、!resume 並說明誰能用', () => {
+await t('help：私訊列出全部（斜線寫法，並說明 ! 備用寫法）；討論串不列 /clear、/resume 並說明誰能用', () => {
   const dm = commands.helpText('dm');
   const th = commands.helpText('thread');
-  for (const n of ['help', 'clear', 'resume', 'stop', 'status', 'model', 'plan', 'compact', 'retry']) has(dm, `!${n}`);
-  has(th, '`!clear`　', false);
-  has(th, '`!resume`　', false);
+  for (const n of ['help', 'clear', 'resume', 'stop', 'status', 'model', 'plan', 'compact', 'retry', 'skill']) has(dm, `\`/${n}\``);
+  has(dm, '`!model sonnet`');
+  has(th, '`/clear`　', false);
+  has(th, '`/resume`　', false);
   has(th, '主人或提出需求的人');
 });
 

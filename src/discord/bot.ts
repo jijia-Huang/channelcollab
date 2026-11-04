@@ -1,7 +1,7 @@
 /**
  * Discord side: decides whether a message triggers a run (threads under bound
  * channels, and the owner's direct messages), opens the thread, runs `!`
- * commands, queues turns, and routes the buttons and menus.
+ * commands, queues turns, and routes slash commands, buttons and menus.
  */
 import {
   ActionRowBuilder,
@@ -29,12 +29,13 @@ import { allowedTrigger } from '../security/access.js';
 import { pinGate } from '../security/pin.js';
 import { DM_KEY, getThread, registerThread, saveState } from '../store/state.js';
 import { handleApprovalInteraction, isApprovalInteraction } from './approvals-ui.js';
-import { handleCommandInteraction, isCommandInteraction, runCommand } from './command-run.js';
-import { COMMANDS, dmAccess, mentionsOtherBotRole, mentionsSelf, parseCommand, throttle, type Command, type RoleMention } from './commands.js';
-import { runTurn, running, type Conv } from './conversation.js';
+import { handleCommandInteraction, isCommandInteraction, messageIO, runCommand } from './command-run.js';
+import { commandGate, dmAccess, gateText, mentionsOtherBotRole, mentionsSelf, NO_PIN_TEXT, parseCommand, throttle, type Command, type RoleMention } from './commands.js';
+import { runTurn, type Conv } from './conversation.js';
 import { handleDetailsClick, isDetailsButton } from './details.js';
 import { checkPin, LOCKED_REPLY, pinModal, pinOkFollowUp } from './pin-ui.js';
 import { handlePromptInteraction, isPromptInteraction, type Who } from './prompts.js';
+import { handleSlashAutocomplete, handleSlashCommand, registerSlashCommands, starterHuman, threadWho } from './slash.js';
 import { StatusReactions } from './status.js';
 
 function threadName(message: Message): string {
@@ -88,12 +89,6 @@ async function threadHops(thread: AnyThreadChannel, trigger: Message, maxHops: n
   }
 }
 
-/** A thread opened from a message keeps that message in the parent channel; its author, if human. */
-async function starterHuman(thread: AnyThreadChannel): Promise<string | undefined> {
-  const starter = await thread.fetchStarterMessage().catch(() => null);
-  return starter && !starter.author.bot ? starter.author.id : undefined;
-}
-
 export function createBot(): Client {
   const client = new Client({
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
@@ -118,6 +113,9 @@ export function createBot(): Client {
     const dm = config && resolveDm(config);
     log('dm', `intent DirectMessages on; ${dm ? `dm configured cwd=${dm.cwd} mode=${dm.permissionMode} model=${dm.model ?? '-'} launcher=${dm.launcher || 'builtin'}${pinGate.configured ? '' : ' (closed until a PIN is set)'}` : 'dm not configured (direct messages closed)'}`);
     log('security', `pin=${pinGate.configured ? 'set' : 'not set'} unlock_minutes=${config?.security.pin_unlock_minutes ?? '-'} roster_only=${config?.access.roster_only ?? '-'} owner_wait_minutes=${config?.defaults.owner_wait_minutes ?? '-'}`);
+    const channels = Object.keys(config?.channels ?? {}).length;
+    log('mode', channels && dm ? `channels (${channels}) and direct messages` : channels ? `channels only (${channels})` : dm ? 'direct messages only (no channel bound)' : 'nothing configured: bind a channel or turn on direct messages');
+    void registerSlashCommands(c);
   });
 
   client.on(Events.InteractionCreate, (i) => {
@@ -128,7 +126,9 @@ export function createBot(): Client {
 }
 
 async function onInteraction(i: Interaction): Promise<void> {
-  if (i.isButton() && isDetailsButton(i.customId)) {
+  if (i.isChatInputCommand()) await handleSlashCommand(i);
+  else if (i.isAutocomplete()) await handleSlashAutocomplete(i);
+  else if (i.isButton() && isDetailsButton(i.customId)) {
     log('details', `${i.customId} clicked by ${i.user.username}`);
     await handleDetailsClick(i);
   } else if (isPromptInteraction(i)) await handlePromptInteraction(i);
@@ -194,8 +194,9 @@ async function onMessage(message: Message): Promise<void> {
   }
 
   const cmd = fromBot ? undefined : parseCommand(message.content);
+  // The same gate as slash commands; the lock, an unbound channel and the allowlist were checked above (silently).
   if (cmd && decision.action === 'open-thread') {
-    await message.reply({ content: '指令請在討論串裡（或私訊 Bot）使用。', allowedMentions: { parse: [] } });
+    await message.reply({ content: gateText('not-thread', { cmd: cmd.name }), allowedMentions: { parse: [] } });
     return;
   }
 
@@ -254,18 +255,14 @@ async function onMessage(message: Message): Promise<void> {
 
 /** A command in a thread: the owner, or whoever asked for the running turn (else the thread's starter), like 🛑. */
 async function threadCommand(cmd: Command, conv: Conv, thread: AnyThreadChannel, message: Message, ownerId: string | undefined): Promise<void> {
-  if (COMMANDS[cmd.name].dmOnly) {
-    await message.reply({ content: `\`!${cmd.name}\` 只能在私訊 Bot 時使用。`, allowedMentions: { parse: [] } });
+  const who = await threadWho(thread, ownerId);
+  const refusal = commandGate({ cmd: cmd.name, where: 'thread', actorId: message.author.id, ownerId, locked: pinGate.locked, bound: true, notAllowed: false, requesterId: who.requesterId });
+  if (refusal) {
+    log('command', `${conv.key} !${cmd.name} refused ${message.author.username} (${refusal})`);
+    await message.reply({ content: gateText(refusal, { cmd: cmd.name, ownerId, requesterId: who.requesterId }), allowedMentions: { parse: [] } });
     return;
   }
-  const who: Who = { ownerId, requesterId: running.get(conv.key)?.requesterId ?? (await starterHuman(thread)) };
-  if (!canAct('stop', message.author.id, who)) {
-    log('command', `${conv.key} !${cmd.name} refused ${message.author.username}`);
-    const names = [who.requesterId, who.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
-    await message.reply({ content: `只有 ${names.join(' 或 ') || 'Bot 的主人'} 可以在這個討論串用指令。`, allowedMentions: { parse: [] } });
-    return;
-  }
-  await runCommand(cmd, conv, message, { ownerId, requesterId: message.author.id === ownerId ? who.requesterId : message.author.id });
+  await runCommand(cmd, conv, messageIO(message), { ownerId, requesterId: message.author.id === ownerId ? who.requesterId : message.author.id });
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +315,7 @@ async function onDirectMessage(message: Message): Promise<void> {
   }
   if (!pinGate.configured) {
     log('ignore', `${message.id} dm-no-pin`);
-    return answer('私訊要先設定 PIN 才能用：請在電腦上執行 channelcollab 的 set-pin（或雙擊桌面的「設定 channelcollab PIN.bat」）。');
+    return answer(NO_PIN_TEXT);
   }
   if (!pinGate.unlocked) {
     if (held.length < HELD_MAX) held.push(message);
@@ -342,7 +339,7 @@ async function handleDm(message: Message, dm: ResolvedChannel, ownerId: string):
   const conv: Conv = { key: DM_KEY, kind: 'dm', room, base: dm, selfId: message.client.user.id };
   const who: Who = { ownerId };
   const cmd = parseCommand(message.content);
-  if (cmd) return runCommand(cmd, conv, message, who);
+  if (cmd) return runCommand(cmd, conv, messageIO(message), who);
   log('trigger', `${message.id} dm author=${message.author.username} text=${brief(message.content, 120)}`);
   const status = new StatusReactions(message);
   await status.set('received');

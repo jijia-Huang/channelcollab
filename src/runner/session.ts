@@ -25,6 +25,8 @@ import { forbiddenPath, forbiddenUse, zoneDenyMessage, type Zones } from '../sec
 import { killTree, launcherOptions, type Spawned } from './launcher.js';
 import { blockedByClassifier, decideTool, inside, retryKey } from './policy.js';
 import { contextFromUsage, recordRateLimit, type RateInfo } from './usage.js';
+import { skillCatalog, type OfferedCommand } from './skills.js';
+import { rememberSkills } from '../store/state.js';
 
 const OWN_PREFIX = 'mcp__channelcollab__';
 export const REPLY_TOOL = `${OWN_PREFIX}reply`;
@@ -641,9 +643,20 @@ export class LiveSession {
       if (!this.model) {
         const cc = msg.mcp_servers.find((s) => s.name === 'channelcollab');
         log(this.tag, `init after ${Date.now() - started} ms pid=${this.pid ?? '-'} session=${msg.session_id} model=${msg.model} mode=${msg.permissionMode} apiKeySource=${msg.apiKeySource} cc_version=${msg.claude_code_version} channelcollab=${cc?.status} replyListed=${msg.tools.includes(REPLY_TOOL)} skills=${msg.skills.length} plugins=${msg.plugins.length}`);
+        this.offered = { skills: msg.skills, terminal: msg.terminal_slash_commands ?? [] };
+        // The command list carries the built-in marker the init message lacks; without it, only the skills.
+        this.q
+          .supportedCommands()
+          .then((list) => this.recordSkills(list))
+          .catch((e) => {
+            log(this.tag, `supportedCommands failed (${(e as Error).message}); /skill lists the init skills only`);
+            this.recordSkills([]);
+          });
       }
       this.sessionId = msg.session_id;
       this.model = msg.model;
+    } else if (msg.type === 'system' && msg.subtype === 'commands_changed') {
+      this.recordSkills(msg.commands);
     } else if (msg.type === 'rate_limit_event') {
       const info = msg.rate_limit_info as RateInfo;
       log(this.tag, `rate limit ${brief(info, 400)}`);
@@ -669,6 +682,16 @@ export class LiveSession {
     } else if (msg.type === 'result') {
       this.finishTurn(msg);
     }
+  }
+
+  /** What the init message said about skills; the /skill list is built from it and the command list. */
+  private offered: { skills: string[]; terminal: string[] } = { skills: [], terminal: [] };
+
+  /** Keep the /skill list for this folder (state.json), for autocomplete before the next session starts. */
+  private recordSkills(list: OfferedCommand[]): void {
+    const items = skillCatalog(list, this.offered.skills, this.offered.terminal);
+    rememberSkills(this.cwd, items);
+    log(this.tag, `skills for /skill: ${items.length} (${brief(items.map((s) => s.name).join(' '), 200)})`);
   }
 
   private finishTurn(result: Result | undefined, error?: string): void {

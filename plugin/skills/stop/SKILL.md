@@ -1,6 +1,6 @@
 ---
 name: stop
-description: 正常停止自己的 channelcollab Discord Bot，並確認沒有殘留程序。效果和桌面的「停止 channelcollab Bot.bat」相同。使用者說「停止 Bot」「關掉 Bot」「Bot 先停一下」「stop」時使用。
+description: 正常停止自己的 channelcollab Discord Bot，並確認沒有殘留程序。效果和雙擊捷徑「停止 <Bot 名稱>.bat」相同。使用者說「停止 Bot」「關掉 Bot」「Bot 先停一下」「stop」時使用。
 allowed-tools: Bash(node:*), PowerShell(node:*)
 ---
 

@@ -10,7 +10,7 @@
 //   access --roster-only on|off    白名單：只有主人和名冊上的人／Bot 能叫 Bot（預設開）
 //   roster list|add|remove|import  管理自己的名冊 <HOME>\roster.json（Bot 和成員；add 只要 Discord ID）
 //   start | stop | status      啟動（背景執行）、停止、查看狀態
-//   shortcut [--dir <資料夾>]   產生雙擊用的「啟動／停止 channelcollab Bot.bat」（預設放桌面）
+//   shortcut [--dir <資料夾>] [--name <名稱>]   產生雙擊用的「啟動／停止 <Bot 名稱>.bat」等（預設放桌面）
 //   --self-test                不需要 token 的自我測試
 //
 // HOME：--home <路徑> 優先，其次環境變數 CHANNELCOLLAB_HOME，預設 %USERPROFILE%\.channelcollab。
@@ -31,6 +31,8 @@ const SCRIPT_DIR = path.dirname(SCRIPT_PATH);
 const SOURCE_RUNTIME = fs.existsSync(path.join(SCRIPT_DIR, 'bot.mjs')) ? SCRIPT_DIR : path.resolve(SCRIPT_DIR, '..', 'runtime');
 const RUNTIME_FILES = ['bot.mjs', 'stop.mjs', 'package.json', 'package-lock.json'];
 const MIN_NODE_MAJOR = 22;
+/** Agent SDK 的提醒代碼（見 filterStderr）。 */
+const SDK_SHADOW_WARNING = 'CLAUDE_SDK_CAN_USE_TOOL_SHADOWED';
 const READY_WAIT_S = 90;
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'auto'];
 const SNOWFLAKE = /^\d{17,20}$/;
@@ -105,6 +107,15 @@ function readConfig(file) {
   return c;
 }
 
+/** 用途：none（還沒設定）、dm-only（只用私訊）、channels（只有頻道）、both（頻道＋私訊）。 */
+export function configMode(channelCount, dmOn) {
+  if (channelCount && dmOn) return 'both';
+  if (channelCount) return 'channels';
+  return dmOn ? 'dm-only' : 'none';
+}
+
+export const MODE_LABEL = { none: '還沒設定（沒有綁頻道，也沒開私訊）', 'dm-only': '只用私訊', channels: '團隊頻道協作', both: '團隊頻道協作＋私訊' };
+
 /** 不含 token 的設定摘要（給 check／status 用）。 */
 export function configSummary(file) {
   if (!fs.existsSync(file)) return { exists: false, hasToken: false, ownerId: null, guildId: null, channels: {} };
@@ -122,6 +133,7 @@ export function configSummary(file) {
     defaultMode: c.defaults?.permission_mode ?? null,
     channels,
     dm,
+    mode: configMode(Object.keys(channels).length, !!dm),
     rosterOnly: c.access?.roster_only !== false,
     pinUnlockMinutes: typeof c.security?.pin_unlock_minutes === 'number' ? c.security.pin_unlock_minutes : 30,
     ownerWaitMinutes: typeof c.defaults?.owner_wait_minutes === 'number' ? c.defaults.owner_wait_minutes : 2,
@@ -772,6 +784,29 @@ function readLines(file, maxBytes = 256 * 1024) {
   }
 }
 
+/**
+ * bot.err.log 裡不算錯誤的行：Agent SDK 對 reply 工具的提醒（reply 一律放行是刻意的設計），
+ * 以及緊接在它後面的 Node 提示「(Use `node --trace-warnings ...`」。0.1.6 起啟動時已用
+ * --disable-warning 關掉，這裡過濾舊 log 和舊版留下的行。
+ */
+export function filterStderr(lines) {
+  const out = [];
+  let afterShadowed = false;
+  for (const l of lines) {
+    if (/CLAUDE_SDK_CAN_USE_TOOL_SHADOWED/.test(l)) {
+      afterShadowed = true;
+      continue;
+    }
+    if (afterShadowed && /^\(Use `node --trace-warnings/.test(l.trim())) {
+      afterShadowed = false;
+      continue;
+    }
+    afterShadowed = false;
+    out.push(l);
+  }
+  return out;
+}
+
 export function parseLog(lines) {
   let ready = null;
   let start = null;
@@ -799,7 +834,7 @@ async function getStatus(p) {
   const running = await isRunning(p);
   const pid = readPid(p);
   const log = parseLog(readLines(p.log));
-  const errTail = readLines(p.errLog).slice(-5);
+  const errTail = filterStderr(readLines(p.errLog)).slice(-5);
   return {
     home: p.home,
     running,
@@ -814,6 +849,7 @@ async function getStatus(p) {
     pin: { set: fs.existsSync(p.pin), ...(running ? await pinState(p) : {}) },
     roster: rosterCounts(p.roster),
     runtime: runtimeState(p),
+    launchers: { 'set-pin': findLauncher(p, 'set-pin'), unlock: findLauncher(p, 'unlock') },
   };
 }
 
@@ -836,8 +872,7 @@ async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
   if (await isRunning(p)) {
     const s = parseLog(readLines(p.log));
     console.log(`✅ Bot 已經在執行中（${s.ready ? `登入成 ${s.ready.tag}` : '尚未登入完成'}），不用再啟動。`);
-    console.log('綁定的頻道：');
-    printChannels(cfg.channels);
+    printSetup(cfg, fs.existsSync(p.pin));
     return true;
   }
   const rt = runtimeState(p);
@@ -850,7 +885,8 @@ async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
   rotate(p.errLog, p.prevErrLog);
   const out = fs.openSync(p.log, 'a');
   const err = fs.openSync(p.errLog, 'a');
-  const child = spawn(process.execPath, [p.bot], {
+  // reply 工具一律放行是刻意的設計；SDK 對此的提醒不是錯誤，不寫進 bot.err.log。
+  const child = spawn(process.execPath, [`--disable-warning=${SDK_SHADOW_WARNING}`, p.bot], {
     cwd: p.runtime,
     env: { ...process.env, CHANNELCOLLAB_HOME: p.home },
     detached: true,
@@ -871,8 +907,7 @@ async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
     const s = parseLog(readLines(p.log));
     if (s.ready) {
       console.log(`✅ Bot 已上線：登入成 ${s.ready.tag}（Discord ID ${s.ready.id}）`);
-      console.log('綁定的頻道：');
-      printChannels(cfg.channels);
+      printSetup(cfg, fs.existsSync(p.pin));
       console.log('Bot 在背景執行，關掉這個視窗或 Claude Code 都不會停；要停止請用 stop。');
       return true;
     }
@@ -880,7 +915,7 @@ async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
   }
   const s = parseLog(readLines(p.log));
   console.log(exited !== null ? `❌ Bot 啟動失敗，程序已結束（代碼 ${exited}）。` : `❌ ${wait} 秒內沒有上線。`);
-  for (const l of [...s.errors, ...readLines(p.errLog).slice(-8)]) console.log(`   ${l}`);
+  for (const l of [...s.errors, ...filterStderr(readLines(p.errLog)).slice(-8)]) console.log(`   ${l}`);
   console.log('   常見原因：token 失效（請管理員重給交付檔）、網路連不到 discord.com、Message Content Intent 沒開。');
   process.exitCode = 1;
   return false;
@@ -947,12 +982,82 @@ async function stop(p) {
 // ---------------------------------------------------------------------------
 // 雙擊用的啟動／停止檔（.bat）
 // ---------------------------------------------------------------------------
+/** 0.1.5 以前的固定檔名（不知道 Bot 名稱時仍用它）。同一台電腦有好幾隻 Bot 時會互相覆蓋，所以 0.1.6 起檔名帶 Bot 名稱。 */
 export const LAUNCHER_NAMES = {
   start: '啟動 channelcollab Bot.bat',
   stop: '停止 channelcollab Bot.bat',
   'set-pin': '設定 channelcollab PIN.bat',
   unlock: '解除 channelcollab 鎖定.bat',
 };
+
+/** 檔名用的名稱：去掉 Discord 舊式的 #1234，不能用的字元換成 _，結尾的點和空白去掉。 */
+export function launcherLabel(name) {
+  const cleaned = String(name ?? '')
+    .replace(/#\d{1,4}$/, '')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+    .replace(/[. ]+$/, '')
+    .trim()
+    .slice(0, 60);
+  return cleaned || null;
+}
+
+/** 「啟動 <名稱>.bat」等；沒有名稱時用舊的固定檔名。 */
+export function launcherNames(label) {
+  if (!label) return { ...LAUNCHER_NAMES };
+  return { start: `啟動 ${label}.bat`, stop: `停止 ${label}.bat`, 'set-pin': `設定 ${label} PIN.bat`, unlock: `解除 ${label} 鎖定.bat` };
+}
+
+/**
+ * 捷徑檔名用的 Bot 名稱：--name；名冊裡這隻 Bot 的名稱或最後一次登入的名稱（bot.log）；
+ * 不是預設 HOME 時用 HOME 資料夾名稱。都沒有就是 null（用舊檔名）。
+ */
+export function botLabel(p, { name, defaultHome = path.join(os.homedir(), '.channelcollab') } = {}) {
+  if (name) return launcherLabel(name);
+  const ready = parseLog(readLines(p.log)).ready ?? parseLog(readLines(p.prevLog)).ready;
+  if (ready) {
+    const bots = readJsonSafe(p.roster)?.bots;
+    const fromRoster = Array.isArray(bots) ? bots.find((b) => b?.botId === ready.id)?.botName : undefined;
+    return launcherLabel(fromRoster || ready.tag);
+  }
+  if (path.resolve(p.home).toLowerCase() !== path.resolve(defaultHome).toLowerCase()) return launcherLabel(path.basename(p.home).replace(/^\.+/, ''));
+  return null;
+}
+
+/** shortcut 建立的檔案記在 <HOME>\launchers.json，status 用它指出實際存在的檔案。 */
+const launchersRecord = (p) => path.join(p.home, 'launchers.json');
+
+/** 這個 HOME 的某個捷徑檔（實際存在才回傳）；找不到時 null，status 改成顯示指令。 */
+export function findLauncher(p, action, { dirs = [] } = {}) {
+  const recorded = readJsonSafe(launchersRecord(p))?.files?.[action];
+  if (typeof recorded === 'string' && fs.existsSync(recorded)) return recorded;
+  // 0.1.5 以前建的舊檔名：放在 <HOME>\launchers（或指定的資料夾），內容指向這個 HOME 才算。
+  for (const dir of [path.join(p.home, 'launchers'), ...dirs]) {
+    const f = path.join(dir, LAUNCHER_NAMES[action]);
+    if (launcherPointsHere(f, p)) return f;
+  }
+  return null;
+}
+
+function readJsonSafe(file) {
+  try {
+    return readJson(file, null);
+  } catch {
+    return null;
+  }
+}
+
+function launcherPointsHere(file, p) {
+  try {
+    return fs.readFileSync(file, 'utf8').includes(`--home ${batq(p.home)}`);
+  } catch {
+    return false;
+  }
+}
+
+/** 沒有捷徑檔時給的指令（在終端機執行）。 */
+export function ctlCommand(p, action) {
+  return `node "${p.ctl}" ${action} --home "${p.home}"`;
+}
 
 /** cmd 的 % 要寫成 %%，其他字元在雙引號裡原樣保留。 */
 const batq = (s) => `"${String(s).replace(/%/g, '%%')}"`;
@@ -986,18 +1091,39 @@ function desktopDir() {
   return dir && fs.existsSync(dir) ? dir : path.join(os.homedir(), 'Desktop');
 }
 
-function makeLaunchers(p, dir) {
-  if (!runtimeState(p).installed) throw new CliError('runtime 還沒安裝。請先執行 install-runtime 或 start。');
-  syncCtl(p);
+/**
+ * 在 dir（預設桌面）建四個 .bat，檔名帶 Bot 名稱。同一個資料夾裡指向這個 HOME 的舊檔
+ * （0.1.5 的固定檔名、或改名前建的）會刪掉，指向別的 HOME 的不動。
+ */
+export function makeLaunchers(p, dir, { name, skipRuntimeCheck = false } = {}) {
+  if (!skipRuntimeCheck) {
+    if (!runtimeState(p).installed) throw new CliError('runtime 還沒安裝。請先執行 install-runtime 或 start。');
+    syncCtl(p);
+  }
   const target = path.resolve(dir || desktopDir());
   fs.mkdirSync(target, { recursive: true });
+  const names = launcherNames(botLabel(p, { name }));
+  const prev = readJsonSafe(launchersRecord(p))?.files ?? {};
   const files = [];
-  for (const action of Object.keys(LAUNCHER_NAMES)) {
-    const file = path.join(target, LAUNCHER_NAMES[action]);
+  const removed = [];
+  const record = {};
+  for (const action of Object.keys(names)) {
+    const file = path.join(target, names[action]);
     fs.writeFileSync(file, launcherBat(p, action), 'utf8');
     files.push(file);
+    record[action] = file;
+    const stale = [path.join(target, LAUNCHER_NAMES[action]), typeof prev[action] === 'string' ? prev[action] : null].filter(Boolean);
+    for (const old of stale) {
+      if (path.resolve(old).toLowerCase() === path.resolve(file).toLowerCase()) continue;
+      if (path.dirname(path.resolve(old)).toLowerCase() !== target.toLowerCase()) continue;
+      if (launcherPointsHere(old, p)) {
+        fs.rmSync(old, { force: true });
+        removed.push(old);
+      }
+    }
   }
-  return files;
+  writeJson(launchersRecord(p), { version: 1, dir: target, files: record });
+  return { files, removed };
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,6 +1132,18 @@ function makeLaunchers(p, dir) {
 function printDm(dm, pinSet) {
   if (!dm) return console.log('私訊：未開啟（要用的話：bind --dm --cwd <資料夾>，並先設定 PIN）');
   console.log(`私訊：開啟 → ${dm.cwd}（模型 ${dm.model ?? '預設'}，權限模式 ${dm.permission_mode ?? '沿用預設'}${dm.launcher ? `，啟動器 ${dm.launcher}` : ''}）${pinSet ? '' : '　⚠️ 還沒設定 PIN，私訊暫不開放'}`);
+}
+
+/** 模式、頻道、私訊（start 和 status 共用）。 */
+function printSetup(c, pinSet) {
+  console.log(`模式：${MODE_LABEL[c.mode] ?? c.mode}`);
+  if (c.mode === 'none') console.log('   ⚠️ 要先綁一個頻道（/channelcollab:bind），或開私訊（bind --dm --cwd <資料夾>，並設定 PIN）');
+  if (c.mode === 'dm-only') console.log('綁定的頻道：無（只用私訊，不需要；之後想加入團隊頻道，用 /channelcollab:bind 綁頻道就好）');
+  else {
+    console.log('綁定的頻道：');
+    printChannels(c.channels);
+  }
+  printDm(c.dm, pinSet);
 }
 
 function printChannels(channels) {
@@ -1017,6 +1155,12 @@ function printChannels(channels) {
   }
 }
 
+/** status 的提示：捷徑檔真的存在才叫使用者雙擊它，否則給指令。 */
+export function launcherHint(s, action) {
+  const f = s.launchers?.[action];
+  return f ? `雙擊「${f}」` : `在終端機執行 ${ctlCommand(paths(s.home), action)}`;
+}
+
 function printStatus(s) {
   console.log(`HOME：${s.home}`);
   if (s.running) console.log(`✅ Bot 執行中（pid ${s.pid ?? '?'}）${s.loggedInAs ? `，登入成 ${s.loggedInAs}（ID ${s.botId}）` : '，尚未登入完成'}`);
@@ -1026,15 +1170,15 @@ function printStatus(s) {
   if (!c.exists) console.log('❌ 還沒有設定檔（請執行 setup）');
   else {
     console.log(`${c.hasToken ? '✅' : '❌'} Bot token ${c.hasToken ? '已設定' : '未設定'}`);
-    console.log(`${c.ownerId ? '✅' : '⚠️ '} 主人 Discord ID：${c.ownerId ?? '未設定（權限按鈕需要）'}`);
-    console.log('綁定的頻道：');
-    printChannels(c.channels);
-    printDm(c.dm, s.pin?.set);
+    console.log(`${c.ownerId ? '✅' : '⚠️ '} 主人 Discord ID：${c.ownerId ?? `未設定（權限按鈕${c.dm ? '和私訊' : ''}需要）`}`);
+    printSetup(c, s.pin?.set);
     console.log(`白名單：${c.rosterOnly ? '開啟（只有主人和名冊上的人、Bot 能叫 Bot）' : '⚠️ 關閉（伺服器裡任何人都能叫 Bot）'}`);
   }
   const pin = s.pin ?? {};
-  if (!pin.set) console.log('⚠️  PIN：未設定（建議設定：set-pin，或雙擊桌面的「設定 channelcollab PIN.bat」；私訊需要 PIN）');
-  else console.log(`✅ PIN：已設定${pin.locked ? '，🔒 目前鎖定中（輸錯太多次，用 unlock 解除）' : ''}`);
+  if (!pin.set) {
+    const needed = c?.dm ? '私訊要有 PIN 才會開放' : '建議設定；開私訊時必須設定';
+    console.log(`${c?.dm ? '❌' : '⚠️ '} PIN：未設定（${needed}：${launcherHint(s, 'set-pin')}，或用 /channelcollab:bind 設定 PIN）`);
+  } else console.log(`✅ PIN：已設定${pin.locked ? `，🔒 目前鎖定中（輸錯太多次；解除：${launcherHint(s, 'unlock')}）` : ''}`);
   const r = s.roster;
   if (r?.broken) console.log('⚠️  名冊：<HOME>\\roster.json 格式不對，Bot 會當作空名冊');
   else if (!r || (!r.bots && !r.members)) console.log('名冊：空的（可以用 /channelcollab:roster 把常合作的人和 Bot 加進來）');
@@ -1159,9 +1303,13 @@ const commands = {
     printStatus(s);
   },
   async shortcut(p, opts) {
-    const files = makeLaunchers(p, typeof opts.dir === 'string' ? opts.dir : undefined);
+    const { files, removed } = makeLaunchers(p, typeof opts.dir === 'string' ? opts.dir : undefined, { name: opt(opts.name) });
     console.log('✅ 已建立雙擊用的檔案：');
     for (const f of files) console.log(`  - ${f}`);
+    if (removed.length) {
+      console.log('   已刪除同一個資料夾裡、指向這個 Bot 的舊捷徑：');
+      for (const f of removed) console.log(`  - ${f}`);
+    }
     console.log('   雙擊「啟動」會在背景啟動 Bot 並顯示是否上線；看到結果後按任意鍵關閉視窗，Bot 會繼續執行。');
     console.log('   「設定 PIN」設定核准用 PIN；「解除鎖定」在 PIN 輸錯太多次被鎖定時使用。');
   },
@@ -1273,7 +1421,7 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
   start [--wait <秒>] [--no-update]       在背景啟動 Bot，等它上線
   stop                                    停止 Bot，並確認沒有殘留程序
   status [--json]                         Bot 是否在跑、登入成誰、綁定、最近錯誤
-  shortcut [--dir <資料夾>]               產生雙擊用的啟動／停止 .bat（預設放桌面）
+  shortcut [--dir <資料夾>] [--name <名稱>]  產生雙擊用的啟動／停止／PIN／解除鎖定 .bat，檔名帶 Bot 名稱（預設放桌面）
   --self-test                             自我測試
 
 HOME：--home 優先，其次 CHANNELCOLLAB_HOME，預設 %USERPROFILE%\\.channelcollab`;
@@ -1627,6 +1775,102 @@ async function selfTest() {
     const p = paths('C:\\Users\\someone\\.channelcollab');
     eq(launcherBat(p, 'set-pin', 'C:\\node.exe').includes(`"${p.ctl}" set-pin --home "${p.home}"`), true);
     eq(Object.keys(LAUNCHER_NAMES), ['start', 'stop', 'set-pin', 'unlock']);
+  });
+
+  console.log('只用私訊（0.1.6）');
+  await t('只有 dm 設定：模式是「只用私訊」，沒綁頻道不算問題', () => {
+    const f = path.join(tmp, 'dm-only.json');
+    fs.writeFileSync(f, JSON.stringify({ discord: { token: FAKE, owner_id: CH }, dm: { cwd: tmp, permission_mode: 'default' } }), 'utf-8');
+    const c = configSummary(f);
+    eq([c.mode, Object.keys(c.channels).length, c.dm.cwd, c.guildId], ['dm-only', 0, tmp, null]);
+    eq(MODE_LABEL[c.mode], '只用私訊');
+    eq([configMode(0, false), configMode(2, false), configMode(1, true), configMode(0, true)], ['none', 'channels', 'both', 'dm-only']);
+  });
+  await t('status：只用私訊顯示模式、不要求綁頻道；都沒設定才提示要設定', async () => {
+    const run = (config) => {
+      const lines = [];
+      const orig = console.log;
+      console.log = (...a) => lines.push(a.join(' '));
+      try {
+        printStatus({ home: tmp, running: false, config, pin: { set: true }, roster: { bots: 0, members: 0 }, runtime: { installed: false }, recentErrors: [], stderrTail: [], launchers: {} });
+      } finally {
+        console.log = orig;
+      }
+      return lines.join('\n');
+    };
+    const base = { exists: true, hasToken: true, ownerId: CH, channels: {}, rosterOnly: true };
+    const dmOnly = run({ ...base, dm: { cwd: tmp }, mode: 'dm-only' });
+    eq(dmOnly.includes('模式：只用私訊'), true, 'dm-only');
+    eq(dmOnly.includes('還沒有綁定任何頻道'), false, '不把沒綁頻道當問題');
+    eq(dmOnly.includes('要先綁一個頻道'), false);
+    const none = run({ ...base, dm: null, mode: 'none' });
+    eq(none.includes('要先綁一個頻道'), true, 'none 要提示');
+  });
+
+  console.log('最近的錯誤（0.1.6）');
+  await t('過濾 SDK 對 reply 工具的提醒和它下一行的 trace-warnings 提示，其他錯誤保留', () => {
+    const lines = [
+      '(node:1) [CLAUDE_SDK_CAN_USE_TOOL_SHADOWED] Warning: canUseTool will not be invoked for: mcp__channelcollab__reply. Bare allowedTools entries ...',
+      '(Use `node --trace-warnings ...` to show where the warning was created)',
+      'Error: real problem',
+      '(node:2) [DEP0040] DeprecationWarning: something else',
+      '(Use `node --trace-warnings ...` to show where the warning was created)',
+    ];
+    eq(filterStderr(lines), [lines[2], lines[3], lines[4]]);
+  });
+
+  console.log('捷徑檔名（0.1.6）');
+  await t('檔名帶 Bot 名稱，去掉 #1234 和不能用的字元；沒有名稱時用舊檔名', () => {
+    eq(launcherLabel('Test-Bot#1234'), 'Test-Bot');
+    eq(launcherLabel('a/b:c?'), 'a_b_c_');
+    eq(launcherLabel('  '), null);
+    eq(launcherNames('Test-Bot'), { start: '啟動 Test-Bot.bat', stop: '停止 Test-Bot.bat', 'set-pin': '設定 Test-Bot PIN.bat', unlock: '解除 Test-Bot 鎖定.bat' });
+    eq(launcherNames(null), LAUNCHER_NAMES);
+  });
+  await t('名稱來源：bot.log 最後登入的 Bot（名冊有就用名冊的名稱）；非預設 HOME 用資料夾名稱', () => {
+    const h = path.join(tmp, 'labels', '.channelcollab-second');
+    fs.mkdirSync(h, { recursive: true });
+    const p = paths(h);
+    eq(botLabel(p, { defaultHome: path.join(tmp, 'nothing') }), 'channelcollab-second', '資料夾名稱');
+    eq(botLabel(paths(path.join(tmp, 'def')), { defaultHome: path.join(tmp, 'def') }), null, '預設 HOME、沒有 log');
+    fs.writeFileSync(p.log, '[01:00:01.000] [ready] logged in as test-bot#0001 id=222222222222222222 guilds=1\n', 'utf-8');
+    eq(botLabel(p), 'test-bot');
+    fs.writeFileSync(p.roster, JSON.stringify({ version: 1, bots: [{ botId: '222222222222222222', botName: '測試Bot' }] }), 'utf-8');
+    eq(botLabel(p), '測試Bot');
+    eq(botLabel(p, { name: '指定名稱' }), '指定名稱');
+  });
+  await t('兩個 HOME 的捷徑放同一個資料夾不會互相覆蓋；舊的固定檔名（指向自己）會被換掉，指向別人的不動', () => {
+    const dir = path.join(tmp, 'shared-launchers');
+    const a = paths(path.join(tmp, 'homes', 'a'));
+    const b = paths(path.join(tmp, 'homes', 'b'));
+    for (const p of [a, b]) fs.mkdirSync(p.home, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
+    // 0.1.5 留下的舊檔：start 指向 a、stop 指向 b
+    fs.writeFileSync(path.join(dir, LAUNCHER_NAMES.start), launcherBat(a, 'start'), 'utf8');
+    fs.writeFileSync(path.join(dir, LAUNCHER_NAMES.stop), launcherBat(b, 'stop'), 'utf8');
+    const ra = makeLaunchers(a, dir, { name: 'Bot-A', skipRuntimeCheck: true });
+    const rb = makeLaunchers(b, dir, { name: 'Bot-B', skipRuntimeCheck: true });
+    eq(ra.files.map((f) => path.basename(f)), Object.values(launcherNames('Bot-A')));
+    eq(ra.removed.map((f) => path.basename(f)), [LAUNCHER_NAMES.start], 'a 只刪自己的舊檔');
+    eq(rb.removed.map((f) => path.basename(f)), [LAUNCHER_NAMES.stop]);
+    const left = fs.readdirSync(dir).sort();
+    eq(left, [...Object.values(launcherNames('Bot-A')), ...Object.values(launcherNames('Bot-B'))].sort());
+    eq(fs.readFileSync(path.join(dir, '啟動 Bot-A.bat'), 'utf8').includes(`--home "${a.home}"`), true);
+    eq(fs.readFileSync(path.join(dir, '啟動 Bot-B.bat'), 'utf8').includes(`--home "${b.home}"`), true);
+  });
+  await t('status 的 PIN 提示指向實際存在的檔案，找不到時改成顯示指令', () => {
+    const p = paths(path.join(tmp, 'homes', 'a'));
+    const f = findLauncher(p, 'set-pin');
+    eq(path.basename(f), '設定 Bot-A PIN.bat');
+    eq(launcherHint({ home: p.home, launchers: { 'set-pin': f } }, 'set-pin'), `雙擊「${f}」`);
+    fs.rmSync(f);
+    eq(findLauncher(p, 'set-pin'), null, '刪掉後找不到');
+    eq(launcherHint({ home: p.home, launchers: { 'set-pin': null } }, 'set-pin'), `在終端機執行 node "${p.ctl}" set-pin --home "${p.home}"`);
+    // 0.1.5 的舊檔名放在 <HOME>\launchers 也找得到
+    const legacy = paths(path.join(tmp, 'homes', 'legacy'));
+    fs.mkdirSync(path.join(legacy.home, 'launchers'), { recursive: true });
+    fs.writeFileSync(path.join(legacy.home, 'launchers', LAUNCHER_NAMES['set-pin']), launcherBat(legacy, 'set-pin'), 'utf8');
+    eq(path.basename(findLauncher(legacy, 'set-pin')), LAUNCHER_NAMES['set-pin']);
   });
 
   console.log('Node 版本');

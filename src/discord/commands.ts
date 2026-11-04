@@ -1,22 +1,32 @@
 /**
- * `!` commands and other small rules for direct messages and threads (pure:
- * no Discord client, so they can be tested on their own; src/features.test.ts).
+ * `!` and `/` commands and other small rules for direct messages and threads
+ * (pure: no Discord client, so they can be tested on their own;
+ * src/features.test.ts). A slash command becomes the same Command a `!`
+ * message does, passes the same gate and runs through the same runCommand.
  */
+import { canAct } from '../runner/policy.js';
 
-export type CommandName = 'help' | 'clear' | 'resume' | 'stop' | 'status' | 'model' | 'plan' | 'compact' | 'retry';
-export type Command = { name: CommandName; arg?: string };
+export type CommandName = 'help' | 'clear' | 'resume' | 'stop' | 'status' | 'model' | 'plan' | 'compact' | 'retry' | 'skill';
+/** `rest`: what follows the skill name in `!skill <name> <args>`. */
+export type Command = { name: CommandName; arg?: string; rest?: string };
 
-type Spec = { dmOnly: boolean; takesArg: boolean; desc: string };
+/**
+ * dmOnly: only in a direct message with the bot. private: the answer is only
+ * for the person who used it (a slash command answers ephemerally); the others
+ * change the conversation and leave a short public note.
+ */
+type Spec = { dmOnly: boolean; takesArg: boolean; private: boolean; desc: string; example?: string };
 export const COMMANDS: Record<CommandName, Spec> = {
-  help: { dmOnly: false, takesArg: false, desc: '列出指令' },
-  clear: { dmOnly: true, takesArg: false, desc: '結束目前的對話，下一則訊息開新的' },
-  resume: { dmOnly: true, takesArg: false, desc: '從清單選一段以前的對話接回來' },
-  stop: { dmOnly: false, takesArg: false, desc: '中斷 Claude 正在做的這一輪（同 🛑）' },
-  status: { dmOnly: false, takesArg: false, desc: '工作目錄、模型、模式、花費、上下文和額度' },
-  model: { dmOnly: false, takesArg: true, desc: '換模型（haiku／sonnet／opus），例如 !model sonnet' },
-  plan: { dmOnly: false, takesArg: false, desc: '切到計畫模式（只討論不動手），再打一次切回' },
-  compact: { dmOnly: false, takesArg: false, desc: '壓縮上下文，讓對話可以繼續' },
-  retry: { dmOnly: false, takesArg: false, desc: '把上一則訊息原樣重送一次' },
+  help: { dmOnly: false, takesArg: false, private: true, desc: '列出指令' },
+  clear: { dmOnly: true, takesArg: false, private: false, desc: '結束目前的對話，下一則訊息開新的' },
+  resume: { dmOnly: true, takesArg: false, private: true, desc: '從清單選一段以前的對話接回來' },
+  stop: { dmOnly: false, takesArg: false, private: false, desc: '中斷 Claude 正在做的這一輪（同 🛑）' },
+  status: { dmOnly: false, takesArg: false, private: true, desc: '工作目錄、模型、模式、花費、上下文和額度' },
+  model: { dmOnly: false, takesArg: true, private: false, desc: '換模型（haiku／sonnet／opus）', example: 'sonnet' },
+  plan: { dmOnly: false, takesArg: false, private: false, desc: '切到計畫模式（只討論不動手），再用一次切回' },
+  compact: { dmOnly: false, takesArg: false, private: false, desc: '壓縮上下文，讓對話可以繼續' },
+  retry: { dmOnly: false, takesArg: false, private: false, desc: '把上一則訊息原樣重送一次' },
+  skill: { dmOnly: false, takesArg: true, private: false, desc: '執行 Claude Code 的 skill 或自訂指令', example: '<名稱> [參數]' },
 };
 
 export const MODEL_CHOICES = [
@@ -36,7 +46,11 @@ export function stripMentions(text: string): string {
  * ordinary message.
  */
 export function parseCommand(text: string): Command | undefined {
-  const m = /^!([a-z]+)(?:\s+(\S+))?$/i.exec(stripMentions(text));
+  const clean = stripMentions(text);
+  // `!skill` alone lists the skills; `!skill <name> <args...>` runs one.
+  const sk = /^!skill(?:\s+(\S+)(?:\s+(.+))?)?$/i.exec(clean);
+  if (sk) return { name: 'skill', ...(sk[1] !== undefined ? { arg: sk[1] } : {}), ...(sk[2] !== undefined ? { rest: sk[2] } : {}) };
+  const m = /^!([a-z]+)(?:\s+(\S+))?$/i.exec(clean);
   if (!m) return undefined;
   const name = m[1].toLowerCase() as CommandName;
   const spec = COMMANDS[name];
@@ -55,10 +69,152 @@ export function normalizeModel(arg: string): string | undefined {
 export function helpText(kind: 'thread' | 'dm'): string {
   const lines = (Object.entries(COMMANDS) as [CommandName, Spec][])
     .filter(([, s]) => kind === 'dm' || !s.dmOnly)
-    .map(([n, s]) => `\`!${n}\`　${s.desc}`);
-  const who = kind === 'dm' ? '' : '\n討論串裡只有 Bot 的主人或提出需求的人能用；`!clear`、`!resume` 只能在私訊用。';
-  return `**指令**（訊息只打指令才算，大小寫都可以）\n${lines.join('\n')}${who}`;
+    .map(([n, s]) => `\`/${n}\`${s.example ? ` ${s.example}` : ''}　${s.desc}`);
+  const who = kind === 'dm' ? '' : '\n討論串裡只有 Bot 的主人或提出需求的人能用；`/clear`、`/resume` 只能在私訊用。';
+  return [
+    '**指令**：打 `/` 會跳出選單，同一個伺服器有好幾隻 Bot 時，請選這隻 Bot 底下的指令。',
+    '也可以打 `!` 開頭的備用寫法（例如 `!model sonnet`、`!skill <名稱> [參數]`，訊息只打指令才算）。',
+    ...lines,
+    '`/skill` 的名稱會從清單選；清單是這個工作資料夾上次開對話時 Claude Code 提供的 skill 和自訂指令（還沒開過對話時，先傳一則訊息）。skill 用到的工具一樣要按權限按鈕。',
+  ].join('\n') + who;
 }
+
+// ---------------------------------------------------------------------------
+// Slash commands (Discord application commands)
+// ---------------------------------------------------------------------------
+
+/** Discord API values (no discord.js here, to keep this file pure). */
+const CHAT_INPUT = 1;
+const STRING = 3;
+const CONTEXT_GUILD = 0;
+const CONTEXT_BOT_DM = 1;
+const GUILD_INSTALL = 0;
+
+type SlashOption = { type: number; name: string; description: string; required?: boolean; autocomplete?: boolean; max_length?: number; choices?: { name: string; value: string }[] };
+export type SlashDefinition = { type: number; name: string; description: string; contexts: number[]; integration_types: number[]; options?: SlashOption[] };
+
+/**
+ * The global commands this bot registers (bulk overwrite on start, so a
+ * restart never duplicates them). Direct-message-only commands are offered
+ * only in the direct message; the rest in servers (threads included) too.
+ */
+export function slashDefinitions(): SlashDefinition[] {
+  return (Object.entries(COMMANDS) as [CommandName, Spec][]).map(([name, s]) => {
+    const def: SlashDefinition = {
+      type: CHAT_INPUT,
+      name,
+      description: s.desc.slice(0, 100),
+      contexts: s.dmOnly ? [CONTEXT_BOT_DM] : [CONTEXT_GUILD, CONTEXT_BOT_DM],
+      integration_types: [GUILD_INSTALL],
+    };
+    if (name === 'model') {
+      def.options = [{ type: STRING, name: 'name', description: '要換成的模型（不選就顯示按鈕）', required: false, choices: MODEL_CHOICES.map((m) => ({ name: `${m.label}（${m.note}）`, value: m.alias })) }];
+    }
+    if (name === 'skill') {
+      def.options = [
+        { type: STRING, name: 'name', description: 'skill 或自訂指令的名稱（從清單選）', required: true, autocomplete: true, max_length: 100 },
+        { type: STRING, name: 'args', description: '要交給它的參數（選填）', required: false, max_length: 1500 },
+      ];
+    }
+    return def;
+  });
+}
+
+/** A slash command's name and options as the same Command a `!` message gives. */
+export function commandFromSlash(name: string, options: Record<string, string | undefined> = {}): Command | undefined {
+  if (!(name in COMMANDS)) return undefined;
+  const n = name as CommandName;
+  if (n === 'model') return options.name ? { name: n, arg: options.name } : { name: n };
+  if (n === 'skill') return { name: n, ...(options.name ? { arg: options.name } : {}), ...(options.args?.trim() ? { rest: options.args.trim() } : {}) };
+  return { name: n };
+}
+
+// ---------------------------------------------------------------------------
+// Who may use a command where (the same rules for `!` and `/`)
+// ---------------------------------------------------------------------------
+
+export type GateRefusal =
+  | 'locked'
+  | 'unbound'
+  | 'not-allowed'
+  | 'not-thread'
+  | 'dm-only'
+  | 'not-actor'
+  | 'dm-not-owner'
+  | 'dm-disabled'
+  | 'dm-no-pin'
+  | 'dm-pin-needed';
+
+export type GateFacts = {
+  cmd: CommandName;
+  where: 'dm' | 'thread' | 'channel';
+  actorId: string;
+  ownerId?: string;
+  /** Locked after too many wrong PINs. */
+  locked: boolean;
+  /** Server: the channel (or the thread's parent) is bound, in the configured server. */
+  bound?: boolean;
+  /** Server: the allowlist is on and the actor is not on it. */
+  notAllowed?: boolean;
+  /** Thread: whoever asked for the running turn, else the thread's starter. */
+  requesterId?: string;
+  /** Direct message: the dm block is set, a PIN is set, the PIN was entered recently. */
+  dmEnabled?: boolean;
+  pinSet?: boolean;
+  pinUnlocked?: boolean;
+};
+
+/** Why a command may not run here, or undefined when it may. */
+export function commandGate(f: GateFacts): GateRefusal | undefined {
+  if (f.locked) return 'locked';
+  if (f.where === 'dm') {
+    const a = dmAccess({ authorId: f.actorId, ownerId: f.ownerId, dmEnabled: !!f.dmEnabled });
+    if (a === 'not-owner') return 'dm-not-owner';
+    if (a === 'disabled') return 'dm-disabled';
+    if (!f.pinSet) return 'dm-no-pin';
+    if (!f.pinUnlocked) return 'dm-pin-needed';
+    return undefined;
+  }
+  if (!f.bound) return 'unbound';
+  if (f.notAllowed) return 'not-allowed';
+  if (f.where !== 'thread') return 'not-thread';
+  if (COMMANDS[f.cmd].dmOnly) return 'dm-only';
+  // Like 🛑: the owner, or whoever asked for the running turn (else the thread's starter).
+  if (!canAct('stop', f.actorId, { ownerId: f.ownerId, requesterId: f.requesterId })) return 'not-actor';
+  return undefined;
+}
+
+/** What to tell the person (a `!` message is answered only for some refusals; see bot.ts). */
+export function gateText(r: GateRefusal, f: { cmd: CommandName; ownerId?: string; requesterId?: string; slash?: boolean }): string {
+  const c = `${f.slash ? '/' : '!'}${f.cmd}`;
+  switch (r) {
+    case 'locked':
+      return '🔒 已鎖定（PIN 輸錯太多次）。請在電腦上執行 unlock 或重啟 Bot 解除。';
+    case 'unbound':
+      return '這個頻道沒有綁定這隻 Bot，指令只能在綁定頻道的討論串裡（或私訊 Bot）使用。';
+    case 'not-allowed':
+      return '你不在這隻 Bot 的白名單裡，請 Bot 的主人把你加進名冊。';
+    case 'not-thread':
+      return '指令請在討論串裡（或私訊 Bot）使用。';
+    case 'dm-only':
+      return `\`${c}\` 只能在私訊 Bot 時使用。`;
+    case 'not-actor': {
+      const names = [f.requesterId, f.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
+      return `只有 ${names.join(' 或 ') || 'Bot 的主人'} 可以在這個討論串用指令。`;
+    }
+    case 'dm-not-owner':
+      return '這隻 Bot 只接受主人私訊。';
+    case 'dm-disabled':
+      return '私訊未開啟：請在電腦上用 /channelcollab:bind 開啟私訊（要先設定 PIN）。';
+    case 'dm-no-pin':
+      return NO_PIN_TEXT;
+    case 'dm-pin-needed':
+      return '🔒 私訊要先輸入 PIN 解鎖，解鎖後再用一次指令。';
+  }
+}
+
+/** Direct messages without a PIN set (the shortcut file names differ per bot, so none is named here). */
+export const NO_PIN_TEXT = '私訊要先設定 PIN 才能用：請在電腦上執行 channelcollab 的 set-pin（或在 Claude Code 用 /channelcollab:bind 設定 PIN）。';
 
 /** Who may use a direct message: only the bot's owner, and only when the dm block is set. */
 export function dmAccess(f: { authorId: string; ownerId?: string; dmEnabled: boolean }): 'run' | 'not-owner' | 'disabled' {
