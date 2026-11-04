@@ -560,7 +560,7 @@ channelcollab 會在每個 session 附上一份協作守則（`--append-system-p
 - **Claude Code 斜線指令**：`/channelcollab:start`、`/channelcollab:stop`、`/channelcollab:status`，呼叫 plugin 裡同一支總控腳本。
 - `start`：Bot 以 detached、隱藏視窗的子程序在背景執行，stdout／stderr 寫到 `<HOME>\bot.log`／`bot.err.log`（上一次的改名為 `bot.prev*.log`），等 log 出現 `[ready]`（最多 90 秒）後回報登入身分與綁定的頻道。已經在跑（停止用的 named pipe 連得上）就只回報「已在執行中」，不重複啟動。
   - 實測（0.1.2）：Bot 是 DETACHED_PROCESS（沒有 console），關閉 console 不會影響它；開發環境裡的程序都在一個工作階段層級的 job（允許 silent breakaway、沒有 KILL_ON_JOB_CLOSE），沒有會連帶結束 Bot 的 job。情境 A：在 headless Claude Code（`claude -p`）裡用 Bash 執行 `start`，Claude 結束 23 分鐘後 Bot 仍在線、log 沒有中斷，之後 `stop` 正常。情境 B：在 console 視窗執行啟動 `.bat`，上線後對視窗送 WM_CLOSE（等同按 X），cmd 與 console 都結束，Bot 仍在線。所以啟動方式維持 `spawn(detached)`，不需要另外脫離 job。
-  - 用 PowerShell `Start-Process -NoNewWindow` 或直接在終端機前景執行 `npm start` 的 Bot 掛在那個終端機的 console 上，關掉終端機就會一起結束；要在背景長時間執行，請用 `start`。
+  - 未實測：關掉多工終端機面板本身（不只是結束其中的 Claude）、Windows Terminal 分頁、啟動等待期間（spawn 到 `[ready]`）就關掉啟動者。開發時曾有一個以 `Start-Process` 執行 `npm start` 的 Bot 在面板關閉時被一起結束，確切原因未查明；要在背景長時間執行，請用 `start`。
 - `stop`：執行 runtime 的 `stop.mjs`（同 `npm run stop`），再確認 Bot 程序和停止前記下的子孫程序都已結束。
 - **開機自動啟動暫不提供**：用工作排程器註冊登入工作的做法，在開發環境被 Claude Code 自動模式判定為未授權的常駐設定而擋下；使用者決定改成桌面雙擊。Phase 0-7 維持未驗證。
 
