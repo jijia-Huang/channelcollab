@@ -785,6 +785,16 @@ export function parseLog(lines) {
   return { start, ready, errors: errors.slice(-5) };
 }
 
+/** 執行中的 Bot 的 PIN 狀態（鎖定與否）；0.1.5 以前的 Bot 不認得這個指令，回傳空物件。 */
+async function pinState(p) {
+  try {
+    const v = JSON.parse((await pipeRequest(stopPipe(p.home), 'pin-state')) || '{}');
+    return v && typeof v === 'object' ? v : {};
+  } catch {
+    return {};
+  }
+}
+
 async function getStatus(p) {
   const running = await isRunning(p);
   const pid = readPid(p);
@@ -801,7 +811,7 @@ async function getStatus(p) {
     recentErrors: log.errors,
     stderrTail: errTail,
     config: configSummary(p.config),
-    pin: { set: fs.existsSync(p.pin), ...(running ? JSON.parse((await pipeRequest(stopPipe(p.home), 'pin-state')) || '{}') : {}) },
+    pin: { set: fs.existsSync(p.pin), ...(running ? await pinState(p) : {}) },
     roster: rosterCounts(p.roster),
     runtime: runtimeState(p),
   };

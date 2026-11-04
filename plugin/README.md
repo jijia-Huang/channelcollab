@@ -7,7 +7,7 @@
 | 指令 | 用途 |
 |---|---|
 | `/channelcollab:setup` | 設定精靈：檢查 Node、安裝執行環境、匯入管理員給的交付檔、綁定頻道、啟動 Bot |
-| `/channelcollab:bind` | 新增、修改、移除頻道綁定 |
+| `/channelcollab:bind` | 新增、修改、移除頻道綁定；開關私訊（主人私訊 Bot）；設定核准用 PIN、白名單 |
 | `/channelcollab:start`、`/channelcollab:stop`、`/channelcollab:status` | 啟動、停止、查看狀態（也可以雙擊 setup 在桌面建立的 .bat） |
 | `/channelcollab:roster` | 管理自己的名冊（Bot 認得哪些 Bot、哪些人）；加入只要 Discord ID |
 | `/channelcollab:guidelines` | 協作守則 |

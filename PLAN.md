@@ -606,10 +606,11 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 ├─ src/                               Bot 本體（TypeScript）
 │   ├─ main.ts                        進入點（npm start）
 │   ├─ stop.ts                        npm run stop
-│   ├─ config.ts、log.ts、roster.ts、roster.test.ts
-│   ├─ discord/                       收發、按鈕、選單、表情、詳細
+│   ├─ config.ts、log.ts、roster.ts、roster.test.ts、features.test.ts
+│   ├─ discord/                       收發、按鈕、選單、表情、詳細；conversation（討論串與私訊共用的一輪）、commands／command-run（! 指令）、approvals-ui（稍後核准）、pin-ui
 │   ├─ router/                        觸發判斷、轉手計數、排隊
-│   ├─ runner/                        Agent SDK 驅動、啟動器、session 池
+│   ├─ runner/                        Agent SDK 驅動、啟動器、session 池；usage（上下文與額度提醒）、failure（錯誤訊息）、approvals（稍後核准）
+│   ├─ security/                      pin（核准用 PIN）、zones（禁區）、access（白名單）
 │   └─ store/                         本機狀態（state.json）
 ├─ plugin/                            plugin 根目錄
 │   ├─ .claude-plugin/plugin.json     名稱 channelcollab、版本
