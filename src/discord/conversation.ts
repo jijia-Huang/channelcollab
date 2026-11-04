@@ -114,7 +114,8 @@ export async function runTurn(c: Conv, trigger: Message, status: StatusReactions
       }
     }
     // Something the owner decided while Claude was idle (e.g. denied the approve-later list).
-    if (ts.pendingNote && kind !== 'compact') {
+    // Not in front of a slash command (/compact, a skill, a retried skill): it must start with "/" to run; the note waits for the next turn.
+    if (ts.pendingNote && kind !== 'compact' && !prompt.startsWith('/')) {
       prompt = `${ts.pendingNote}\n\n${prompt}`;
       ts.pendingNote = undefined;
     }

@@ -2304,7 +2304,7 @@ async function runTurn(c, trigger, status, who, input = {}) {
         ts.last = text;
       }
     }
-    if (ts.pendingNote && kind !== "compact") {
+    if (ts.pendingNote && kind !== "compact" && !prompt.startsWith("/")) {
       prompt = `${ts.pendingNote}
 
 ${prompt}`;
