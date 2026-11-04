@@ -19,7 +19,7 @@
 ### 非目標
 
 - 不做規則式安全過濾。要不要找人、找誰，交給 Claude 依照協作守則判斷。
-- 不自動 merge。協作守則預設最多做到開 PR。
+- 不另外限制 merge。協作守則不規定 Bot 能做到哪一步；要不要 merge 依使用者在討論串的指示，執行指令時照常經主人核准。
 - 決策類功能不在本工具內（交給外部工具，例如決策類工具）。channelcollab 只提供 `resume` 指令讓外部工具接回來。
 - 不在程式碼或文件中提及、依賴任何其他特定 plugin 或外部系統。對外只有設定與指令介面。
 
@@ -500,7 +500,7 @@ channelcollab 會在每個 session 附上一份協作守則（`--append-system-p
 
 - 你是「OOO 的 Bot」，正在 Discord 討論串中與多人協作；訊息前綴標示了發話者。
 - **只透過 `reply` / `mention` 發言**，你的其他輸出別人看不到。發言要簡短、只講結論。
-- 小事直接做，**最多做到開 PR，不要 merge**。
+- 小事直接做；能做到哪一步（開 PR、merge）依使用者的指示，守則不另外限制。
 - 需要快速選擇時，用 AskUserQuestion（會變成 Discord 選單）。
 - 需要主人好好思考的決策：如果主人有安裝決策類的外部工具就交給它，然後回報「已交給主人決策」；沒有的話就 @ 主人。
 - **只有要交棒時才 @ 其他 Bot**，提到別人時不要用 @。
@@ -559,6 +559,8 @@ channelcollab 會在每個 session 附上一份協作守則（`--append-system-p
 - **桌面雙擊**：setup 用總控 `shortcut` 在桌面產生「啟動 channelcollab Bot.bat」「停止 channelcollab Bot.bat」（桌面位置向系統查詢，OneDrive 重新導向也正確）。`.bat` 執行 `<HOME>\runtime\ctl.mjs`（總控腳本的複本，每次 start／install-runtime／shortcut 都會同步），所以 plugin 更新後路徑仍有效；node 用產生時的絕對路徑，找不到再用 PATH 上的。
 - **Claude Code 斜線指令**：`/channelcollab:start`、`/channelcollab:stop`、`/channelcollab:status`，呼叫 plugin 裡同一支總控腳本。
 - `start`：Bot 以 detached、隱藏視窗的子程序在背景執行，stdout／stderr 寫到 `<HOME>\bot.log`／`bot.err.log`（上一次的改名為 `bot.prev*.log`），等 log 出現 `[ready]`（最多 90 秒）後回報登入身分與綁定的頻道。已經在跑（停止用的 named pipe 連得上）就只回報「已在執行中」，不重複啟動。
+  - 實測（0.1.2）：Bot 是 DETACHED_PROCESS（沒有 console），關閉 console 不會影響它；開發環境裡的程序都在一個工作階段層級的 job（允許 silent breakaway、沒有 KILL_ON_JOB_CLOSE），沒有會連帶結束 Bot 的 job。情境 A：在 headless Claude Code（`claude -p`）裡用 Bash 執行 `start`，Claude 結束 23 分鐘後 Bot 仍在線、log 沒有中斷，之後 `stop` 正常。情境 B：在 console 視窗執行啟動 `.bat`，上線後對視窗送 WM_CLOSE（等同按 X），cmd 與 console 都結束，Bot 仍在線。所以啟動方式維持 `spawn(detached)`，不需要另外脫離 job。
+  - 用 PowerShell `Start-Process -NoNewWindow` 或直接在終端機前景執行 `npm start` 的 Bot 掛在那個終端機的 console 上，關掉終端機就會一起結束；要在背景長時間執行，請用 `start`。
 - `stop`：執行 runtime 的 `stop.mjs`（同 `npm run stop`），再確認 Bot 程序和停止前記下的子孫程序都已結束。
 - **開機自動啟動暫不提供**：用工作排程器註冊登入工作的做法，在開發環境被 Claude Code 自動模式判定為未授權的常駐設定而擋下；使用者決定改成桌面雙擊。Phase 0-7 維持未驗證。
 
