@@ -153,7 +153,7 @@
 
 補充：
 
-- `permission_mode`：**必須明確設定**（預設寫 `default`）。省略時 Claude 會沿用使用者自己的設定（例如 auto 模式），權限回呼就不會被呼叫，Discord 上也不會出現權限按鈕。
+- `permission_mode`：**必須明確設定**（預設寫 `default`）。省略時 Claude 會沿用使用者自己的設定（例如 auto 模式），權限回呼就不會被呼叫，Discord 上也不會出現權限按鈕。設成 `auto` 時由自動模式判斷，被擋下的動作改問主人（§8）。
 - `tools`：真正限縮這個頻道可用的工具集（對應 SDK 的 `tools`）。注意 SDK 的 `allowedTools` 只是「預先放行、不再詢問」，**不會**限縮工具集，所以設定檔不提供 `allowed_tools` 以免誤用。
 - `model`：依頻道指定模型。Opus 單輪約 $0.2，Haiku 單輪不到 $0.01（Phase 0 實測），簡單的頻道可以用便宜的模型。
 
@@ -393,15 +393,19 @@
 | 工具 | `default` | `acceptEdits` | `plan` | `dontAsk` | `auto` |
 |---|---|---|---|---|---|
 | Bot 自己的工具（`reply`） | 放行 | 放行 | 放行 | 放行 | 放行 |
-| 唯讀工具（Read、Glob、Grep、LS、LSP、NotebookRead、ToolSearch、TodoWrite、Task 系列、Skill），目標在 cwd 或這個討論串的 inbox 內（或沒有指定路徑） | 放行 | 放行 | 放行 | 放行 | 交給 Claude Code |
-| 唯讀工具，目標在 cwd／inbox **以外**（例如 Bot 自己含 token 的 config） | 問主人 | 問主人 | 問主人 | 問主人 | 交給 Claude Code |
-| Edit、Write、MultiEdit、NotebookEdit，目標在 cwd／inbox 內 | 問主人 | 放行 | 拒絕 | 拒絕 | 交給 Claude Code |
-| 其他（Bash、PowerShell、cwd 外的編輯、WebFetch、其他 MCP 工具…） | 問主人 | 問主人 | 拒絕 | 拒絕 | 交給 Claude Code |
+| 唯讀工具（Read、Glob、Grep、LS、LSP、NotebookRead、ToolSearch、TodoWrite、Task 系列、Skill），目標在 cwd 或這個討論串的 inbox 內（或沒有指定路徑） | 放行 | 放行 | 放行 | 放行 | 自動判斷 |
+| 唯讀工具，目標在 cwd／inbox **以外**（例如 Bot 自己含 token 的 config） | 問主人 | 問主人 | 問主人 | 問主人 | 自動判斷 |
+| Edit、Write、MultiEdit、NotebookEdit，目標在 cwd／inbox 內 | 問主人 | 放行 | 拒絕 | 拒絕 | 自動判斷 |
+| 其他（Bash、PowerShell、cwd 外的編輯、WebFetch、其他 MCP 工具…） | 問主人 | 問主人 | 拒絕 | 拒絕 | 自動判斷 |
 | AskUserQuestion | 在 Discord 提問 | 同左 | 同左 | 同左 | 同左 |
 
-- 「這個 session 一律允許」過的工具：除了 `plan` 以外都直接放行（`auto` 本來就交給 Claude Code）。
-- `auto`：使用者選了 Claude Code 自己的自動判斷，Bot 不介入，所以不會出現權限按鈕。
-- Claude Code 自己仍想詢問的情況（例如 `auto` 的判斷結果是要問）會走到 `canUseTool`，一樣變成 Discord 的權限按鈕。
+- 「這個 session 一律允許」過的工具：除了 `plan` 以外都直接放行。在 `auto` 也一樣：整個工具在這個 session 不再經過自動判斷（例如按了「一律允許 Bash」，之後所有 Bash 都直接執行）。
+- `auto`（自動判斷）：由 Claude Code 的自動模式決定每個動作。
+  - 判斷放行 → 照常執行，不出現按鈕。
+  - 判斷擋下 → 改在討論串送權限按鈕給主人，按鈕訊息會寫「自動模式擋下了這個動作，原因：…」。主人按「允許」就照原樣執行這一次；按「這個 session 一律允許」跟其他模式同義；按「拒絕」或逾時，Claude 收到拒絕理由並照理由調整。
+  - 使用者 settings 裡範圍太大的允許規則（例如整個 `Bash`）在自動模式下會被 Claude Code 忽略（debug log：`Ignoring dangerous permission Bash(*) … (bypasses classifier)`），所以 Bash 也會經過自動判斷。
+  - deny 規則擋下的動作不會變成按鈕（deny 規則仍然有效）。
+- Claude Code 自己仍想詢問的情況會走到 `canUseTool`，一樣變成 Discord 的權限按鈕。
 
 ### 權限按鈕的實作方式（Phase 2 實測）
 
@@ -411,6 +415,13 @@
   - hook 直接在 Bot 程序內 await Discord 按鈕，不需要 IPC 或 `defer`。hook 預設逾時是 60 秒，所以 matcher 的 `timeout` 設成「權限等待上限 + 60 秒」（實測 await 65 秒沒有問題）。
 - **AskUserQuestion**：hook 對它不做決定（回傳 `{}`），交給 `canUseTool`；Bot 在 Discord 問完後回傳 `{ behavior: 'allow', updatedInput: { ...input, answers } }`，`answers` 的 key 是問題原文、值是選項 label（多選用 `, ` 連接）。實測 Claude 收到「Your questions have been answered…」並照答案繼續。hook 若對它回 allow，`canUseTool` 就不會被呼叫，Claude 會拿不到答案。
 - **🛑 停止**：`query.interrupt()` 約 0.1 秒回應（`still_queued: []`），執行中的 Bash 被中止，這一輪以 `error_during_execution` 結束（Bot 記為 `interrupted`）。程序不會結束，下一則訊息在同一個 session 繼續，記得先前的對話。
+- **auto 模式擋下後改問主人**（實測 `spike/auto-check.ts`，SDK 0.3.314／CLI 2.1.314，並用 2.1.318 的啟動器再驗一次，結果相同）：
+  - 自動模式擋下時 **不會** 呼叫 `canUseTool`，而是送出 `system/permission_denied`（`decision_reason_type: 'classifier'`、`decision_reason` 例如 `[Data Exfiltration]`），並觸發 **PermissionDenied hook**（輸入有 `tool_name`、`tool_input`、`reason`）。deny 規則擋下的只有 `permission_denied` 訊息，**不會**觸發這個 hook。
+  - hook 在 Claude 看到拒絕結果之前執行，可以在程序內 await 主人的按鈕（實測 await 75 秒沒問題；timeout 同 PreToolUse）。
+  - hook 的輸出只能回 `retry: true`，Claude 會在拒絕結果後看到「The PermissionDenied hook indicated you may retry this tool call.」；hook 的 `systemMessage` 不會傳給 Claude。
+  - 所以主人的決定在 Claude **重試同一個呼叫**時生效：Bot 記下這個呼叫（`retryKey`：工具名稱＋參數，不含 Claude 自己寫的 `description`），重試時 PreToolUse hook 回 `allow` —— 實測會跳過自動判斷，指令真的執行；主人拒絕或逾時則回 `deny`，理由就是主人的拒絕理由。記錄只在這一輪內有效。
+  - 系統提示要求 Claude 在被告知可以重試時用相同參數重試一次。實測每次都會重試；如果 Claude 改了參數，等於新的呼叫，會再經過一次自動判斷（擋下就再問一次）。
+  - 代價：每次擋下多一步（Claude 重試一次）。
 - 等待期間的取消：hook 和 `canUseTool` 收到的 `signal`，加上這一輪自己的 AbortController（🛑、強制關閉、逾時時觸發），任一個 abort 就把按鈕訊息標成「已取消」並回傳拒絕，hook 不會卡住。
 
 ---

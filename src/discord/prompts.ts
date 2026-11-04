@@ -128,7 +128,10 @@ export async function askPermission(thread: AnyThreadChannel, req: PermissionReq
     await thread.send({ content: `🔐 Claude 想執行 \`${req.toolName}\`，但這個 Bot 沒有設定主人（config 的 \`discord.owner_id\`），無法核准，已拒絕。`, allowedMentions: { parse: [] } });
     return { behavior: 'deny', message: '這個 Bot 沒有設定主人，沒有人能核准權限請求，已拒絕。' };
   }
-  const base = `🔐 **權限請求** \`${req.toolName}\`　<@${who.ownerId}> 請確認（${minutes(timeoutMs)}內沒有回應會自動拒絕）\n${summarizeTool(req.toolName, req.input)}`;
+  // Claude Code's reason text may carry terminal colour codes.
+  const blocked = req.blockedReason?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+  const why = req.blockedReason !== undefined ? `\n🤖 自動模式擋下了這個動作${blocked ? `，原因：${clip(blocked, 300)}` : ''}。按「允許」就會照原樣執行。` : '';
+  const base = `🔐 **權限請求** \`${req.toolName}\`　<@${who.ownerId}> 請確認（${minutes(timeoutMs)}內沒有回應會自動拒絕）${why}\n${summarizeTool(req.toolName, req.input)}`;
   const p: PermissionPending = { kind: 'permission', who, base: clip(base, MAX_CONTENT - 200), toolName: req.toolName, done: () => {} };
   const s = settleOnce<{ a: PermissionAnswer; note: string }>(
     id,

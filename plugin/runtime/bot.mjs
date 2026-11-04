@@ -274,7 +274,10 @@ function targetPath(input) {
 function decideTool(name, input, ctx) {
   if (name === "AskUserQuestion") return { kind: "cli", why: "question" };
   if (name.startsWith(ctx.ownPrefix)) return { kind: "allow", why: "own tool" };
-  if (ctx.mode === "auto") return { kind: "cli", why: "auto mode" };
+  if (ctx.mode === "auto") {
+    if (ctx.alwaysAllowed.has(name)) return { kind: "allow", why: "always allowed this session" };
+    return { kind: "cli", why: "auto mode" };
+  }
   if (READ_ONLY.has(name)) {
     const p = targetPath(input);
     if (p && !inside(p, ctx.roots)) return { kind: "ask", why: "read outside cwd" };
@@ -289,6 +292,13 @@ function decideTool(name, input, ctx) {
   if (ctx.mode === "dontAsk") return { kind: "deny", why: "dontAsk mode" };
   return { kind: "ask", why: "needs approval" };
 }
+function blockedByClassifier(mode) {
+  return mode === "auto" ? "ask" : "keep";
+}
+function retryKey(name, input) {
+  const { description: _label, ...rest } = input;
+  return `${name} ${JSON.stringify(rest)}`;
+}
 function canAct(kind, clickerId, who) {
   if (who.ownerId && clickerId === who.ownerId) return true;
   if (kind === "permission") return false;
@@ -302,7 +312,7 @@ var TURN_TIMEOUT_MS = 10 * 60 * 1e3;
 var MAX_TURNS = 40;
 var CLOSE_GRACE_MS = 15 * 1e3;
 var MAX_REPLY_FILES = 10;
-function guidelines(selfId) {
+function guidelines(selfId, auto) {
   let configured;
   try {
     configured = loadConfig().discord.owner_id;
@@ -312,7 +322,7 @@ function guidelines(selfId) {
     "\u4F60\u6B63\u5728\u4E00\u500B Discord \u8A0E\u8AD6\u4E32\u88E1\u548C\u4EBA\u5354\u4F5C\uFF0C\u8A0E\u8AD6\u4E32\u88E1\u53EF\u80FD\u9084\u6709\u5176\u4ED6\u4EBA\u7684 Bot\u3002\u6BCF\u5247\u4F7F\u7528\u8005\u8A0A\u606F\u6703\u6A19\u793A\u767C\u8A71\u8005\u3001\u4F4D\u7F6E\u548C\u6700\u8FD1\u7684\u5C0D\u8A71\u3002",
     `- \u4F60\u7684\u4E00\u822C\u6587\u5B57\u8F38\u51FA\u6C92\u6709\u4EBA\u770B\u5F97\u5230\uFF1B\u8981\u8B93\u4EBA\u770B\u5230\u7684\u5167\u5BB9\uFF0C\u4E00\u5F8B\u547C\u53EB ${REPLY_TOOL} \u5DE5\u5177\u3002`,
     "- \u56DE\u8986\u8981\u7C21\u77ED\uFF0C\u53EA\u8B1B\u7D50\u8AD6\uFF1B\u505A\u4E86\u4FEE\u6539\u5C31\u8AAA\u660E\u6539\u4E86\u4EC0\u9EBC\u3002",
-    "- \u9700\u8981\u6B0A\u9650\u7684\u5DE5\u5177\u6703\u5728 Discord \u4E0A\u8ACB Bot \u7684\u4E3B\u4EBA\u6838\u51C6\uFF0C\u7B49\u5F85\u671F\u9593\u4E0D\u5FC5\u53E6\u5916\u8AAA\u660E\u3002\u88AB\u62D2\u7D55\u6642\u7167\u62D2\u7D55\u7406\u7531\u8ABF\u6574\u505A\u6CD5\uFF0C\u4E0D\u8981\u539F\u6A23\u91CD\u8A66\u3002",
+    auto ? "- \u9019\u500B\u983B\u9053\u7528\u81EA\u52D5\u6A21\u5F0F\uFF1A\u52D5\u4F5C\u7531 Claude Code \u81EA\u52D5\u5224\u65B7\uFF1B\u88AB\u81EA\u52D5\u6A21\u5F0F\u64CB\u4E0B\u7684\u52D5\u4F5C\u6703\u6539\u5728 Discord \u4E0A\u8ACB Bot \u7684\u4E3B\u4EBA\u6C7A\u5B9A\uFF0C\u7B49\u5F85\u671F\u9593\u4E0D\u5FC5\u53E6\u5916\u8AAA\u660E\u3002\u4E4B\u5F8C\u82E5\u88AB\u544A\u77E5\u53EF\u4EE5\u91CD\u8A66\u9019\u500B\u547C\u53EB\uFF0C\u4EE3\u8868\u4E3B\u4EBA\u5DF2\u7D93\u56DE\u8986\uFF1A\u8ACB\u7528\u5B8C\u5168\u76F8\u540C\u7684\u53C3\u6578\u91CD\u8A66\u4E00\u6B21\uFF08\u4E0D\u8981\u6539\u6307\u4EE4\uFF09\uFF1B\u82E5\u7D50\u679C\u662F\u4E3B\u4EBA\u62D2\u7D55\uFF0C\u7167\u62D2\u7D55\u7406\u7531\u8ABF\u6574\u505A\u6CD5\uFF0C\u4E0D\u8981\u518D\u8A66\u3002" : "- \u9700\u8981\u6B0A\u9650\u7684\u5DE5\u5177\u6703\u5728 Discord \u4E0A\u8ACB Bot \u7684\u4E3B\u4EBA\u6838\u51C6\uFF0C\u7B49\u5F85\u671F\u9593\u4E0D\u5FC5\u53E6\u5916\u8AAA\u660E\u3002\u88AB\u62D2\u7D55\u6642\u7167\u62D2\u7D55\u7406\u7531\u8ABF\u6574\u505A\u6CD5\uFF0C\u4E0D\u8981\u539F\u6A23\u91CD\u8A66\u3002",
     "- \u9700\u8981\u4F7F\u7528\u8005\u505A\u9078\u64C7\u6642\uFF0C\u53EF\u4EE5\u7528 AskUserQuestion \u5DE5\u5177\uFF0C\u9078\u9805\u6703\u4EE5\u6309\u9215\u6216\u9078\u55AE\u5448\u73FE\u5728 Discord \u4E0A\u3002",
     "- \u9700\u8981\u4E3B\u4EBA\u597D\u597D\u601D\u8003\u7684\u6C7A\u7B56\uFF08\u4F8B\u5982\u65B9\u5411\u3001\u53D6\u6368\u3001\u5F71\u97FF\u7BC4\u570D\u5927\u7684\u6539\u52D5\uFF09\uFF0C\u5728 reply \u88E1 @ \u4E3B\u4EBA\uFF0C\u8ACB\u4E3B\u4EBA\u6C7A\u5B9A\uFF0C\u4E0D\u8981\u81EA\u5DF1\u6C7A\u5B9A\u3002",
     "- \u4F7F\u7528\u8005\u9644\u7684\u6A94\u6848\u6703\u4E0B\u8F09\u5230\u672C\u6A5F\uFF0C\u8DEF\u5F91\u5BEB\u5728\u8A0A\u606F\u7684\u3010\u9644\u4EF6\u3011\u88E1\uFF0C\u7528 Read \u8B80\u53D6\u3002",
@@ -409,6 +419,12 @@ var LiveSession = class {
       if (hookInput.hook_event_name !== "PreToolUse") return {};
       const name = hookInput.tool_name;
       const toolInput = hookInput.tool_input ?? {};
+      const retry = this.turn?.retries.get(retryKey(name, toolInput));
+      if (retry) {
+        this.turn?.retries.delete(retryKey(name, toolInput));
+        log("permission", `${threadId} retry ${"deny" in retry ? "deny" : "allow"} ${name} (owner answered a classifier block) id=${toolUseId ?? "-"}`);
+        return "deny" in retry ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: retry.deny } } : { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "approved by the owner after an auto mode block" } };
+      }
       const d = decideTool(name, toolInput, { mode: channel.permissionMode, roots, alwaysAllowed: this.alwaysAllowed, ownPrefix: OWN_PREFIX });
       if (d.kind === "cli") return {};
       if (d.kind === "allow") {
@@ -422,6 +438,18 @@ var LiveSession = class {
       }
       const answer = await this.ask(name, toolInput, toolUseId ?? "", signal);
       return answer.behavior === "deny" ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: answer.message } } : { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "approved by the owner" } };
+    };
+    const permissionDenied = async (hookInput, toolUseId, { signal }) => {
+      if (hookInput.hook_event_name !== "PermissionDenied") return {};
+      const t = this.turn;
+      if (!t || blockedByClassifier(channel.permissionMode) !== "ask") return {};
+      const name = hookInput.tool_name;
+      const toolInput = hookInput.tool_input ?? {};
+      log("permission", `${threadId} classifier blocked ${name} (${brief(hookInput.reason, 200)}) id=${toolUseId ?? hookInput.tool_use_id}`);
+      const answer = await this.ask(name, toolInput, toolUseId ?? hookInput.tool_use_id, signal, hookInput.reason ?? "");
+      if (t.stoppedBy || this.turn !== t) return {};
+      t.retries.set(retryKey(name, toolInput), answer.behavior === "deny" ? { deny: answer.message } : { allow: true });
+      return { hookSpecificOutput: { hookEventName: "PermissionDenied", retry: true } };
     };
     const canUseTool = async (toolName, input, { signal, toolUseID }) => {
       if (toolName !== "AskUserQuestion") {
@@ -448,6 +476,7 @@ var LiveSession = class {
       this.child = child;
       log(this.tag, `spawned pid=${child.pid}`);
     };
+    const hookTimeout = Math.ceil(channel.permissionTimeoutMs / 1e3) + 60;
     log(this.tag, `start cwd=${channel.cwd} model=${channel.model ?? "-"} mode=${channel.permissionMode} launcher=${channel.launcher || "builtin"} resume=${resume ?? "-"} always=${JSON.stringify([...this.alwaysAllowed])}`);
     this.q = query({
       prompt: this.input(),
@@ -460,11 +489,14 @@ var LiveSession = class {
         settingSources: ["user", "project"],
         // Always explicit: omitted, the user's own default (e.g. auto) applies and canUseTool is skipped.
         permissionMode: channel.permissionMode,
-        systemPrompt: { type: "preset", preset: "claude_code", append: guidelines(selfId) },
+        systemPrompt: { type: "preset", preset: "claude_code", append: guidelines(selfId, channel.permissionMode === "auto") },
         allowedTools: [REPLY_TOOL],
         mcpServers: { channelcollab: server },
-        // The hook awaits the owner's answer in-process, so its timeout (seconds) must outlast the prompt's.
-        hooks: { PreToolUse: [{ hooks: [preToolUse], timeout: Math.ceil(channel.permissionTimeoutMs / 1e3) + 60 }] },
+        // The hooks await the owner's answer in-process, so their timeout (seconds) must outlast the prompt's.
+        hooks: {
+          PreToolUse: [{ hooks: [preToolUse], timeout: hookTimeout }],
+          ...blockedByClassifier(channel.permissionMode) === "ask" ? { PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }] } : {}
+        },
         canUseTool,
         maxTurns: MAX_TURNS,
         abortController: this.abort,
@@ -536,6 +568,7 @@ var LiveSession = class {
         timerStarted: 0,
         waits: 0,
         abort: new AbortController(),
+        retries: /* @__PURE__ */ new Map(),
         resolve
       };
       this.turn = t;
@@ -602,11 +635,11 @@ var LiveSession = class {
     return this.closing;
   }
   /** Ask the owner about a tool call; the turn clock stops while waiting. */
-  async ask(toolName, input, toolUseId, signal) {
+  async ask(toolName, input, toolUseId, signal, blockedReason) {
     const t = this.turn;
     if (!t) return { behavior: "deny", message: "No active turn." };
-    log("permission", `${this.threadId} ask ${toolName} id=${toolUseId} ${brief(input)}`);
-    const answer = await this.waitFor(() => t.askPermission({ toolName, input, toolUseId, signal: this.linked(signal, t) }));
+    log("permission", `${this.threadId} ask ${toolName} id=${toolUseId}${blockedReason !== void 0 ? " (auto mode block)" : ""} ${brief(input)}`);
+    const answer = await this.waitFor(() => t.askPermission({ toolName, input, toolUseId, blockedReason, signal: this.linked(signal, t) }));
     log("permission", `${this.threadId} ${answer.behavior} ${toolName} id=${toolUseId}${answer.behavior === "deny" ? ` ${brief(answer.message, 200)}` : ""}`);
     if (answer.behavior === "deny") t.denials.push(toolName);
     if (answer.behavior === "always") this.alwaysAllowed.add(toolName);
@@ -1031,7 +1064,10 @@ async function askPermission(thread, req, who, timeoutMs) {
     await thread.send({ content: `\u{1F510} Claude \u60F3\u57F7\u884C \`${req.toolName}\`\uFF0C\u4F46\u9019\u500B Bot \u6C92\u6709\u8A2D\u5B9A\u4E3B\u4EBA\uFF08config \u7684 \`discord.owner_id\`\uFF09\uFF0C\u7121\u6CD5\u6838\u51C6\uFF0C\u5DF2\u62D2\u7D55\u3002`, allowedMentions: { parse: [] } });
     return { behavior: "deny", message: "\u9019\u500B Bot \u6C92\u6709\u8A2D\u5B9A\u4E3B\u4EBA\uFF0C\u6C92\u6709\u4EBA\u80FD\u6838\u51C6\u6B0A\u9650\u8ACB\u6C42\uFF0C\u5DF2\u62D2\u7D55\u3002" };
   }
-  const base = `\u{1F510} **\u6B0A\u9650\u8ACB\u6C42** \`${req.toolName}\`\u3000<@${who.ownerId}> \u8ACB\u78BA\u8A8D\uFF08${minutes(timeoutMs)}\u5167\u6C92\u6709\u56DE\u61C9\u6703\u81EA\u52D5\u62D2\u7D55\uFF09
+  const blocked = req.blockedReason?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trim();
+  const why = req.blockedReason !== void 0 ? `
+\u{1F916} \u81EA\u52D5\u6A21\u5F0F\u64CB\u4E0B\u4E86\u9019\u500B\u52D5\u4F5C${blocked ? `\uFF0C\u539F\u56E0\uFF1A${clip(blocked, 300)}` : ""}\u3002\u6309\u300C\u5141\u8A31\u300D\u5C31\u6703\u7167\u539F\u6A23\u57F7\u884C\u3002` : "";
+  const base = `\u{1F510} **\u6B0A\u9650\u8ACB\u6C42** \`${req.toolName}\`\u3000<@${who.ownerId}> \u8ACB\u78BA\u8A8D\uFF08${minutes(timeoutMs)}\u5167\u6C92\u6709\u56DE\u61C9\u6703\u81EA\u52D5\u62D2\u7D55\uFF09${why}
 ${summarizeTool(req.toolName, req.input)}`;
   const p = { kind: "permission", who, base: clip(base, MAX_CONTENT - 200), toolName: req.toolName, done: () => {
   } };

@@ -43,8 +43,13 @@ export function decideTool(name: string, input: Record<string, unknown>, ctx: To
   // Answered by people through canUseTool; deciding it here would skip that.
   if (name === 'AskUserQuestion') return { kind: 'cli', why: 'question' };
   if (name.startsWith(ctx.ownPrefix)) return { kind: 'allow', why: 'own tool' };
-  // auto: the user picked Claude Code's own classifier for this channel.
-  if (ctx.mode === 'auto') return { kind: 'cli', why: 'auto mode' };
+  if (ctx.mode === 'auto') {
+    // "Always allow" after a classifier block: the whole tool skips the classifier for the session.
+    if (ctx.alwaysAllowed.has(name)) return { kind: 'allow', why: 'always allowed this session' };
+    // Everything else goes to Claude Code's classifier; what it blocks reaches the owner
+    // through the PermissionDenied hook (see blockedByClassifier).
+    return { kind: 'cli', why: 'auto mode' };
+  }
   if (READ_ONLY.has(name)) {
     const p = targetPath(input);
     // Reading outside the project (e.g. the bot's own config with its token) needs the owner.
@@ -59,6 +64,25 @@ export function decideTool(name: string, input: Record<string, unknown>, ctx: To
   }
   if (ctx.mode === 'dontAsk') return { kind: 'deny', why: 'dontAsk mode' };
   return { kind: 'ask', why: 'needs approval' };
+}
+
+/**
+ * auto mode: the classifier blocked a call (PermissionDenied hook). Only the
+ * classifier fires that hook (deny rules do not, spike/auto-check.ts), so in
+ * auto mode the block goes to the owner; in any other mode it stands.
+ */
+export function blockedByClassifier(mode: PermissionMode): 'ask' | 'keep' {
+  return mode === 'auto' ? 'ask' : 'keep';
+}
+
+/**
+ * Identifies "the same call" when Claude retries a blocked call the owner has
+ * answered. `description` is Claude's own label for the call and changes
+ * between attempts, so it is not part of the call.
+ */
+export function retryKey(name: string, input: Record<string, unknown>): string {
+  const { description: _label, ...rest } = input;
+  return `${name} ${JSON.stringify(rest)}`;
 }
 
 /** Prompt kinds and who may act on them (PLAN §8). */

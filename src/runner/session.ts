@@ -21,7 +21,7 @@ import { INBOX_DIR, loadConfig, type ResolvedChannel } from '../config.js';
 import { brief, log } from '../log.js';
 import { botOwner, rosterPrompt } from '../roster.js';
 import { killTree, launcherOptions, type Spawned } from './launcher.js';
-import { decideTool, inside } from './policy.js';
+import { blockedByClassifier, decideTool, inside, retryKey } from './policy.js';
 
 const OWN_PREFIX = 'mcp__channelcollab__';
 export const REPLY_TOOL = `${OWN_PREFIX}reply`;
@@ -34,7 +34,7 @@ const CLOSE_GRACE_MS = 15 * 1000;
 /** Files Claude can attach to one reply (Discord's limit per message). */
 const MAX_REPLY_FILES = 10;
 
-function guidelines(selfId: string): string {
+function guidelines(selfId: string, auto: boolean): string {
   let configured: string | undefined;
   try {
     configured = loadConfig().discord.owner_id;
@@ -43,7 +43,9 @@ function guidelines(selfId: string): string {
     '你正在一個 Discord 討論串裡和人協作，討論串裡可能還有其他人的 Bot。每則使用者訊息會標示發話者、位置和最近的對話。',
     `- 你的一般文字輸出沒有人看得到；要讓人看到的內容，一律呼叫 ${REPLY_TOOL} 工具。`,
     '- 回覆要簡短，只講結論；做了修改就說明改了什麼。',
-    '- 需要權限的工具會在 Discord 上請 Bot 的主人核准，等待期間不必另外說明。被拒絕時照拒絕理由調整做法，不要原樣重試。',
+    auto
+      ? '- 這個頻道用自動模式：動作由 Claude Code 自動判斷；被自動模式擋下的動作會改在 Discord 上請 Bot 的主人決定，等待期間不必另外說明。之後若被告知可以重試這個呼叫，代表主人已經回覆：請用完全相同的參數重試一次（不要改指令）；若結果是主人拒絕，照拒絕理由調整做法，不要再試。'
+      : '- 需要權限的工具會在 Discord 上請 Bot 的主人核准，等待期間不必另外說明。被拒絕時照拒絕理由調整做法，不要原樣重試。',
     '- 需要使用者做選擇時，可以用 AskUserQuestion 工具，選項會以按鈕或選單呈現在 Discord 上。',
     '- 需要主人好好思考的決策（例如方向、取捨、影響範圍大的改動），在 reply 裡 @ 主人，請主人決定，不要自己決定。',
     '- 使用者附的檔案會下載到本機，路徑寫在訊息的【附件】裡，用 Read 讀取。',
@@ -58,6 +60,8 @@ export type PermissionRequest = {
   toolName: string;
   input: Record<string, unknown>;
   toolUseId: string;
+  /** Set when auto mode's classifier blocked the call: its reason (may be empty). */
+  blockedReason?: string;
   /** Aborted when the turn is stopped or the session closes; the prompt should then go away. */
   signal: AbortSignal;
 };
@@ -107,6 +111,8 @@ type Turn = TurnCallbacks & {
   waits: number;
   /** Cancels prompts still waiting when the turn is stopped or the session ends. */
   abort: AbortController;
+  /** auto mode: the owner's answer to a classifier block, waiting for Claude's retry of that call (retryKey). */
+  retries: Map<string, { allow: true } | { deny: string }>;
   stoppedBy?: string;
   resolve: (r: TurnResult) => void;
 };
@@ -254,6 +260,15 @@ export class LiveSession {
       if (hookInput.hook_event_name !== 'PreToolUse') return {};
       const name = hookInput.tool_name;
       const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
+      // auto mode: Claude retrying a call the classifier blocked and the owner has answered.
+      const retry = this.turn?.retries.get(retryKey(name, toolInput));
+      if (retry) {
+        this.turn?.retries.delete(retryKey(name, toolInput));
+        log('permission', `${threadId} retry ${'deny' in retry ? 'deny' : 'allow'} ${name} (owner answered a classifier block) id=${toolUseId ?? '-'}`);
+        return 'deny' in retry
+          ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: retry.deny } }
+          : { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'approved by the owner after an auto mode block' } };
+      }
       const d = decideTool(name, toolInput, { mode: channel.permissionMode, roots, alwaysAllowed: this.alwaysAllowed, ownPrefix: OWN_PREFIX });
       if (d.kind === 'cli') return {};
       if (d.kind === 'allow') {
@@ -269,6 +284,25 @@ export class LiveSession {
       return answer.behavior === 'deny'
         ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: answer.message } }
         : { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'approved by the owner' } };
+    };
+
+    // auto mode (PLAN §8): the classifier blocked a call. canUseTool is not consulted for
+    // that; this hook runs before Claude sees the refusal, so it can wait for the owner.
+    // Its output can only say "retry", so the answer is applied when Claude retries the
+    // same call: PreToolUse then allows it (skipping the classifier) or denies it with
+    // the owner's reason (spike/auto-check.ts).
+    const permissionDenied: HookCallback = async (hookInput, toolUseId, { signal }) => {
+      if (hookInput.hook_event_name !== 'PermissionDenied') return {};
+      const t = this.turn;
+      if (!t || blockedByClassifier(channel.permissionMode) !== 'ask') return {};
+      const name = hookInput.tool_name;
+      const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
+      log('permission', `${threadId} classifier blocked ${name} (${brief(hookInput.reason, 200)}) id=${toolUseId ?? hookInput.tool_use_id}`);
+      const answer = await this.ask(name, toolInput, toolUseId ?? hookInput.tool_use_id, signal, hookInput.reason ?? '');
+      // Stopped turn: nothing to retry.
+      if (t.stoppedBy || this.turn !== t) return {};
+      t.retries.set(retryKey(name, toolInput), answer.behavior === 'deny' ? { deny: answer.message } : { allow: true });
+      return { hookSpecificOutput: { hookEventName: 'PermissionDenied', retry: true } };
     };
 
     // Reached by AskUserQuestion (the hook leaves it alone) and by anything Claude Code itself still wants to ask about.
@@ -299,6 +333,7 @@ export class LiveSession {
       log(this.tag, `spawned pid=${child.pid}`);
     };
 
+    const hookTimeout = Math.ceil(channel.permissionTimeoutMs / 1000) + 60;
     log(this.tag, `start cwd=${channel.cwd} model=${channel.model ?? '-'} mode=${channel.permissionMode} launcher=${channel.launcher || 'builtin'} resume=${resume ?? '-'} always=${JSON.stringify([...this.alwaysAllowed])}`);
     this.q = query({
       prompt: this.input(),
@@ -311,11 +346,14 @@ export class LiveSession {
         settingSources: ['user', 'project'],
         // Always explicit: omitted, the user's own default (e.g. auto) applies and canUseTool is skipped.
         permissionMode: channel.permissionMode,
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: guidelines(selfId) },
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: guidelines(selfId, channel.permissionMode === 'auto') },
         allowedTools: [REPLY_TOOL],
         mcpServers: { channelcollab: server },
-        // The hook awaits the owner's answer in-process, so its timeout (seconds) must outlast the prompt's.
-        hooks: { PreToolUse: [{ hooks: [preToolUse], timeout: Math.ceil(channel.permissionTimeoutMs / 1000) + 60 }] },
+        // The hooks await the owner's answer in-process, so their timeout (seconds) must outlast the prompt's.
+        hooks: {
+          PreToolUse: [{ hooks: [preToolUse], timeout: hookTimeout }],
+          ...(blockedByClassifier(channel.permissionMode) === 'ask' ? { PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }] } : {}),
+        },
         canUseTool,
         maxTurns: MAX_TURNS,
         abortController: this.abort,
@@ -368,6 +406,7 @@ export class LiveSession {
         timerStarted: 0,
         waits: 0,
         abort: new AbortController(),
+        retries: new Map(),
         resolve,
       };
       this.turn = t;
@@ -437,11 +476,11 @@ export class LiveSession {
   }
 
   /** Ask the owner about a tool call; the turn clock stops while waiting. */
-  private async ask(toolName: string, input: Record<string, unknown>, toolUseId: string, signal: AbortSignal): Promise<PermissionAnswer> {
+  private async ask(toolName: string, input: Record<string, unknown>, toolUseId: string, signal: AbortSignal, blockedReason?: string): Promise<PermissionAnswer> {
     const t = this.turn;
     if (!t) return { behavior: 'deny', message: 'No active turn.' };
-    log('permission', `${this.threadId} ask ${toolName} id=${toolUseId} ${brief(input)}`);
-    const answer = await this.waitFor(() => t.askPermission({ toolName, input, toolUseId, signal: this.linked(signal, t) }));
+    log('permission', `${this.threadId} ask ${toolName} id=${toolUseId}${blockedReason !== undefined ? ' (auto mode block)' : ''} ${brief(input)}`);
+    const answer = await this.waitFor(() => t.askPermission({ toolName, input, toolUseId, blockedReason, signal: this.linked(signal, t) }));
     log('permission', `${this.threadId} ${answer.behavior} ${toolName} id=${toolUseId}${answer.behavior === 'deny' ? ` ${brief(answer.message, 200)}` : ''}`);
     if (answer.behavior === 'deny') t.denials.push(toolName);
     if (answer.behavior === 'always') this.alwaysAllowed.add(toolName);
