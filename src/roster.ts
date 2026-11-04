@@ -1,7 +1,7 @@
 /**
- * The roster (PLAN §12): roster.json in HOME, handed out by the admin (in the
- * handoff file, or imported with update-roster). No file means an empty roster.
- * Tells a session who it is and how to reach the other bots.
+ * The roster (PLAN §12): roster.json in HOME. Each person keeps their own
+ * (`channelcollab.mjs roster add|remove|import`); no file means an empty roster.
+ * Tells a session who it is, how to reach the other bots, and who the people are.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -10,26 +10,44 @@ import { log } from './log.js';
 
 export const ROSTER_PATH = path.join(DATA_DIR, 'roster.json');
 
+/** Owner and role are optional: a bot added by ID alone may have neither. */
 export type RosterBot = {
   botId: string;
   botName: string;
-  ownerName: string;
-  ownerDiscordId: string;
-  role: string;
+  ownerName?: string;
+  ownerDiscordId?: string;
+  role?: string;
 };
+
+/** A person on the team (optional `members` in roster.json; older rosters have none). */
+export type RosterMember = {
+  name: string;
+  discordId: string;
+  role?: string;
+};
+
+export type Roster = { bots: RosterBot[]; members: RosterMember[] };
 
 const ROLE_NAMES: Record<string, string> = { engineer: '工程師', planner: '企劃' };
 
 /** Read on every call so an updated roster applies to the next session. A missing or broken file means an empty roster. */
-export function loadRoster(): RosterBot[] {
-  if (!existsSync(ROSTER_PATH)) return [];
+export function loadRosterFile(): Roster {
+  if (!existsSync(ROSTER_PATH)) return { bots: [], members: [] };
   try {
-    const raw = JSON.parse(readFileSync(ROSTER_PATH, 'utf8')) as { bots?: RosterBot[] };
-    return Array.isArray(raw.bots) ? raw.bots : [];
+    const raw = JSON.parse(readFileSync(ROSTER_PATH, 'utf8').replace(/^﻿/, '')) as { bots?: RosterBot[]; members?: RosterMember[] };
+    return {
+      bots: Array.isArray(raw.bots) ? raw.bots.filter((b) => b && b.botId && b.botName) : [],
+      members: Array.isArray(raw.members) ? raw.members.filter((m) => m && m.discordId && m.name) : [],
+    };
   } catch (e) {
     log('roster', `cannot read ${ROSTER_PATH} (${(e as Error).name})`);
-    return [];
+    return { bots: [], members: [] };
   }
+}
+
+/** The bots in the roster. */
+export function loadRoster(): RosterBot[] {
+  return loadRosterFile().bots;
 }
 
 /** Who owns this bot according to the roster. */
@@ -46,19 +64,59 @@ export function roleName(role: string): string {
   return ROLE_NAMES[role] ?? role;
 }
 
-/** Identity, the other bots and the collaboration rules, appended to the system prompt. */
-export function rosterPrompt(selfId: string, ownerId?: string, roster: RosterBot[] = loadRoster()): string {
-  const self = roster.find((b) => b.botId === selfId);
-  const others = roster.filter((b) => b.botId !== selfId);
+/** 「主人 X，角色 Y」 for a bot, leaving out what the roster does not say. */
+function botDetails(b: RosterBot): string {
+  return [b.ownerName ? `主人 ${b.ownerName}` : '', b.role ? `角色 ${roleName(b.role)}` : ''].filter(Boolean).join('，');
+}
+
+export type RosterPerson = RosterMember & { bots: string[] };
+
+/**
+ * Every person in the roster, once per Discord ID: `members` first, then bot
+ * owners who are not in `members`. `bots` lists the bots each person owns.
+ */
+export function rosterPeople(roster: Roster): RosterPerson[] {
+  const people = new Map<string, RosterPerson>();
+  for (const m of roster.members) {
+    if (!people.has(m.discordId)) people.set(m.discordId, { name: m.name, discordId: m.discordId, role: m.role, bots: [] });
+  }
+  for (const b of roster.bots) {
+    if (!b.ownerDiscordId) continue;
+    const p = people.get(b.ownerDiscordId);
+    if (p) p.bots.push(b.botName);
+    else people.set(b.ownerDiscordId, { name: b.ownerName || `${b.botName} 的主人`, discordId: b.ownerDiscordId, role: b.role, bots: [b.botName] });
+  }
+  return [...people.values()];
+}
+
+/** Identity, the other bots, the people and the collaboration rules, appended to the system prompt. */
+export function rosterPrompt(selfId: string, ownerId?: string, roster: Roster = loadRosterFile()): string {
+  const self = roster.bots.find((b) => b.botId === selfId);
+  const others = roster.bots.filter((b) => b.botId !== selfId);
+  const people = rosterPeople(roster);
+  const owner = ownerId ? people.find((p) => p.discordId === ownerId) : undefined;
+  const team = people.filter((p) => p.discordId !== ownerId);
   const lines = [
     self
-      ? `【你的身分】你是 ${self.botName}（Discord ID ${selfId}），${self.ownerName} 的 Bot，角色：${roleName(self.role)}。`
+      ? `【你的身分】你是 ${self.botName}（Discord ID ${selfId}）${self.ownerName ? `，${self.ownerName} 的 Bot` : ''}${self.role ? `，角色：${roleName(self.role)}` : ''}。`
       : `【你的身分】你是 Discord ID ${selfId} 的 Bot（不在名冊中）。`,
   ];
-  if (ownerId) lines.push(`【你的主人】Discord ID ${ownerId}；要找主人就在 reply 文字裡寫 <@${ownerId}>。`);
+  if (ownerId) lines.push(`【你的主人】${owner ? `${owner.name}，` : ''}Discord ID ${ownerId}；要找主人就在 reply 文字裡寫 <@${ownerId}>。`);
   if (others.length) {
     lines.push('【其他 Bot】（名冊；討論串裡可能出現這些 Bot）');
-    for (const b of others) lines.push(`- ${b.botName}：主人 ${b.ownerName}，角色 ${roleName(b.role)}；要找它就在 reply 文字裡寫 <@${b.botId}>`);
+    for (const b of others) {
+      const details = botDetails(b);
+      lines.push(`- ${b.botName}${details ? `：${details}` : ''}；要找它就在 reply 文字裡寫 <@${b.botId}>`);
+    }
+  }
+  if (team.length) {
+    lines.push('【團隊成員】（名冊上的人；要 @ 某人就在 reply 文字裡寫 <@ID>，和 Bot 一樣只在需要對方做事或回答時才 @）');
+    for (const p of team) {
+      const bots = p.bots.length ? `Bot：${p.bots.join('、')}` : '';
+      const role = p.role ? `角色 ${roleName(p.role)}` : '';
+      const details = [role, bots].filter(Boolean).join('，');
+      lines.push(`- ${p.name}${details ? `：${details}` : ''}；要找他就在 reply 文字裡寫 <@${p.discordId}>`);
+    }
   }
   lines.push(
     '【和其他 Bot 協作】',

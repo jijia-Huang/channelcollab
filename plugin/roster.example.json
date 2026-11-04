@@ -14,6 +14,21 @@
       "ownerName": "小華",
       "ownerDiscordId": "200000000000000002",
       "role": "planner"
+    },
+    {
+      "botId": "100000000000000003",
+      "botName": "只知道ID的Bot"
+    }
+  ],
+  "members": [
+    {
+      "discordId": "200000000000000003",
+      "name": "小美",
+      "role": "planner"
+    },
+    {
+      "discordId": "200000000000000004",
+      "name": "阿強"
     }
   ]
 }

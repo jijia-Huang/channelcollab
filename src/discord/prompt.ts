@@ -3,13 +3,29 @@
  * messages, and the triggering message.
  */
 import type { Message, ThreadChannel } from 'discord.js';
-import { loadRoster, roleName, type RosterBot } from '../roster.js';
+import { loadRosterFile, roleName, rosterPeople, type Roster } from '../roster.js';
 import type { SavedAttachments } from './attachments.js';
 
-function speaker(m: Message, roster: RosterBot[]): string {
+/**
+ * 「顯示名稱（username，標籤…）」. Bots in the roster show owner, role and ID;
+ * people always show their Discord ID (so the bot can write <@ID>), plus their
+ * roster name and role when the roster knows them.
+ */
+export function speaker(m: Message, roster: Roster): string {
   const name = m.member?.displayName ?? m.author.displayName;
-  const r = m.author.bot ? roster.find((b) => b.botId === m.author.id) : undefined;
-  const tags = [m.author.username, m.author.bot ? 'Bot' : '', r ? `${r.ownerName} 的${roleName(r.role)}，ID ${r.botId}` : ''];
+  const tags = [m.author.username];
+  if (m.author.bot) {
+    tags.push('Bot');
+    const r = roster.bots.find((b) => b.botId === m.author.id);
+    if (r) {
+      const who = [r.ownerName ? `${r.ownerName} 的` : '', r.role ? roleName(r.role) : r.ownerName ? 'Bot' : ''].join('');
+      tags.push([who, `ID ${r.botId}`].filter(Boolean).join('，'));
+    }
+  } else {
+    tags.push(`ID ${m.author.id}`);
+    const p = rosterPeople(roster).find((x) => x.discordId === m.author.id);
+    if (p) tags.push(`名冊：${p.name}${p.role ? `，${roleName(p.role)}` : ''}`);
+  }
   return `${name}（${tags.filter(Boolean).join('，')}）`;
 }
 
@@ -47,7 +63,7 @@ export async function buildPrompt(opts: {
 }): Promise<string> {
   const { thread, trigger } = opts;
   const history = await recent(thread, trigger, opts.history, opts.afterId);
-  const roster = loadRoster();
+  const roster = loadRosterFile();
   const parent = thread.parent?.name ?? thread.parentId;
   const parts = [
     `【發話者】${speaker(trigger, roster)}`,

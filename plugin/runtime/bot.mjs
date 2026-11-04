@@ -168,15 +168,21 @@ import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:f
 import path3 from "node:path";
 var ROSTER_PATH = path3.join(DATA_DIR, "roster.json");
 var ROLE_NAMES = { engineer: "\u5DE5\u7A0B\u5E2B", planner: "\u4F01\u5283" };
-function loadRoster() {
-  if (!existsSync2(ROSTER_PATH)) return [];
+function loadRosterFile() {
+  if (!existsSync2(ROSTER_PATH)) return { bots: [], members: [] };
   try {
-    const raw = JSON.parse(readFileSync3(ROSTER_PATH, "utf8"));
-    return Array.isArray(raw.bots) ? raw.bots : [];
+    const raw = JSON.parse(readFileSync3(ROSTER_PATH, "utf8").replace(/^﻿/, ""));
+    return {
+      bots: Array.isArray(raw.bots) ? raw.bots.filter((b) => b && b.botId && b.botName) : [],
+      members: Array.isArray(raw.members) ? raw.members.filter((m) => m && m.discordId && m.name) : []
+    };
   } catch (e) {
     log("roster", `cannot read ${ROSTER_PATH} (${e.name})`);
-    return [];
+    return { bots: [], members: [] };
   }
+}
+function loadRoster() {
+  return loadRosterFile().bots;
 }
 function rosterOwner(selfId) {
   return loadRoster().find((b) => b.botId === selfId)?.ownerDiscordId;
@@ -187,16 +193,47 @@ function botOwner(configured, selfId) {
 function roleName(role) {
   return ROLE_NAMES[role] ?? role;
 }
-function rosterPrompt(selfId, ownerId, roster = loadRoster()) {
-  const self = roster.find((b) => b.botId === selfId);
-  const others = roster.filter((b) => b.botId !== selfId);
+function botDetails(b) {
+  return [b.ownerName ? `\u4E3B\u4EBA ${b.ownerName}` : "", b.role ? `\u89D2\u8272 ${roleName(b.role)}` : ""].filter(Boolean).join("\uFF0C");
+}
+function rosterPeople(roster) {
+  const people = /* @__PURE__ */ new Map();
+  for (const m of roster.members) {
+    if (!people.has(m.discordId)) people.set(m.discordId, { name: m.name, discordId: m.discordId, role: m.role, bots: [] });
+  }
+  for (const b of roster.bots) {
+    if (!b.ownerDiscordId) continue;
+    const p = people.get(b.ownerDiscordId);
+    if (p) p.bots.push(b.botName);
+    else people.set(b.ownerDiscordId, { name: b.ownerName || `${b.botName} \u7684\u4E3B\u4EBA`, discordId: b.ownerDiscordId, role: b.role, bots: [b.botName] });
+  }
+  return [...people.values()];
+}
+function rosterPrompt(selfId, ownerId, roster = loadRosterFile()) {
+  const self = roster.bots.find((b) => b.botId === selfId);
+  const others = roster.bots.filter((b) => b.botId !== selfId);
+  const people = rosterPeople(roster);
+  const owner = ownerId ? people.find((p) => p.discordId === ownerId) : void 0;
+  const team = people.filter((p) => p.discordId !== ownerId);
   const lines = [
-    self ? `\u3010\u4F60\u7684\u8EAB\u5206\u3011\u4F60\u662F ${self.botName}\uFF08Discord ID ${selfId}\uFF09\uFF0C${self.ownerName} \u7684 Bot\uFF0C\u89D2\u8272\uFF1A${roleName(self.role)}\u3002` : `\u3010\u4F60\u7684\u8EAB\u5206\u3011\u4F60\u662F Discord ID ${selfId} \u7684 Bot\uFF08\u4E0D\u5728\u540D\u518A\u4E2D\uFF09\u3002`
+    self ? `\u3010\u4F60\u7684\u8EAB\u5206\u3011\u4F60\u662F ${self.botName}\uFF08Discord ID ${selfId}\uFF09${self.ownerName ? `\uFF0C${self.ownerName} \u7684 Bot` : ""}${self.role ? `\uFF0C\u89D2\u8272\uFF1A${roleName(self.role)}` : ""}\u3002` : `\u3010\u4F60\u7684\u8EAB\u5206\u3011\u4F60\u662F Discord ID ${selfId} \u7684 Bot\uFF08\u4E0D\u5728\u540D\u518A\u4E2D\uFF09\u3002`
   ];
-  if (ownerId) lines.push(`\u3010\u4F60\u7684\u4E3B\u4EBA\u3011Discord ID ${ownerId}\uFF1B\u8981\u627E\u4E3B\u4EBA\u5C31\u5728 reply \u6587\u5B57\u88E1\u5BEB <@${ownerId}>\u3002`);
+  if (ownerId) lines.push(`\u3010\u4F60\u7684\u4E3B\u4EBA\u3011${owner ? `${owner.name}\uFF0C` : ""}Discord ID ${ownerId}\uFF1B\u8981\u627E\u4E3B\u4EBA\u5C31\u5728 reply \u6587\u5B57\u88E1\u5BEB <@${ownerId}>\u3002`);
   if (others.length) {
     lines.push("\u3010\u5176\u4ED6 Bot\u3011\uFF08\u540D\u518A\uFF1B\u8A0E\u8AD6\u4E32\u88E1\u53EF\u80FD\u51FA\u73FE\u9019\u4E9B Bot\uFF09");
-    for (const b of others) lines.push(`- ${b.botName}\uFF1A\u4E3B\u4EBA ${b.ownerName}\uFF0C\u89D2\u8272 ${roleName(b.role)}\uFF1B\u8981\u627E\u5B83\u5C31\u5728 reply \u6587\u5B57\u88E1\u5BEB <@${b.botId}>`);
+    for (const b of others) {
+      const details2 = botDetails(b);
+      lines.push(`- ${b.botName}${details2 ? `\uFF1A${details2}` : ""}\uFF1B\u8981\u627E\u5B83\u5C31\u5728 reply \u6587\u5B57\u88E1\u5BEB <@${b.botId}>`);
+    }
+  }
+  if (team.length) {
+    lines.push("\u3010\u5718\u968A\u6210\u54E1\u3011\uFF08\u540D\u518A\u4E0A\u7684\u4EBA\uFF1B\u8981 @ \u67D0\u4EBA\u5C31\u5728 reply \u6587\u5B57\u88E1\u5BEB <@ID>\uFF0C\u548C Bot \u4E00\u6A23\u53EA\u5728\u9700\u8981\u5C0D\u65B9\u505A\u4E8B\u6216\u56DE\u7B54\u6642\u624D @\uFF09");
+    for (const p of team) {
+      const bots = p.bots.length ? `Bot\uFF1A${p.bots.join("\u3001")}` : "";
+      const role = p.role ? `\u89D2\u8272 ${roleName(p.role)}` : "";
+      const details2 = [role, bots].filter(Boolean).join("\uFF0C");
+      lines.push(`- ${p.name}${details2 ? `\uFF1A${details2}` : ""}\uFF1B\u8981\u627E\u4ED6\u5C31\u5728 reply \u6587\u5B57\u88E1\u5BEB <@${p.discordId}>`);
+    }
   }
   lines.push(
     "\u3010\u548C\u5176\u4ED6 Bot \u5354\u4F5C\u3011",
@@ -944,8 +981,19 @@ async function handleDetailsClick(i) {
 // src/discord/prompt.ts
 function speaker(m, roster) {
   const name = m.member?.displayName ?? m.author.displayName;
-  const r = m.author.bot ? roster.find((b) => b.botId === m.author.id) : void 0;
-  const tags = [m.author.username, m.author.bot ? "Bot" : "", r ? `${r.ownerName} \u7684${roleName(r.role)}\uFF0CID ${r.botId}` : ""];
+  const tags = [m.author.username];
+  if (m.author.bot) {
+    tags.push("Bot");
+    const r = roster.bots.find((b) => b.botId === m.author.id);
+    if (r) {
+      const who = [r.ownerName ? `${r.ownerName} \u7684` : "", r.role ? roleName(r.role) : r.ownerName ? "Bot" : ""].join("");
+      tags.push([who, `ID ${r.botId}`].filter(Boolean).join("\uFF0C"));
+    }
+  } else {
+    tags.push(`ID ${m.author.id}`);
+    const p = rosterPeople(roster).find((x) => x.discordId === m.author.id);
+    if (p) tags.push(`\u540D\u518A\uFF1A${p.name}${p.role ? `\uFF0C${roleName(p.role)}` : ""}`);
+  }
   return `${name}\uFF08${tags.filter(Boolean).join("\uFF0C")}\uFF09`;
 }
 function body(m, saved) {
@@ -965,7 +1013,7 @@ async function recent(thread, trigger, limit, afterId) {
 async function buildPrompt(opts) {
   const { thread, trigger } = opts;
   const history = await recent(thread, trigger, opts.history, opts.afterId);
-  const roster = loadRoster();
+  const roster = loadRosterFile();
   const parent = thread.parent?.name ?? thread.parentId;
   const parts = [
     `\u3010\u767C\u8A71\u8005\u3011${speaker(trigger, roster)}`,
@@ -1385,7 +1433,8 @@ function createBot() {
     }
     const owner = botOwner(configured, c.user.id);
     log("owner", owner ? `${owner} (${configured ? "discord.owner_id" : "roster"})` : "none: set discord.owner_id, or permission requests are denied");
-    log("roster", `${loadRoster().length} bots from ${ROSTER_PATH}`);
+    const roster = loadRosterFile();
+    log("roster", `${roster.bots.length} bots, ${roster.members.length} members from ${ROSTER_PATH}`);
   });
   client2.on(Events.InteractionCreate, (i) => {
     if (i.isButton() && isDetailsButton(i.customId)) {

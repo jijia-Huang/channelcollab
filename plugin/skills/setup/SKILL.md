@@ -62,7 +62,7 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/create-bot/scripts/create-bot.mjs" import-han
 交付檔是管理員私下傳給使用者的 `.json` 檔，例如 `小明-bot.json`。
 
 1. 呼叫時有帶參數就把它當交付檔路徑；沒有就問使用者檔案放在哪裡（常見是「下載」資料夾）。可以用 Glob 在 `%USERPROFILE%\Downloads` 找 `*-bot.json` 來確認檔案存在，**但不要打開它**。
-2. 匯入：`import-handoff "<路徑>" --json`（上方的建 Bot 腳本）。腳本會向 Discord 驗證 token，再把 token、主人 ID、名冊寫進 HOME。最後一行 `RESULT {...}` 有 `botName`、`ownerId`、`rosterCount`。
+2. 匯入：`import-handoff "<路徑>" --json`（上方的建 Bot 腳本）。腳本會向 Discord 驗證 token，再把 token、主人 ID 寫進 HOME；交付檔附的名冊條目（通常是這個 Bot 自己）合併進名冊，不覆蓋原有的。最後一行 `RESULT {...}` 有 `botName`、`ownerId`、`rosterCount`。
 3. 依結果處理：
    - **「已經有另一個 Bot 的 token」**：這台電腦的 HOME 已經有別的 Bot。不要自己加 `--replace`。問使用者：要取代原本的 Bot（加 `--replace` 重跑），還是用另一個資料夾跑第二個 Bot（之後每個指令都加 `--home`）。
    - **401／token 無效**：交付檔過期了（管理員重設過 token）。請使用者向管理員要新的交付檔。

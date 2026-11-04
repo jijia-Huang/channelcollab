@@ -45,4 +45,5 @@ description: channelcollab 的 Discord 協作守則：Bot 在討論串裡怎麼�
 
 **名冊**
 
-- Bot 從名冊知道自己是誰、主人是誰，以及其他 Bot 的名稱、主人、角色。名冊由管理員維護，成員用 `/channelcollab:update-roster` 匯入新版。
+- Bot 從名冊知道自己是誰、主人是誰，以及其他 Bot 的名稱、主人、角色，和團隊成員（人）的名字、角色。名冊是每個人自己的，用 `/channelcollab:roster` 加入或移除（只要 Discord ID）。
+- 要 @ 某個人（不只主人），在 reply 文字裡寫 `<@ID>`；ID 見名冊的團隊成員，或對話紀錄裡人類發言者標籤上的「ID」。和 Bot 一樣，只在需要對方做事或回答時才 @。

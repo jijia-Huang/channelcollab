@@ -182,10 +182,10 @@ node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" save-token --for member --memb
 ```
 
 - 存成交付檔 `<HOME>\handoff\<成員名稱>-bot.json`，**不會寫進管理員自己的 config.json**。`--owner-id` 會寫進交付檔，成員匯入時自動設成 Bot 的主人（`discord.owner_id`，權限按鈕只有主人能按）。
-- 接著寫名冊時帶 `--handoff "<交付檔路徑>"`（第 7 節），目前的整份名冊會附進交付檔，成員匯入時一起裝好。
+- 接著寫名冊時帶 `--handoff "<交付檔路徑>"`（第 7 節），主人 ID 和這個 Bot 自己那一筆會附進交付檔，成員匯入後他的 Bot 就知道自己是誰。
 - 請明確告訴管理員：
   > 交付檔裡是**明文 token**。請私下（Discord 私訊或當面）把這個檔案交給本人，**不要貼在公開頻道或群組**。對方匯入後，兩邊都要刪掉這個檔案（用私訊傳的話，也刪掉那則訊息）。
-- 成員收到後，在自己的 Claude Code 執行 `/channelcollab:setup`，精靈會匯入交付檔（token、主人 ID、名冊），並提醒刪除檔案。
+- 成員收到後，在自己的 Claude Code 執行 `/channelcollab:setup`，精靈會匯入交付檔（token、主人 ID、這個 Bot 的名冊條目），並提醒刪除檔案。
 
 ### 驗證設定
 
@@ -236,22 +236,22 @@ node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" invite --guild-id <伺服器ID
 
 ## 7. 名冊
 
-名冊用來在提示詞中標示發話者，也讓 Bot 知道怎麼找其他 Bot。每個人的名冊放在自己的 `<HOME>\roster.json`，**不放在 plugin 裡**（plugin 的 repo 是公開的，名冊有真實的 Discord ID）。plugin 只附一份假資料的 `roster.example.json` 當格式範例。
+名冊用來在提示詞中標示發話者，也讓 Bot 知道怎麼找其他 Bot 和人。**名冊是每個人自己的**：每個 Bot 只讀自己的 `<HOME>\roster.json`，沒有要發放的正本。名冊**不放在 plugin 裡**（plugin 的 repo 是公開的，名冊有真實的 Discord ID）。plugin 只附一份假資料的 `roster.example.json` 當格式範例。
 
-管理員的 `<HOME>\roster.json` 就是正本：
+建好 Bot 後，把它寫進**建立者自己的**名冊：
 
 ```
 node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" roster --owner-name "成員名稱" --owner-id <成員Discord ID> --role engineer|planner [--handoff "<交付檔>"]
 ```
 
-- 帶 `--handoff` 時，Bot 身分從交付檔的 token 取得，寫完名冊後會把**整份名冊**和主人 ID 附進那個交付檔。新成員匯入交付檔時，名冊就一起裝好了。
-- 名冊有異動（新增成員、改名）時，其他成員要更新：管理員把自己的 `<HOME>\roster.json` 傳給大家（名冊沒有 token，可以放在團隊頻道），成員用 `/channelcollab:update-roster` 匯入。
+- 帶 `--handoff` 時，Bot 身分從交付檔的 token 取得，寫完名冊後會把主人 ID 和**這個 Bot 自己那一筆**附進交付檔（不附建立者的整份名冊）。成員匯入時合併進他自己的名冊。
+- 其他人想讓自己的 Bot 認得這個新 Bot，請他們用 `/channelcollab:roster` 自己加（只要 Bot 的 Discord ID，名稱會自動查）。收尾時把新 Bot 的 ID 告訴使用者，方便轉告。
 
 - Bot ID 和名稱會從 token 自動取得。也可以用 `--bot-id <ID> --bot-name <名稱> --app-id <Application ID>` 直接指定，這樣不需要 token。**用這個方式時記得帶 `--app-id`**，否則名冊那一筆不會有 `applicationId`。
 - 同一位主人有兩個 Bot（例如自己的正式 Bot 加一個測試 Bot）時，腳本會印出「已經有另一個 Bot」的 ⚠️，這是提醒，不是錯誤。測試用的 Bot 建議把 `--owner-name` 寫成看得出是測試的名稱（例如「測試企劃」）。
 - `--role` 可以填 `engineer`／`工程師` 或 `planner`／`企劃`。
 - 預設寫入 `<HOME>\roster.json`（`--roster <路徑>` 可以改）。檔案不存在就建立，已有同一個 `botId` 就更新那一筆。同一位主人已經有別的 Bot 時，會顯示警告。
-- 成員自己建 Bot 時，用 `--print` 輸出一筆資料，請使用者交給管理員合併進正本。
+- 只想看這一筆的內容、不寫檔時，用 `--print`。
 - **不要把名冊寫進 plugin 資料夾或 repo**：安裝目錄在 plugin 更新時會被覆蓋，repo 又是公開的。
 
 **格式**
@@ -269,9 +269,14 @@ node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" roster --owner-name "成員名
       "applicationId": "Application ID",
       "updatedAt": "ISO 8601 時間"
     }
+  ],
+  "members": [
+    { "discordId": "人的 Discord 使用者 ID", "name": "名字", "role": "engineer | planner（可省略）" }
   ]
 }
 ```
+
+`members`（人）由 `/channelcollab:roster` 管理，create-bot 寫名冊時原樣保留。
 
 ---
 
@@ -282,7 +287,7 @@ node "${CLAUDE_SKILL_DIR}/scripts/create-bot.mjs" roster --owner-name "成員名
 - Bot 名稱、Bot ID、Application ID，以及建在哪個 Team 或個人帳號底下。
 - token 存在哪裡：自己的 config.json，或是交付檔路徑加上「請私下交付」的提醒。
 - `verify` 的最終結果，並列出仍是 ❌ 的項目。
-- 是否已經加入伺服器。名冊是新增、更新，還是只輸出了一筆要交給管理員的資料。
+- 是否已經加入伺服器。名冊是新增還是更新；提醒其他人可以用 `/channelcollab:roster` 和 Bot ID 把它加進自己的名冊。
 - 建在個人帳號底下時，再提醒一次之後可以轉移到 Team。
 
 ---

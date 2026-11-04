@@ -3,10 +3,10 @@
 //
 // 子命令：
 //   save-token     從剪貼簿讀取 Bot token、向 Discord 驗證後存檔（自己用 → config.json；幫成員建 → 交付檔）
-//   import-handoff 成員把管理員給的交付檔匯入自己的 config.json（連同主人 ID 與名冊）
+//   import-handoff 成員把交付檔匯入自己的 config.json（連同主人 ID；附帶的 Bot 自己那一筆合併進名冊）
 //   verify         檢查 token、Message Content Intent、Public Bot、所屬 Team、是否已在指定伺服器
 //   invite         產生 OAuth2 邀請網址
-//   roster         產生名冊資料並寫入／合併到 roster.json（加 --handoff 時一併附進交付檔）
+//   roster         把新 Bot 寫進建立者自己的 roster.json（加 --handoff 時，主人 ID 與這筆資料附進交付檔）
 //   --self-test    不需要 token 的自我測試
 //
 // HOME：--home <路徑> 優先，其次環境變數 CHANNELCOLLAB_HOME，預設 %USERPROFILE%\.channelcollab。
@@ -21,6 +21,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mergeRoster, validateRoster } from '../../../scripts/channelcollab.mjs';
 
 const API = 'https://discord.com/api/v10';
 const USER_AGENT = 'DiscordBot (channelcollab-create-bot, 1.0)';
@@ -252,8 +253,9 @@ export function safeFileName(name) {
 
 // ---------------------------------------------------------------------------
 // 名冊
-// 格式：{ "version": 1, "bots": [ { botId, botName, applicationId, ownerName, ownerDiscordId, role, updatedAt } ] }
-// 以 botId 為鍵合併；role 只能是 engineer（工程師）或 planner（企劃）。
+// 格式：{ "version": 1, "bots": [ { botId, botName, applicationId, ownerName, ownerDiscordId, role, updatedAt } ],
+//         "members": [ { discordId, name, role } ] }（members 由總控的 roster add 管理，這裡原樣保留）
+// 名冊是每個人自己的：這裡只寫建立者自己的 roster.json，以 botId 為鍵合併；role 只能是 engineer 或 planner。
 // ---------------------------------------------------------------------------
 const ROLE_ALIASES = { engineer: 'engineer', 工程師: 'engineer', planner: 'planner', 企劃: 'planner', 企画: 'planner' };
 
@@ -575,7 +577,8 @@ async function cmdSaveToken(opts) {
 
 /**
  * 把交付檔寫進成員自己的 HOME：token → config.json 的 discord.token；主人 ID → discord.owner_id；
- * 附帶的名冊 → roster.json。config.json 已經有「另一個」Bot 的 token 時，沒有 replace 就停止，
+ * 附帶的名冊（通常只有這個 Bot 自己那一筆）合併進 roster.json，成員自己已有的條目不覆蓋。
+ * config.json 已經有「另一個」Bot 的 token 時，沒有 replace 就停止，
  * 避免一台電腦上的既有 Bot 被覆蓋（要跑第二個 Bot 請用另一個 HOME）。
  */
 export function applyHandoff({ handoff, token, configFile, rosterFile, replace = false }) {
@@ -588,6 +591,16 @@ export function applyHandoff({ handoff, token, configFile, rosterFile, replace =
       'exists',
     );
   }
+  let incoming = null;
+  if (Array.isArray(handoff?.roster?.bots)) {
+    try {
+      incoming = validateRoster({ bots: handoff.roster.bots, members: handoff.roster.members ?? [] });
+    } catch (e) {
+      throw new CliError(`交付檔附的名冊格式不對：${e.message}`);
+    }
+  }
+  const mine = incoming ? readJsonFile(rosterFile, { version: 1, bots: [] }) : null;
+  if (mine && !Array.isArray(mine.bots)) throw new CliError(`${rosterFile} 格式不對（缺少 bots 陣列），已停止以免覆蓋。`);
   mergeTokenIntoConfig(configFile, token);
   let ownerId = null;
   const wantOwner = handoff?.owner?.discordId;
@@ -598,11 +611,14 @@ export function applyHandoff({ handoff, token, configFile, rosterFile, replace =
     ownerId = wantOwner;
   }
   let rosterCount = null;
-  if (Array.isArray(handoff?.roster?.bots)) {
-    writeJsonFile(rosterFile, { version: handoff.roster.version ?? 1, bots: handoff.roster.bots });
-    rosterCount = handoff.roster.bots.length;
+  let rosterAdded = 0;
+  if (incoming) {
+    const r = mergeRoster({ version: 1, members: [], ...mine }, incoming);
+    writeJsonFile(rosterFile, r.roster);
+    rosterCount = r.roster.bots.length;
+    rosterAdded = r.added.length;
   }
-  return { ownerId, rosterCount, replaced: typeof previous === 'string' && !!previous && previous !== token };
+  return { ownerId, rosterCount, rosterAdded, replaced: typeof previous === 'string' && !!previous && previous !== token };
 }
 
 async function cmdImportHandoff(opts) {
@@ -623,7 +639,11 @@ async function cmdImportHandoff(opts) {
   console.log(`✅ token 有效（Bot「${botName}」，ID ${me.id}），已寫入 ${configFile} 的 discord.token`);
   if (r.replaced) console.log('   取代了原本的 token');
   console.log(r.ownerId ? `✅ 主人 Discord ID：${r.ownerId}` : '⚠️  交付檔裡沒有主人的 Discord ID，請另外設定（set-owner）。');
-  console.log(r.rosterCount !== null ? `✅ 名冊（${r.rosterCount} 個 Bot）已寫入 ${rosterFile}` : '⚠️  交付檔沒有附名冊，之後請向管理員要 roster.json 匯入。');
+  console.log(
+    r.rosterCount !== null
+      ? `✅ 名冊：合併進 ${rosterFile}（新增 ${r.rosterAdded} 筆，目前 ${r.rosterCount} 個 Bot；你原本的條目沒有改動）`
+      : '   交付檔沒有附名冊。常合作的人和 Bot 可以用 /channelcollab:roster 自己加進名冊。',
+  );
   let deleted = false;
   if (opts['delete-handoff']) {
     try {
@@ -696,17 +716,22 @@ async function cmdRoster(opts) {
   console.log(`   檔案：${file}`);
   for (const w of r.warnings) console.log(`⚠️  ${w}`);
   if (opts['handoff']) {
-    attachToHandoff(path.resolve(opts['handoff']), readJsonFile(file, { version: 1, bots: [] }), entry);
-    console.log(`✅ 已把名冊（${r.count} 筆）與主人 ID 附進交付檔 ${path.resolve(opts['handoff'])}`);
+    attachToHandoff(path.resolve(opts['handoff']), entry);
+    console.log(`✅ 已把主人 ID 與這個 Bot 的名冊資料附進交付檔 ${path.resolve(opts['handoff'])}`);
+    console.log('   其他人想讓自己的 Bot 認得這個新 Bot，請他們用 /channelcollab:roster 自己加（只要 Bot 的 Discord ID）。');
   }
 }
 
-/** 把目前的名冊快照與主人資料寫進交付檔，成員匯入時一次到位。token 欄位原樣保留。 */
-export function attachToHandoff(handoffFile, roster, entry) {
+/**
+ * 把主人資料和這個 Bot 自己的名冊條目寫進交付檔：成員匯入後，他的 Bot 知道自己是誰。
+ * 名冊是每個人自己的，所以不附建立者的整份名冊。token 欄位原樣保留。
+ */
+export function attachToHandoff(handoffFile, entry) {
   const h = readJsonFile(handoffFile, null);
   if (!h?.discord?.token) throw new CliError(`${handoffFile} 不是交付檔（沒有 discord.token），已停止。`);
   h.owner = { ...(h.owner ?? {}), name: entry.ownerName, discordId: entry.ownerDiscordId, role: entry.role };
-  h.roster = { version: roster.version ?? 1, bots: roster.bots };
+  const { updatedAt, ...bot } = entry;
+  h.roster = { version: 1, bots: [bot] };
   writeJsonFile(handoffFile, h);
 }
 
@@ -973,25 +998,43 @@ async function selfTest() {
   const hf = path.join(tmp, 'handoff.json');
   const cfgFile = path.join(home, 'config.json');
   const rosterFile = path.join(home, 'roster.json');
-  await t('roster --handoff：名冊快照與主人 ID 附進交付檔，token 保留', () => {
+  await t('roster --handoff：只附主人 ID 與這個 Bot 自己那一筆（不附建立者的整份名冊），token 保留', () => {
     writeJsonFile(hf, { discord: { token: FAKE }, bot: { id: APP, name: 'x' }, owner: { name: '小明' } });
     const roster = JSON.parse(fs.readFileSync(rf, 'utf-8'));
-    attachToHandoff(hf, roster, roster.bots[0]);
+    attachToHandoff(hf, roster.bots[0]);
     const h = JSON.parse(fs.readFileSync(hf, 'utf-8'));
     eq(h.discord.token, FAKE, 'token');
     eq(h.owner.discordId, '222222222222222222');
-    eq(h.roster.bots.length, 2);
-    throws(() => attachToHandoff(rf, roster, roster.bots[0]), /不是交付檔/);
+    eq(h.roster.bots.length, 1);
+    eq(h.roster.bots[0].botId, roster.bots[0].botId);
+    eq('updatedAt' in h.roster.bots[0], false);
+    throws(() => attachToHandoff(rf, roster.bots[0]), /不是交付檔/);
   });
-  await t('匯入：token、owner_id、名冊寫進成員的 HOME', () => {
+  await t('匯入：token、owner_id 寫進成員的 HOME；名冊用合併，成員自己的 Bot 與 members 不被覆蓋', () => {
+    writeJsonFile(rosterFile, {
+      version: 1,
+      bots: [{ botId: '111111111111111111', botName: '我自己取的名字' }, { botId: '444444444444444444', botName: '同事Bot' }],
+      members: [{ discordId: '555555555555555555', name: '小美', role: 'planner' }],
+    });
     const h = JSON.parse(fs.readFileSync(hf, 'utf-8'));
+    h.roster.bots.push({ botId: '666666666666666666', botName: '附帶的Bot' });
     const r = applyHandoff({ handoff: h, token: FAKE, configFile: cfgFile, rosterFile });
     eq(r.ownerId, '222222222222222222');
-    eq(r.rosterCount, 2);
+    eq(r.rosterCount, 3);
+    eq(r.rosterAdded, 1);
     const c = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
     eq(c.discord.token, FAKE);
     eq(c.discord.owner_id, '222222222222222222');
-    eq(JSON.parse(fs.readFileSync(rosterFile, 'utf-8')).bots.length, 2);
+    const ros = JSON.parse(fs.readFileSync(rosterFile, 'utf-8'));
+    eq(ros.bots[0].botName, '我自己取的名字', '同 ID 保留自己的');
+    eq(JSON.stringify(ros.members), JSON.stringify([{ discordId: '555555555555555555', name: '小美', role: 'planner' }]), 'members 保留');
+    throws(() => applyHandoff({ handoff: { roster: { bots: [{ botId: 'x', botName: 'y' }] } }, token: FAKE, configFile: cfgFile, rosterFile }), /名冊格式/);
+  });
+  await t('upsertRoster 更新 Bot 時保留 members', () => {
+    const f = path.join(tmp, 'roster-members.json');
+    writeJsonFile(f, { version: 1, bots: [], members: [{ discordId: '555555555555555555', name: '小美' }] });
+    upsertRoster(f, buildRosterEntry({ ...base, role: 'planner' }));
+    eq(JSON.stringify(JSON.parse(fs.readFileSync(f, 'utf-8')).members), JSON.stringify([{ discordId: '555555555555555555', name: '小美' }]));
   });
   await t('同一個 token 重新匯入可以；另一個 Bot 的 token 不加 --replace 會拒絕且不改檔', () => {
     applyHandoff({ handoff: {}, token: FAKE, configFile: cfgFile, rosterFile });
@@ -1021,15 +1064,15 @@ const HELP = `用法：node create-bot.mjs <子命令> [選項]
              [--handoff-dir <dir>] [--keep-clipboard] [--json]
                                                       從剪貼簿讀 token，存成交付檔（幫成員建）
   import-handoff <交付檔> [--config <path>] [--roster <path>] [--replace] [--delete-handoff] [--json]
-                                                      把交付檔的 token、主人 ID、名冊匯入自己的 HOME
+                                                      把交付檔的 token、主人 ID 匯入自己的 HOME（名冊用合併）
   verify [--config <path> | --handoff <檔> | --from-clipboard]
          [--guild-id <id>] [--team-id <id>] [--json] 檢查 Bot 設定
   invite (--app-id <id> | token 來源) [--guild-id <id>] [--lock-guild]
                                                       產生邀請網址
   roster --owner-name <名稱> --owner-id <Discord ID> --role engineer|planner
          [--bot-id <id> --bot-name <名稱> --app-id <id> | token 來源] [--roster <path>] [--print]
-                                                      寫入／合併名冊；token 來源是 --handoff 時，
-                                                      名冊與主人 ID 也會附進該交付檔
+                                                      寫進自己的名冊；token 來源是 --handoff 時，
+                                                      主人 ID 與這筆資料也會附進該交付檔
   --self-test                                         自我測試（不需要 token）
 
 所有子命令都接受 --home <路徑>（預設：CHANNELCOLLAB_HOME，沒設時 %USERPROFILE%\\.channelcollab）。

@@ -6,13 +6,14 @@
 //   install-runtime [--force]  把 plugin 內的 runtime 安裝到 <HOME>\runtime（npm ci，依賴版本固定）
 //   set-owner <Discord ID>     寫入 config.json 的 discord.owner_id（Bot 的主人，可以按權限按鈕）
 //   bind ...                   新增、修改、移除、列出頻道綁定
-//   import-roster <檔案>       匯入管理員給的名冊，存成 <HOME>\roster.json
+//   roster list|add|remove|import  管理自己的名冊 <HOME>\roster.json（Bot 和成員；add 只要 Discord ID）
 //   start | stop | status      啟動（背景執行）、停止、查看狀態
 //   shortcut [--dir <資料夾>]   產生雙擊用的「啟動／停止 channelcollab Bot.bat」（預設放桌面）
 //   --self-test                不需要 token 的自我測試
 //
 // HOME：--home <路徑> 優先，其次環境變數 CHANNELCOLLAB_HOME，預設 %USERPROFILE%\.channelcollab。
-// 安全：config.json 含 Discord token。本腳本只讀寫 token 以外的欄位，任何輸出都不含 token。
+// 安全：config.json 含 Discord token。本腳本只讀寫 token 以外的欄位；roster add 會在程式裡用 token
+// 向 Discord 查名稱，任何輸出都不含 token。
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -169,21 +170,252 @@ export function unbindChannel(file, channel) {
   return true;
 }
 
-/** 名冊格式檢查：{ version, bots: [{ botId, botName, ownerName, ownerDiscordId, role }] } */
+// ---------------------------------------------------------------------------
+// 名冊（每個人自己的 <HOME>\roster.json）
+// 格式：{ version: 1,
+//         bots:    [{ botId, botName, ownerName?, ownerDiscordId?, role? }],
+//         members: [{ discordId, name, role? }] }   ← members 可省略（舊名冊沒有）
+// ---------------------------------------------------------------------------
+const ROLE_ALIASES = { engineer: 'engineer', 工程師: 'engineer', planner: 'planner', 企劃: 'planner', 企画: 'planner' };
+const TOKEN_LIKE = /[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}/;
+
+/** engineer／工程師、planner／企劃；沒給就是 undefined（role 可以不填）。 */
+export function normalizeRole(role) {
+  if (role === undefined || role === null || role === true || role === '') return undefined;
+  const s = String(role).trim();
+  const r = ROLE_ALIASES[s.toLowerCase()] ?? ROLE_ALIASES[s];
+  if (!r) throw new CliError(`角色必須是 engineer／工程師 或 planner／企劃（收到：${role}）`);
+  return r;
+}
+
+/** 名冊格式檢查。bots 必填 botId、botName；members 可省略，有的話每筆要有 discordId、name。 */
 export function validateRoster(data) {
-  if (!data || !Array.isArray(data.bots)) throw new CliError('名冊格式不對：缺少 bots 陣列');
+  if (!data || typeof data !== 'object' || !Array.isArray(data.bots)) throw new CliError('名冊格式不對：缺少 bots 陣列');
+  if (data.members !== undefined && !Array.isArray(data.members)) throw new CliError('名冊格式不對：members 必須是陣列');
+  const seen = new Set();
+  const once = (id, where) => {
+    if (seen.has(id)) throw new CliError(`名冊裡 ${id} 出現不只一次（${where}）`);
+    seen.add(id);
+  };
   data.bots.forEach((b, i) => {
-    for (const k of ['botId', 'ownerDiscordId']) {
-      if (!SNOWFLAKE.test(String(b?.[k] ?? ''))) throw new CliError(`名冊第 ${i + 1} 筆的 ${k} 格式不對`);
+    if (!SNOWFLAKE.test(String(b?.botId ?? ''))) throw new CliError(`名冊 bots 第 ${i + 1} 筆的 botId 格式不對`);
+    if (typeof b.botName !== 'string' || !b.botName) throw new CliError(`名冊 bots 第 ${i + 1} 筆缺少 botName`);
+    if (b.ownerDiscordId !== undefined && !SNOWFLAKE.test(String(b.ownerDiscordId))) throw new CliError(`名冊 bots 第 ${i + 1} 筆的 ownerDiscordId 格式不對`);
+    for (const k of ['ownerName', 'role']) {
+      if (b[k] !== undefined && typeof b[k] !== 'string') throw new CliError(`名冊 bots 第 ${i + 1} 筆的 ${k} 不是文字`);
     }
-    for (const k of ['botName', 'ownerName', 'role']) {
-      if (typeof b?.[k] !== 'string' || !b[k]) throw new CliError(`名冊第 ${i + 1} 筆缺少 ${k}`);
-    }
+    once(b.botId, `bots 第 ${i + 1} 筆`);
   });
-  if (JSON.stringify(data).match(/[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}/)) {
-    throw new CliError('名冊裡有看起來像 token 的字串，已拒絕匯入。名冊不應該包含 token。');
+  (data.members ?? []).forEach((m, i) => {
+    if (!SNOWFLAKE.test(String(m?.discordId ?? ''))) throw new CliError(`名冊 members 第 ${i + 1} 筆的 discordId 格式不對`);
+    if (typeof m.name !== 'string' || !m.name) throw new CliError(`名冊 members 第 ${i + 1} 筆缺少 name`);
+    if (m.role !== undefined && typeof m.role !== 'string') throw new CliError(`名冊 members 第 ${i + 1} 筆的 role 不是文字`);
+    once(m.discordId, `members 第 ${i + 1} 筆`);
+  });
+  if (TOKEN_LIKE.test(JSON.stringify(data))) {
+    throw new CliError('名冊裡有看起來像 token 的字串，已拒絕。名冊不應該包含 token。');
   }
   return data;
+}
+
+/** 讀自己的名冊；不存在就是空名冊。壞掉的檔案會停下來，不覆蓋。 */
+export function readRoster(file) {
+  const r = readJson(file, null) ?? { version: 1, bots: [] };
+  if (typeof r !== 'object' || Array.isArray(r)) throw new CliError(`${file} 的最外層不是物件，已停止以免覆蓋。`);
+  r.version ??= 1;
+  r.bots ??= [];
+  r.members ??= [];
+  return validateRoster(r);
+}
+
+/** 名冊的摘要數字（給 status 用）；不存在時是 null。 */
+export function rosterCounts(file) {
+  if (!fs.existsSync(file)) return null;
+  try {
+    const r = readRoster(file);
+    return { bots: r.bots.length, members: r.members.length };
+  } catch {
+    return { bots: 0, members: 0, broken: true };
+  }
+}
+
+/**
+ * 新增或更新一筆。entry：{ kind: 'bot'|'member', id, name, role?, ownerId?, ownerName? }
+ * 同一個 ID 已在名冊就更新（只改有給的欄位）；在另一類（Bot／成員）就搬過來。
+ */
+export function rosterUpsert(roster, entry) {
+  const { kind, id } = entry;
+  if (!SNOWFLAKE.test(String(id ?? ''))) throw new CliError(`Discord ID 格式不對（應為 17–20 位數字）：${id}`);
+  if (!entry.name) throw new CliError('缺少名稱');
+  const role = normalizeRole(entry.role);
+  let moved = false;
+  if (kind === 'bot') {
+    if (entry.ownerId !== undefined && !SNOWFLAKE.test(String(entry.ownerId))) throw new CliError(`主人的 Discord ID 格式不對：${entry.ownerId}`);
+    if (roster.members.some((m) => m.discordId === id)) {
+      roster.members = roster.members.filter((m) => m.discordId !== id);
+      moved = true;
+    }
+    const idx = roster.bots.findIndex((b) => b.botId === id);
+    const next = { ...(idx >= 0 ? roster.bots[idx] : {}), botId: id, botName: entry.name };
+    if (entry.ownerName) next.ownerName = entry.ownerName;
+    if (entry.ownerId) next.ownerDiscordId = String(entry.ownerId);
+    if (role) next.role = role;
+    if (idx >= 0) roster.bots[idx] = next;
+    else roster.bots.push(next);
+    return { action: idx >= 0 ? 'updated' : 'added', moved, entry: next };
+  }
+  if (kind !== 'member') throw new CliError(`不明的種類：${kind}`);
+  if (entry.ownerId || entry.ownerName) throw new CliError('--owner-id／--owner-name 只用在 Bot 上');
+  if (roster.bots.some((b) => b.botId === id)) {
+    roster.bots = roster.bots.filter((b) => b.botId !== id);
+    moved = true;
+  }
+  const idx = roster.members.findIndex((m) => m.discordId === id);
+  const next = { ...(idx >= 0 ? roster.members[idx] : {}), discordId: id, name: entry.name };
+  if (role) next.role = role;
+  if (idx >= 0) roster.members[idx] = next;
+  else roster.members.push(next);
+  return { action: idx >= 0 ? 'updated' : 'added', moved, entry: next };
+}
+
+/** 移除一筆（Bot 或成員）；回傳移除的種類，找不到時是 null。 */
+export function rosterRemove(roster, id) {
+  if (roster.bots.some((b) => b.botId === id)) {
+    roster.bots = roster.bots.filter((b) => b.botId !== id);
+    return 'bot';
+  }
+  if (roster.members.some((m) => m.discordId === id)) {
+    roster.members = roster.members.filter((m) => m.discordId !== id);
+    return 'member';
+  }
+  return null;
+}
+
+const BOT_FIELDS = ['botName', 'ownerName', 'ownerDiscordId', 'role'];
+const MEMBER_FIELDS = ['name', 'role'];
+const sameFields = (a, b, keys) => keys.every((k) => (a[k] ?? null) === (b[k] ?? null));
+
+/**
+ * 把別人給的名冊合併進自己的。新的 ID 加進來；同一個 ID 預設保留自己的（列進 conflicts），
+ * theirs 為 true 時改用對方的（列進 replaced）。ID 在自己這邊是另一類（Bot／成員）時一律保留自己的。
+ * 不修改傳入的物件，回傳新的名冊。
+ */
+export function mergeRoster(mine, theirs, { preferTheirs = false } = {}) {
+  const out = { ...mine, bots: [...(mine.bots ?? [])], members: [...(mine.members ?? [])] };
+  const added = [];
+  const conflicts = [];
+  const replaced = [];
+  const ids = () => new Set([...out.bots.map((b) => b.botId), ...out.members.map((m) => m.discordId)]);
+  for (const b of theirs.bots ?? []) {
+    const idx = out.bots.findIndex((x) => x.botId === b.botId);
+    if (idx < 0) {
+      if (ids().has(b.botId)) conflicts.push({ kind: 'bot', id: b.botId, name: b.botName, mine: '成員', theirs: 'Bot' });
+      else {
+        out.bots.push(b);
+        added.push({ kind: 'bot', id: b.botId, name: b.botName });
+      }
+    } else if (!sameFields(out.bots[idx], b, BOT_FIELDS)) {
+      if (preferTheirs) {
+        out.bots[idx] = { ...out.bots[idx], ...b };
+        replaced.push({ kind: 'bot', id: b.botId, name: b.botName });
+      } else conflicts.push({ kind: 'bot', id: b.botId, name: out.bots[idx].botName, theirsName: b.botName });
+    }
+  }
+  for (const m of theirs.members ?? []) {
+    const idx = out.members.findIndex((x) => x.discordId === m.discordId);
+    if (idx < 0) {
+      if (ids().has(m.discordId)) conflicts.push({ kind: 'member', id: m.discordId, name: m.name, mine: 'Bot', theirs: '成員' });
+      else {
+        out.members.push(m);
+        added.push({ kind: 'member', id: m.discordId, name: m.name });
+      }
+    } else if (!sameFields(out.members[idx], m, MEMBER_FIELDS)) {
+      if (preferTheirs) {
+        out.members[idx] = { ...out.members[idx], ...m };
+        replaced.push({ kind: 'member', id: m.discordId, name: m.name });
+      } else conflicts.push({ kind: 'member', id: m.discordId, name: out.members[idx].name, theirsName: m.name });
+    }
+  }
+  return { roster: out, added, conflicts, replaced };
+}
+
+const ROLE_LABEL = { engineer: '工程師', planner: '企劃' };
+const roleLabel = (r) => (r ? ROLE_LABEL[r] ?? r : '未填角色');
+
+/** 名冊的文字清單（list／add／import 共用）。 */
+export function rosterLines(roster) {
+  const lines = [`Bot（${roster.bots.length}）：`];
+  if (!roster.bots.length) lines.push('  （沒有）');
+  for (const b of roster.bots) {
+    const owner = b.ownerDiscordId ? `主人 ${b.ownerName ?? '?'}（ID ${b.ownerDiscordId}）` : b.ownerName ? `主人 ${b.ownerName}` : '主人未填';
+    lines.push(`  - ${b.botName}（ID ${b.botId}）：${owner}，${roleLabel(b.role)}`);
+  }
+  lines.push(`成員（${roster.members.length}）：`);
+  if (!roster.members.length) lines.push('  （沒有）');
+  for (const m of roster.members) lines.push(`  - ${m.name}（ID ${m.discordId}）：${roleLabel(m.role)}`);
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
+// 用自己 Bot 的 token 查 Discord 使用者（名稱、是不是 Bot）。token 只用在請求標頭，不輸出。
+// ---------------------------------------------------------------------------
+const DISCORD_API = 'https://discord.com/api/v10';
+
+async function discordGet(token, route, fetchImpl) {
+  let res;
+  try {
+    res = await fetchImpl(DISCORD_API + route, {
+      headers: { Authorization: `Bot ${token}`, 'User-Agent': 'DiscordBot (channelcollab, 1.0)' },
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (e) {
+    const why = e?.name === 'TimeoutError' ? '逾時' : e?.cause?.code || e?.name || 'error';
+    throw new CliError(`連不到 Discord API（${why}）`);
+  }
+  if (res.status === 401) throw new CliError('Discord 回應 401：這個 HOME 的 Bot token 無效');
+  const body = res.ok ? await res.json() : null;
+  return { status: res.status, body };
+}
+
+/**
+ * 查一個 Discord ID：名稱依序取伺服器暱稱（nick）、global_name、username。
+ * 伺服器用 config.json 的 discord.guild_id；沒有就試 Bot 所在的伺服器（最多 10 個）。
+ */
+export async function lookupDiscordUser({ token, guildId }, id, fetchImpl = globalThis.fetch) {
+  if (!token) throw new CliError('這個 HOME 還沒有 Bot token，沒辦法向 Discord 查名稱');
+  const u = await discordGet(token, `/users/${id}`, fetchImpl);
+  if (u.status === 404) throw new CliError(`Discord 上找不到 ID ${id} 的使用者`);
+  if (!u.body) throw new CliError(`Discord API /users/${id} 回應 ${u.status}`);
+  let guilds = guildId ? [String(guildId)] : [];
+  if (!guilds.length) {
+    const g = await discordGet(token, '/users/@me/guilds?limit=10', fetchImpl);
+    guilds = Array.isArray(g.body) ? g.body.map((x) => x.id) : [];
+  }
+  let nick = null;
+  let guild = null;
+  for (const gid of guilds.slice(0, 10)) {
+    const m = await discordGet(token, `/guilds/${gid}/members/${id}`, fetchImpl);
+    if (m.body) {
+      nick = m.body.nick || null;
+      guild = gid;
+      break;
+    }
+  }
+  return {
+    id: String(id),
+    bot: !!u.body.bot,
+    name: nick || u.body.global_name || u.body.username,
+    username: u.body.username,
+    nick,
+    globalName: u.body.global_name ?? null,
+    guild,
+  };
+}
+
+/** 從 config.json 拿查詢需要的 token 與伺服器 ID（只在程式裡用，不回傳給輸出）。 */
+function lookupCredentials(p) {
+  const c = readConfig(p.config);
+  return { token: typeof c.discord?.token === 'string' ? c.discord.token : null, guildId: c.discord?.guild_id ?? null };
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +588,7 @@ async function getStatus(p) {
     recentErrors: log.errors,
     stderrTail: errTail,
     config: configSummary(p.config),
-    roster: fs.existsSync(p.roster) ? (readJson(p.roster, { bots: [] }).bots ?? []).length : null,
+    roster: rosterCounts(p.roster),
     runtime: runtimeState(p),
   };
 }
@@ -564,7 +796,10 @@ function printStatus(s) {
     console.log('綁定的頻道：');
     printChannels(c.channels);
   }
-  console.log(`名冊：${s.roster === null ? '沒有（<HOME>\\roster.json 不存在）' : `${s.roster} 個 Bot`}`);
+  const r = s.roster;
+  if (r?.broken) console.log('⚠️  名冊：<HOME>\\roster.json 格式不對，Bot 會當作空名冊');
+  else if (!r || (!r.bots && !r.members)) console.log('名冊：空的（可以用 /channelcollab:roster 把常合作的人和 Bot 加進來）');
+  else console.log(`名冊：${r.bots} 個 Bot，${r.members} 位成員`);
   const rt = s.runtime;
   console.log(`runtime：${rt.installed ? `版本 ${rt.have?.version}${rt.upToDate ? '（最新）' : `（plugin 是 ${rt.want?.version}，下次啟動會更新）`}` : '未安裝'}`);
   if (s.recentErrors.length || s.stderrTail.length) {
@@ -630,13 +865,14 @@ const commands = {
     printChannels({ [opts.channel]: r.channel });
     console.log(`   設定檔會自動重新載入；Bot 正在執行的話，新的設定從下一則訊息開始生效。`);
   },
+  async roster(p, opts) {
+    const sub = opts._[1] ?? 'list';
+    if (!rosterCommands[sub]) throw new CliError(`roster 的子命令只有 ${Object.keys(rosterCommands).join('、')}（收到：${sub}）`);
+    await rosterCommands[sub](p, opts);
+  },
   async 'import-roster'(p, opts) {
-    const src = opts._[1];
-    if (!src) throw new CliError('用法：import-roster <名冊檔案>');
-    const data = validateRoster(readJson(path.resolve(src), null));
-    writeJson(p.roster, { version: data.version ?? 1, bots: data.bots });
-    console.log(`✅ 已匯入名冊（${data.bots.length} 個 Bot）到 ${p.roster}；下一個新的對話開始生效，不用重啟 Bot。`);
-    for (const b of data.bots) console.log(`  - ${b.botName}：主人 ${b.ownerName}，角色 ${b.role}`);
+    // 舊名稱：等同 roster import
+    await rosterCommands.import(p, { ...opts, _: ['roster', 'import', ...opts._.slice(1)] });
   },
   async start(p, opts) {
     await start(p, { wait: opts.wait === undefined ? READY_WAIT_S : Number(opts.wait), update: !opts['no-update'] });
@@ -657,6 +893,86 @@ const commands = {
   },
 };
 
+const opt = (v) => (v === undefined || v === true ? undefined : String(v));
+
+const rosterCommands = {
+  async list(p, opts) {
+    const r = readRoster(p.roster);
+    if (opts.json) return console.log('RESULT ' + JSON.stringify(r));
+    console.log(`名冊 ${p.roster}${fs.existsSync(p.roster) ? '' : '（還不存在，是空的）'}`);
+    for (const l of rosterLines(r)) console.log(l);
+  },
+  async add(p, opts) {
+    const id = opt(opts._[2] ?? opts.id);
+    if (!id || !SNOWFLAKE.test(id)) throw new CliError('用法：roster add <Discord ID> [--name <名字>] [--role engineer|planner] [--bot|--member] [--owner-id <ID>] [--owner-name <名字>]');
+    let name = opt(opts.name);
+    let kind = opts.bot ? 'bot' : opts.member ? 'member' : undefined;
+    let found = null;
+    if (!name || !kind) {
+      try {
+        found = await lookupDiscordUser(lookupCredentials(p), id);
+      } catch (e) {
+        if (!(e instanceof CliError)) throw e;
+        if (!name) throw new CliError(`${e.message}。查不到名稱時請加 --name <名字>（Bot 再加 --bot）。`);
+        console.log(`⚠️  ${e.message}；改用 --name「${name}」`);
+      }
+    }
+    if (found) {
+      name ??= found.name;
+      kind ??= found.bot ? 'bot' : 'member';
+      if (opts.bot && !found.bot) console.log(`⚠️  Discord 上 ${id} 不是 Bot，但照 --bot 記成 Bot`);
+      if (opts.member && found.bot) console.log(`⚠️  Discord 上 ${id} 是 Bot，但照 --member 記成成員`);
+    }
+    kind ??= 'member';
+    const ownerId = opt(opts['owner-id']);
+    let ownerName = opt(opts['owner-name']);
+    if (kind === 'bot' && ownerId && !ownerName) {
+      try {
+        ownerName = (await lookupDiscordUser(lookupCredentials(p), ownerId)).name;
+      } catch (e) {
+        if (!(e instanceof CliError)) throw e;
+        console.log(`⚠️  查不到主人的名稱（${e.message}）；需要的話用 --owner-name 補上`);
+      }
+    }
+    const roster = readRoster(p.roster);
+    const r = rosterUpsert(roster, { kind, id, name, role: opt(opts.role), ownerId, ownerName });
+    writeJson(p.roster, validateRoster(roster));
+    const what = kind === 'bot' ? 'Bot' : '成員';
+    const src = found ? `（名稱來自 Discord ${found.nick ? '伺服器暱稱' : found.globalName ? '顯示名稱' : 'username'}）` : '';
+    console.log(`✅ 名冊${r.action === 'added' ? '新增' : '更新'}${what}：${name}（ID ${id}）${src}${r.moved ? `；原本記在${kind === 'bot' ? '成員' : 'Bot'}，已搬過來` : ''}`);
+    if (found && !found.guild) console.log('   ⚠️  這個人不在 Bot 所在的伺服器裡（或 Bot 查不到），名稱用的是 Discord 帳號的名稱');
+    console.log(`   檔案：${p.roster}；下一個新的對話開始生效，不用重啟 Bot。`);
+  },
+  async remove(p, opts) {
+    const id = opt(opts._[2] ?? opts.id);
+    if (!id) throw new CliError('用法：roster remove <Discord ID>');
+    const roster = readRoster(p.roster);
+    const kind = rosterRemove(roster, id);
+    if (!kind) return console.log(`名冊裡本來就沒有 ${id}`);
+    writeJson(p.roster, roster);
+    console.log(`✅ 已從名冊移除${kind === 'bot' ? 'Bot' : '成員'} ${id}`);
+  },
+  async import(p, opts) {
+    const src = opt(opts._[2] ?? opts.file);
+    if (!src) throw new CliError('用法：roster import <名冊檔案> [--theirs]');
+    const theirs = validateRoster(readJson(path.resolve(src), null) ?? {});
+    const mine = readRoster(p.roster);
+    const r = mergeRoster(mine, theirs, { preferTheirs: !!opts.theirs });
+    writeJson(p.roster, validateRoster(r.roster));
+    if (opts.json) return console.log('RESULT ' + JSON.stringify({ added: r.added, conflicts: r.conflicts, replaced: r.replaced }));
+    const label = (x) => `${x.kind === 'bot' ? 'Bot' : '成員'} ${x.name}（ID ${x.id}）`;
+    console.log(`✅ 已合併 ${path.resolve(src)} 到 ${p.roster}：新增 ${r.added.length} 筆，取代 ${r.replaced.length} 筆，保留自己的 ${r.conflicts.length} 筆`);
+    for (const x of r.added) console.log(`  + ${label(x)}`);
+    for (const x of r.replaced) console.log(`  ~ ${label(x)}（改用對方的）`);
+    for (const x of r.conflicts) {
+      const why = x.mine ? `你記成${x.mine}，對方記成${x.theirs}` : `對方的內容不同${x.theirsName && x.theirsName !== x.name ? `（對方叫它「${x.theirsName}」）` : ''}`;
+      console.log(`  = ${label(x)}：${why}，保留你的`);
+    }
+    if (r.conflicts.some((x) => !x.mine)) console.log('   要改用對方的內容，加 --theirs 再匯入一次（只影響上面「保留你的」那幾筆）。');
+    console.log('   下一個新的對話開始生效，不用重啟 Bot。');
+  },
+};
+
 const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路徑>]
 
   check [--json]                          檢查 Node、npm、runtime、設定、執行狀態
@@ -667,7 +983,12 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
                                           新增或修改頻道綁定（只給要改的欄位）
   bind --remove --channel <ID>            移除頻道綁定
   bind --list                             列出頻道綁定
-  import-roster <檔案>                    匯入管理員給的名冊
+  roster list [--json]                    列出自己的名冊（Bot 和成員）
+  roster add <Discord ID> [--name <名字>] [--role engineer|planner] [--bot|--member]
+             [--owner-id <ID>] [--owner-name <名字>]
+                                          加進名冊；名字和是不是 Bot 用自己 Bot 的 token 向 Discord 查
+  roster remove <Discord ID>              從名冊移除
+  roster import <檔案> [--theirs]         合併別人給的名冊（同一個 ID 預設保留自己的）
   start [--wait <秒>] [--no-update]       在背景啟動 Bot，等它上線
   stop                                    停止 Bot，並確認沒有殘留程序
   status [--json]                         Bot 是否在跑、登入成誰、綁定、最近錯誤
@@ -794,6 +1115,153 @@ async function selfTest() {
     throws(() => validateRoster({ bots: [{ ...bot, botId: 'x' }] }), /botId/);
     throws(() => validateRoster({ bots: [{ ...bot, botName: '' }] }), /botName/);
     throws(() => validateRoster({ bots: [{ ...bot, note: FAKE }] }), /token/);
+  });
+  const PERSON = '333333333333333333';
+  const BOT2 = '444444444444444444';
+  await t('members 可省略；Bot 的主人與角色可省略；members 的 ID、名稱錯誤或 ID 重複都拒絕', () => {
+    validateRoster({ bots: [{ botId: BOT2, botName: '只有ID的Bot' }] });
+    validateRoster({ bots: [bot], members: [{ discordId: PERSON, name: '小華', role: 'planner' }, { discordId: '555555555555555555', name: '小美' }] });
+    throws(() => validateRoster({ bots: [], members: {} }), /members/);
+    throws(() => validateRoster({ bots: [], members: [{ discordId: 'x', name: 'a' }] }), /discordId/);
+    throws(() => validateRoster({ bots: [], members: [{ discordId: PERSON, name: '' }] }), /name/);
+    throws(() => validateRoster({ bots: [bot], members: [{ discordId: bot.botId, name: 'a' }] }), /不只一次/);
+    throws(() => validateRoster({ bots: [{ ...bot, ownerDiscordId: 'abc' }] }), /ownerDiscordId/);
+  });
+  const rosterHome = path.join(tmp, 'roster-home');
+  const rp = paths(rosterHome);
+  await t('名冊不存在時是空的；舊名冊（沒有 members）照常讀，bots 不動', () => {
+    eq(readRoster(rp.roster), { version: 1, bots: [], members: [] });
+    eq(rosterCounts(rp.roster), null);
+    writeJson(rp.roster, { version: 1, bots: [bot] });
+    const r = readRoster(rp.roster);
+    eq(r.bots, [bot]);
+    eq(r.members, []);
+    eq(rosterCounts(rp.roster), { bots: 1, members: 0 });
+  });
+  await t('新增成員、同一個 ID 再加是更新（沒給的欄位保留）、角色別名、錯誤的角色拒絕', () => {
+    const r = readRoster(rp.roster);
+    eq(rosterUpsert(r, { kind: 'member', id: PERSON, name: '小華', role: '企劃' }).action, 'added');
+    eq(r.members, [{ discordId: PERSON, name: '小華', role: 'planner' }]);
+    eq(rosterUpsert(r, { kind: 'member', id: PERSON, name: '小華華' }).action, 'updated');
+    eq(r.members, [{ discordId: PERSON, name: '小華華', role: 'planner' }]);
+    throws(() => rosterUpsert(r, { kind: 'member', id: PERSON, name: 'x', role: '美術' }), /角色/);
+    throws(() => rosterUpsert(r, { kind: 'member', id: '12', name: 'x' }), /格式/);
+    throws(() => rosterUpsert(r, { kind: 'member', id: PERSON, name: 'x', ownerId: bot.ownerDiscordId }), /只用在 Bot/);
+  });
+  await t('新增只有 ID 與名稱的 Bot；同一個 ID 從成員改成 Bot 會搬過去，不重複', () => {
+    const r = readRoster(rp.roster);
+    rosterUpsert(r, { kind: 'member', id: BOT2, name: '誤加' });
+    const res = rosterUpsert(r, { kind: 'bot', id: BOT2, name: '小華Bot', ownerId: PERSON, ownerName: '小華', role: 'planner' });
+    eq(res.moved, true);
+    eq(r.members.some((m) => m.discordId === BOT2), false);
+    eq(r.bots.at(-1), { botId: BOT2, botName: '小華Bot', ownerName: '小華', ownerDiscordId: PERSON, role: 'planner' });
+    validateRoster(r);
+  });
+  await t('移除 Bot 或成員；不存在時回傳 null', () => {
+    const r = readRoster(rp.roster);
+    rosterUpsert(r, { kind: 'member', id: PERSON, name: '小華' });
+    rosterUpsert(r, { kind: 'bot', id: BOT2, name: '小華Bot' });
+    eq(rosterRemove(r, PERSON), 'member');
+    eq(rosterRemove(r, BOT2), 'bot');
+    eq(rosterRemove(r, BOT2), null);
+    eq(r.bots, [bot]);
+  });
+  await t('合併別人的名冊：新的加入；同 ID 預設保留自己的；--theirs 取代；Bot／成員不同類時保留自己的；不改傳入的物件', () => {
+    const mine = { version: 1, bots: [bot], members: [{ discordId: PERSON, name: '我叫他小華', role: 'planner' }] };
+    const theirs = {
+      bots: [{ ...bot, botName: '別人取的名字' }, { botId: BOT2, botName: '新Bot' }, { botId: PERSON, botName: '把人記成Bot' }],
+      members: [{ discordId: PERSON, name: '小華' }, { discordId: '555555555555555555', name: '小美', role: 'engineer' }],
+    };
+    const before = JSON.stringify(mine);
+    const r = mergeRoster(mine, theirs);
+    eq(JSON.stringify(mine), before, '原物件不變');
+    eq(r.added.map((x) => x.id), [BOT2, '555555555555555555']);
+    eq(r.conflicts.length, 3);
+    eq(r.roster.bots[0].botName, bot.botName, '保留自己的 Bot 名稱');
+    eq(r.roster.members[0].name, '我叫他小華', '保留自己的成員名稱');
+    eq(r.roster.bots.some((b) => b.botId === PERSON), false, '不同類不加入');
+    const t2 = mergeRoster(mine, theirs, { preferTheirs: true });
+    eq(t2.replaced.map((x) => x.id), [bot.botId, PERSON]);
+    eq(t2.roster.bots[0].botName, '別人取的名字');
+    eq(t2.roster.members[0], { discordId: PERSON, name: '小華', role: 'planner' }, '對方沒給的欄位保留');
+    eq(t2.roster.bots.some((b) => b.botId === PERSON), false, '不同類就算 --theirs 也不加入');
+    validateRoster(t2.roster);
+    eq(mergeRoster(mine, { bots: [bot] }).conflicts, [], '內容相同不算衝突');
+  });
+  await t('向 Discord 查名稱：伺服器暱稱優先、其次 global_name、username；查不到伺服器時試 Bot 所在的伺服器；錯誤訊息不含 token', async () => {
+    const calls = [];
+    const fake = (users, members, guilds = []) => async (url, init) => {
+      calls.push({ url, auth: init.headers.Authorization });
+      const route = url.replace('https://discord.com/api/v10', '');
+      const json = (status, body) => ({ status, ok: status < 300, json: async () => body });
+      if (route.startsWith('/users/@me/guilds')) return json(200, guilds);
+      let m = /^\/users\/(\d+)$/.exec(route);
+      if (m) return users[m[1]] ? json(200, users[m[1]]) : json(404, { message: 'Unknown User' });
+      m = /^\/guilds\/(\d+)\/members\/(\d+)$/.exec(route);
+      if (m) return members[`${m[1]}/${m[2]}`] ? json(200, members[`${m[1]}/${m[2]}`]) : json(404, {});
+      return json(404, {});
+    };
+    const users = { [PERSON]: { username: 'xh', global_name: '小華 Global' }, [BOT2]: { username: 'xhbot', global_name: null, bot: true } };
+    const r1 = await lookupDiscordUser({ token: FAKE, guildId: CH }, PERSON, fake(users, { [`${CH}/${PERSON}`]: { nick: '企劃小華' } }));
+    eq([r1.name, r1.bot, r1.guild], ['企劃小華', false, CH]);
+    eq(calls[0].auth, `Bot ${FAKE}`, 'token 只放在 Authorization');
+    const r2 = await lookupDiscordUser({ token: FAKE, guildId: CH }, PERSON, fake(users, { [`${CH}/${PERSON}`]: { nick: null } }));
+    eq(r2.name, '小華 Global');
+    const r3 = await lookupDiscordUser({ token: FAKE }, BOT2, fake(users, { [`9/${BOT2}`]: {} }, [{ id: '8' }, { id: '9' }]));
+    eq([r3.name, r3.bot, r3.guild], ['xhbot', true, '9']);
+    const r4 = await lookupDiscordUser({ token: FAKE }, PERSON, fake(users, {}, []));
+    eq([r4.name, r4.guild], ['小華 Global', null]);
+    for (const fn of [
+      () => lookupDiscordUser({ token: FAKE }, '666666666666666666', fake(users, {})),
+      () => lookupDiscordUser({ token: FAKE }, PERSON, async () => ({ status: 401, ok: false, json: async () => ({}) })),
+      () => lookupDiscordUser({ token: FAKE }, PERSON, async () => { throw new Error(`boom ${FAKE}`); }),
+      () => lookupDiscordUser({ token: null }, PERSON, fake(users, {})),
+    ]) {
+      try {
+        await fn();
+        throw new Error('沒有丟錯');
+      } catch (e) {
+        eq(e instanceof CliError, true, `CliError：${e.message}`);
+        eq(e.message.includes(FAKE), false, '不含 token');
+      }
+    }
+  });
+  await t('roster 子命令：add（給 --name 不查 Discord）、list、remove、import 合併；沒有 token 又沒給 --name 會要求 --name', async () => {
+    const home2 = path.join(tmp, 'roster-cli');
+    const p2 = paths(home2);
+    const quiet = async (fn) => {
+      const log = console.log;
+      const out = [];
+      console.log = (...a) => out.push(a.join(' '));
+      try {
+        await fn();
+      } finally {
+        console.log = log;
+      }
+      return out.join('\n');
+    };
+    await quiet(() => commands.roster(p2, { _: ['roster', 'add', PERSON], name: '小華', member: true, role: 'planner' }));
+    await quiet(() => commands.roster(p2, { _: ['roster', 'add', BOT2], name: '小華Bot', bot: true, 'owner-id': PERSON, 'owner-name': '小華' }));
+    const r = JSON.parse(fs.readFileSync(p2.roster, 'utf-8'));
+    eq(r.members, [{ discordId: PERSON, name: '小華', role: 'planner' }]);
+    eq(r.bots, [{ botId: BOT2, botName: '小華Bot', ownerName: '小華', ownerDiscordId: PERSON }]);
+    const listed = await quiet(() => commands.roster(p2, { _: ['roster', 'list'] }));
+    eq(listed.includes(`小華（ID ${PERSON}）：企劃`), true, 'list 內容');
+    let err = null;
+    try {
+      await quiet(() => commands.roster(p2, { _: ['roster', 'add', '555555555555555555'] }));
+    } catch (e) {
+      err = e;
+    }
+    eq(/--name/.test(err?.message ?? ''), true, `要求 --name：${err?.message}`);
+    const other = path.join(tmp, 'other-roster.json');
+    writeJson(other, { version: 1, bots: [bot], members: [{ discordId: PERSON, name: '別人叫的' }, { discordId: '555555555555555555', name: '小美' }] });
+    await quiet(() => commands['import-roster'](p2, { _: ['import-roster', other] }));
+    const merged = JSON.parse(fs.readFileSync(p2.roster, 'utf-8'));
+    eq(merged.members.map((m) => m.name), ['小華', '小美'], '同 ID 保留自己的');
+    eq(merged.bots.length, 2);
+    await quiet(() => commands.roster(p2, { _: ['roster', 'remove', PERSON] }));
+    eq(rosterCounts(p2.roster), { bots: 2, members: 1 });
   });
 
   console.log('log 解析');

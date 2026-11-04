@@ -65,7 +65,7 @@
 | Discord | discord.js v14 | 最成熟；按鈕、選單、Modal、論壇標籤都支援 |
 | 執行環境 | Node 22 以上（開發期用 `tsx` 直接跑 `src/`） | 成員需自行安裝 Node；setup 偵測不到時請使用者用 winget 安裝 |
 | 打包 | esbuild 打包成 `plugin/runtime/bot.mjs`（npm 套件不打包），提交進 repo；成員端 `npm ci` 安裝固定版本的依賴（見第 13 節） | Agent SDK 內建平台專屬的 CLI 執行檔，只能由 npm 依平台安裝。單一 exe（Phase 0-1）延後 |
-| 名冊 | `<HOME>\roster.json`（每人一份） | 由管理員經交付檔或 `/channelcollab:update-roster` 發放，不放在 plugin 裡（第 12 節） |
+| 名冊 | `<HOME>\roster.json`（每人一份） | 每個人自己維護（`/channelcollab:roster`），不放在 plugin 裡（第 12 節） |
 | 本機狀態 | JSON 檔（`%USERPROFILE%\.channelcollab\state.json`） | 討論串 ↔ session 對應、轉手計數、排隊；資料量小，先用 JSON，不夠用再換 SQLite |
 | 設定 | `%USERPROFILE%\.channelcollab\config.json` | 只在本機，Discord 上不能改；Discord token 也存在其中（`discord.token`） |
 
@@ -523,17 +523,22 @@ channelcollab 會在每個 session 附上一份協作守則（`--append-system-p
 
 ## 12. 名冊
 
-- 記錄每個 Bot 的 Discord ID、主人、主人的 Discord ID、角色（工程師／企劃）、顯示名稱。
-- 每個人的名冊放在自己的 `<HOME>\roster.json`，Bot 只讀這一份；沒有就當作空名冊。**不放在 plugin 裡**（repo 是公開的，plugin 只附假資料的 `roster.example.json`）。
-- 發放方式：管理員的 `<HOME>\roster.json` 是正本，create-bot 建 Bot 時把整份名冊附進交付檔，成員 setup 匯入交付檔時一併寫入；名冊有異動時，管理員把 `roster.json` 傳給所有成員，各自 `/channelcollab:update-roster` 匯入。新名冊從下一個新對話開始生效，不用重啟 Bot。
-- Bot 啟動時在 log 印出 `[roster] N bots from <路徑>`，方便確認讀到哪一份。
-- 用途：提示詞中標示發話者；讓 Bot 知道怎麼找其他 Bot；判斷按鈕權限（誰是主人）。
+- 兩種條目：`bots`（Bot 的 Discord ID、顯示名稱；主人名稱、主人 Discord ID、角色可省略）與 `members`（人的 Discord ID、名字；角色可省略）。`members` 是 0.1.4 加的可選欄位，舊名冊沒有也照常運作。角色是 engineer（工程師）或 planner（企劃）。
+- **名冊是每個人自己的**：放在自己的 `<HOME>\roster.json`，Bot 只讀這一份；沒有就當作空名冊。沒有正本、不由管理員發放，每個人決定自己的 Bot 認得哪些 Bot、哪些人。**不放在 plugin 裡**（repo 是公開的，plugin 只附假資料的 `roster.example.json`）。
+- 管理：總控 `roster add <Discord ID>`／`roster remove <ID>`／`roster list`（都支援 `--home`），skill 是 `/channelcollab:roster`。
+  - `add` 只要 Discord ID：用自己 Bot 的 token 呼叫 `GET /users/{id}` 判斷是不是 Bot，名稱依序取伺服器暱稱（`GET /guilds/{guild_id}/members/{id}` 的 `nick`；`guild_id` 取 config，沒有就試 Bot 所在的伺服器）、`global_name`、`username`。查不到才要求 `--name`（Bot 加 `--bot`）。可選 `--role`、`--owner-id`（主人名稱自動查）、`--owner-name`。同一個 ID 再加是更新；換種類（成員 ↔ Bot）會搬過去。token 只在程式裡用，不輸出。
+  - `roster import <檔案>`（舊名稱 `import-roster`）：**合併**別人給的名冊。新的 ID 加入；同一個 ID 預設保留自己的，`--theirs` 才改用對方的；Bot／成員種類不同時一律保留自己的。
+  - create-bot 建好 Bot 後只寫進建立者自己的名冊；`--handoff` 時把主人 ID 與這個 Bot 自己那一筆附進交付檔，成員匯入時合併進他的名冊（讓他的 Bot 知道自己是誰）。其他人要讓自己的 Bot 認得新 Bot，用 `roster add` 自己加。
+- 改了名冊從下一個新對話開始生效，不用重啟 Bot。Bot 啟動時在 log 印出 `[roster] N bots, M members from <路徑>`，方便確認讀到哪一份；`status` 顯示「名冊：N 個 Bot，M 位成員」，空的時建議用 `/channelcollab:roster` 加入。
+- 用途：提示詞中標示發話者；讓 Bot 知道怎麼找其他 Bot 和人；判斷按鈕權限（誰是主人）。
 - **放進提示詞**（每次啟動 session 時讀一次，附在系統提示詞後面）：
-  - 自己是誰（名稱、ID）、主人是誰、角色。
+  - 自己是誰（名稱、ID）、主人是誰（名冊有名字就附上）、角色。
   - 名冊上其他 Bot 的名稱、主人、角色，以及「要找它就在 reply 文字裡寫 `<@BotID>`」。對話紀錄中顯示的「@名稱」只是文字，照抄不會通知對方。
+  - 【團隊成員】：`members` 加上其他 Bot 的主人（不在 `members` 裡的從 `ownerName`／`ownerDiscordId` 推出），同一個 Discord ID 只列一次，自己的主人不列（已在【你的主人】）。每人一行：名字、角色、擁有的 Bot、「要找他就在 reply 文字裡寫 `<@ID>`」；段落標題說明要 @ 某人就寫 `<@ID>`，和 Bot 一樣只在需要對方做事或回答時才 @。
   - 協作守則：需要對方做事或回答時才 @；其他 Bot 向你提問或交辦時，回答裡 @ 它；自己要的答案拿到後直接做，不再 @ 對方；不要禮貌性地互 @ 道謝或寒暄；一輪只在最後一則 reply 放 @；任務完成就停，完成報告不 @ 任何 Bot；被 @ 但沒事要做時不呼叫 reply。
-- 每則訊息的【發話者】／【最近訊息】若是名冊上的 Bot，會標上「主人 的 角色，ID」。
-- reply 送出時 `allowedMentions` 是 `{ parse: ['users'] }`：Bot 也是 user，所以文字裡的 `<@BotID>` 會真的通知到對方。
+- 每則訊息的【發話者】／【最近訊息】若是名冊上的 Bot，會標上「主人 的 角色，ID」；人類發言者一律標上 Discord ID（`ID <數字>`），在名冊上的再標「名冊：名字，角色」，所以 Bot 可以 @ 主人以外的人。
+- reply 送出時 `allowedMentions` 是 `{ parse: ['users'] }`：Bot 也是 user，所以文字裡的 `<@BotID>`、`<@人的 ID>` 都會真的通知到對方。
+- 測試：`src/roster.test.ts`（提示詞與發話者標籤），總控與 create-bot 的 `--self-test`（名冊增刪、合併、舊名冊相容、向 Discord 查名稱的模擬），都在 `npm run test:plugin` 裡。
 
 ---
 
@@ -556,9 +561,9 @@ channelcollab 會在每個 session 附上一份協作守則（`--append-system-p
 
 ### 管理員（每新增一人）
 
-1. `/channelcollab:create-bot`（幫成員建）：在 Team 底下建 Bot → token 經剪貼簿存成交付檔（`save-token --for member --owner-id <成員 Discord ID>`）→ 驗證、邀請進伺服器 → `roster --handoff <交付檔>` 更新管理員的 `<HOME>\roster.json`，並把整份名冊附進交付檔。
+1. `/channelcollab:create-bot`（幫成員建）：在 Team 底下建 Bot → token 經剪貼簿存成交付檔（`save-token --for member --owner-id <成員 Discord ID>`）→ 驗證、邀請進伺服器 → `roster --handoff <交付檔>` 把新 Bot 寫進管理員自己的 `<HOME>\roster.json`，主人 ID 與這個 Bot 自己那一筆附進交付檔。
 2. 交付檔裡是明文 token：用私下管道交給本人，對方匯入後雙方都刪除。
-3. 名冊有異動時，把 `<HOME>\roster.json` 傳給所有成員，請大家 `/channelcollab:update-roster`。
+3. 名冊不用發放：其他人要讓自己的 Bot 認得新 Bot，各自 `/channelcollab:roster` 用 Bot ID 加入。
 
 ### 成員
 
@@ -591,7 +596,7 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 ├─ src/                               Bot 本體（TypeScript）
 │   ├─ main.ts                        進入點（npm start）
 │   ├─ stop.ts                        npm run stop
-│   ├─ config.ts、log.ts、roster.ts
+│   ├─ config.ts、log.ts、roster.ts、roster.test.ts
 │   ├─ discord/                       收發、按鈕、選單、表情、詳細
 │   ├─ router/                        觸發判斷、轉手計數、排隊
 │   ├─ runner/                        Agent SDK 驅動、啟動器、session 池
@@ -601,12 +606,12 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 │   ├─ README.md
 │   ├─ roster.example.json            名冊格式範例（假資料）
 │   ├─ runtime/                       建置產物（進 repo）：bot.mjs、stop.mjs、package.json、package-lock.json、version.json
-│   ├─ scripts/channelcollab.mjs      總控：check、install-runtime、set-owner、bind、import-roster、start、stop、status、shortcut
+│   ├─ scripts/channelcollab.mjs      總控：check、install-runtime、set-owner、bind、roster、start、stop、status、shortcut
 │   └─ skills/
 │       ├─ setup/                     /channelcollab:setup
 │       ├─ bind/                      /channelcollab:bind
 │       ├─ start/、stop/、status/     /channelcollab:start、stop、status
-│       ├─ update-roster/             /channelcollab:update-roster
+│       ├─ roster/                    /channelcollab:roster（管理自己的名冊）
 │       ├─ guidelines/                協作守則（給人看；與 src 的提示詞一致）
 │       └─ create-bot/                管理員用：建 Bot、交付檔、名冊
 ├─ docs/
@@ -653,7 +658,7 @@ spike 程式與輸出在 `spike/`（`sdk-hello.ts`、`launcher-test.ts`、`outpu
 | 0 驗證假設 | 0-3、0-4、0-5、0-8 與串流／resume ✅；0-1、0-2（單一 exe）延後；0-6、0-7、0-9 未驗證 |
 | 1 單人跑通 | ✅ 已完成並在 Discord 實測；另外做了常駐 session（一個討論串一個持續運作的 `query()`，不必每輪重啟 CLI） |
 | 2 互動功能 | ✅ 權限按鈕、選擇題、🛑 停止、附檔、長輸出切段、排隊，都已在 Discord 實測 |
-| 3 多人化 | 大部分 ✅：多 Bot、名冊、觸發規則、轉手上限、多人權限、協作守則、setup／bind／start／stop／status／update-roster、create-bot、marketplace 打包。未做：`post`／`resume` 指令、`on.task_completed`。開機自動啟動改成桌面 `.bat` 與斜線指令 |
+| 3 多人化 | 大部分 ✅：多 Bot、名冊、觸發規則、轉手上限、多人權限、協作守則、setup／bind／start／stop／status／roster（0.1.4 前叫 update-roster）、create-bot、marketplace 打包。未做：`post`／`resume` 指令、`on.task_completed`。開機自動啟動改成桌面 `.bat` 與斜線指令 |
 | 4 進階體驗 | 未開始 |
 
 ### Phase 1：單人跑通 ✅
@@ -672,8 +677,8 @@ spike 程式與輸出在 `spike/`（`sdk-hello.ts`、`launcher-test.ts`、`outpu
 
 ### Phase 3：多人化（大部分完成）
 
-- ✅ 名冊、觸發規則、轉手上限、多人權限規則、協作守則。
-- ✅ `/channelcollab:setup`、`/channelcollab:bind`、`start`／`stop`／`status`、`update-roster`、`create-bot`、marketplace 打包（隔離環境安裝測試通過）。
+- ✅ 名冊（0.1.4 起每人自己維護，含團隊成員 members）、觸發規則、轉手上限、多人權限規則、協作守則。
+- ✅ `/channelcollab:setup`、`/channelcollab:bind`、`start`／`stop`／`status`、`roster`（0.1.4 前叫 `update-roster`）、`create-bot`、marketplace 打包（隔離環境安裝測試通過）。
 - ✅ 啟動方式：桌面 `.bat` 與斜線指令（取代原定的開機自動啟動，見第 13 節）。
 - 未做：`post`、`resume` 指令（含常駐程式的本機 IPC）；`on.task_completed`。
 - **驗收**：企劃照 `install.md` 在 5 分鐘內裝好；企劃 @ 你的 Bot → 你的 Bot 反問企劃 → 企劃在選單作答 → 完成並開 PR。

@@ -18,7 +18,7 @@ import { brief, log } from '../log.js';
 import { enqueue } from '../router/queue.js';
 import { countHops, decide } from '../router/trigger.js';
 import { acquire } from '../runner/pool.js';
-import { botOwner, loadRoster, ROSTER_PATH } from '../roster.js';
+import { botOwner, loadRosterFile, ROSTER_PATH } from '../roster.js';
 import { getThread, registerThread, saveState } from '../store/state.js';
 import { saveAttachments } from './attachments.js';
 import { attachDetails, handleDetailsClick, isDetailsButton, rememberTurn } from './details.js';
@@ -113,7 +113,8 @@ export function createBot(): Client {
     } catch {}
     const owner = botOwner(configured, c.user.id);
     log('owner', owner ? `${owner} (${configured ? 'discord.owner_id' : 'roster'})` : 'none: set discord.owner_id, or permission requests are denied');
-    log('roster', `${loadRoster().length} bots from ${ROSTER_PATH}`);
+    const roster = loadRosterFile();
+    log('roster', `${roster.bots.length} bots, ${roster.members.length} members from ${ROSTER_PATH}`);
   });
 
   client.on(Events.InteractionCreate, (i) => {

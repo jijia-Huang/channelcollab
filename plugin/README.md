@@ -9,9 +9,9 @@
 | `/channelcollab:setup` | 設定精靈：檢查 Node、安裝執行環境、匯入管理員給的交付檔、綁定頻道、啟動 Bot |
 | `/channelcollab:bind` | 新增、修改、移除頻道綁定 |
 | `/channelcollab:start`、`/channelcollab:stop`、`/channelcollab:status` | 啟動、停止、查看狀態（也可以雙擊 setup 在桌面建立的 .bat） |
-| `/channelcollab:update-roster` | 匯入管理員給的新名冊 |
+| `/channelcollab:roster` | 管理自己的名冊（Bot 認得哪些 Bot、哪些人）；加入只要 Discord ID |
 | `/channelcollab:guidelines` | 協作守則 |
-| `/channelcollab:create-bot` | 管理員用：建立 Discord Bot、產生交付檔、維護名冊 |
+| `/channelcollab:create-bot` | 管理員用：建立 Discord Bot、產生交付檔 |
 
 ## 需求
 

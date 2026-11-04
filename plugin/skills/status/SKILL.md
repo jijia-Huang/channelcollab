@@ -20,7 +20,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" status
 | token 未設定 | `/channelcollab:setup` 匯入交付檔 |
 | 主人 Discord ID 未設定 | `node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" set-owner <自己的 Discord 使用者 ID>`，否則沒人能按權限按鈕 |
 | 沒有綁定任何頻道 | `/channelcollab:bind` |
-| 名冊不存在 | 向管理員要 `roster.json`，用 `/channelcollab:update-roster` 匯入 |
+| 名冊是空的 | 可以用 `/channelcollab:roster` 把常合作的人和 Bot 加進來（只要 Discord ID） |
 | runtime 不是最新 | 下次 `/channelcollab:start` 會自動更新（要先 stop） |
 | 在跑，但在 Discord @ 它沒反應 | 確認是在綁定的頻道（或其底下的討論串）裡 @；檢查「最近的錯誤」；仍不行就 stop 再 start |
 
