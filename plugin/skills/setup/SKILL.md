@@ -1,6 +1,6 @@
 ---
 name: setup
-description: channelcollab 設定精靈。帶成員（多半是企劃）一步步完成：檢查 Node、安裝 Bot 執行環境、匯入管理員給的 Bot 交付檔、設定主人、綁定第一個頻道、啟動 Bot 並確認上線、在桌面建立啟動／停止捷徑。使用者說「設定 channelcollab」「安裝 Bot」「匯入交付檔」「setup」「第一次使用」時使用。
+description: channelcollab 設定精靈。帶成員（多半是企劃）一步步完成：檢查 Node、安裝 Bot 執行環境、匯入管理員給的 Bot 交付檔、設定主人、綁定第一個頻道、設定 PIN、要不要開私訊、啟動 Bot 並確認上線、在桌面建立啟動／停止／PIN 捷徑。使用者說「設定 channelcollab」「安裝 Bot」「匯入交付檔」「setup」「第一次使用」時使用。
 argument-hint: "[交付檔路徑]"
 allowed-tools: Bash(node:*), PowerShell(node:*)
 ---
@@ -30,12 +30,13 @@ node "${CLAUDE_PLUGIN_ROOT}/skills/create-bot/scripts/create-bot.mjs" import-han
 1. **交付檔和 `config.json` 裡有明文 Bot token。絕對不要用 Read、cat、type、Get-Content 或任何方式打開、讀取、顯示這兩個檔案**，只能把路徑交給腳本處理。腳本的輸出不含 token。
 2. 不要叫使用者貼 token。使用者不小心把 token 貼進對話時，不要複述，請他通知管理員重新產生（Reset Token）並重給交付檔。
 3. 不要用 `bypassPermissions`。
+4. **PIN 只能由使用者自己在跳出的主控台視窗輸入**：不要請使用者把 PIN 打在對話裡，也不要把 PIN 放進任何指令參數。
 
 ---
 
 ## 步驟 0：說明與現況
 
-先用兩三句話告訴使用者接下來會做什麼（裝執行環境 → 匯入交付檔 → 綁頻道 → 啟動 → 桌面捷徑），大約 5～10 分鐘。
+先用兩三句話告訴使用者接下來會做什麼（裝執行環境 → 匯入交付檔 → 綁頻道 → 設定 PIN、要不要開私訊 → 啟動 → 桌面捷徑），大約 5～10 分鐘。
 
 ## 步驟 1：檢查 Node
 
@@ -102,6 +103,25 @@ Bot 只在綁定的頻道回應。一次問清楚（自由輸入的項目直接�
 bind --channel <頻道ID> --cwd "<工作資料夾>" --model <模型> --permission-mode default
 ```
 
+## 步驟 5-1：設定 PIN（建議）
+
+PIN 是主人在 Discord 上按「允許」、以及用私訊時要輸入的密碼。說明後用 AskUserQuestion 問要不要現在設定（建議設定）。
+
+- 要設定：先告訴使用者「等一下會跳出一個黑色視窗，請在那個視窗輸入兩次 PIN（建議 6 位數字，畫面只會顯示 *），**不要把 PIN 打在這裡的對話**」，再執行總控 `set-pin`（**指令逾時設 10 分鐘**）。指令會等視窗關閉，結果顯示「✅ PIN 已設定」或「沒有變更」。
+- **絕對不要**請使用者把 PIN 告訴你，也不要把 PIN 放進任何指令參數。
+- 不設定：告訴使用者之後可以雙擊桌面的「設定 channelcollab PIN」再設定；沒有 PIN 時私訊不會開放。
+
+## 步驟 5-2：要不要開私訊
+
+私訊讓主人在手機上直接私訊自己的 Bot（不用 @、不用開討論串），像簡化版的 Claude Code。用 AskUserQuestion 問要不要開（說明：只有主人能用、要有 PIN、等於遠端操作自己的電腦，Discord 帳號要開兩步驟驗證）。
+
+- 要開：工作資料夾預設用**步驟 5 綁定頻道的資料夾**（使用者也可以指定別的）。執行總控：
+  ```
+  bind --dm --cwd "<工作資料夾>" --model <步驟 5 的模型> --permission-mode default
+  ```
+  還沒設 PIN 時提醒：私訊要等設了 PIN 才會開放。
+- 不開：之後可以用 `/channelcollab:bind` 開。
+
 ## 步驟 6：啟動 Bot
 
 執行總控 `start`（會等 Bot 上線，最多 90 秒；**指令逾時設 3 分鐘**；runtime 需要更新時會先自動安裝，那時要更久）。
@@ -111,7 +131,7 @@ bind --channel <頻道ID> --cwd "<工作資料夾>" --model <模型> --permissio
 
 ## 步驟 7：桌面捷徑
 
-執行總控 `shortcut`，在桌面建立兩個檔案：「啟動 channelcollab Bot.bat」和「停止 channelcollab Bot.bat」。告訴使用者之後有兩種方式啟動、停止 Bot，效果一樣：
+執行總控 `shortcut`，在桌面建立四個檔案：「啟動 channelcollab Bot.bat」「停止 channelcollab Bot.bat」「設定 channelcollab PIN.bat」「解除 channelcollab 鎖定.bat」（後兩個：設定或更換 PIN；PIN 輸錯 3 次被鎖定時解除）。告訴使用者之後有兩種方式啟動、停止 Bot，效果一樣：
 
 - 雙擊桌面的「啟動／停止 channelcollab Bot」，看到結果後按任意鍵關閉視窗；
 - 在 Claude Code 輸入 `/channelcollab:start`、`/channelcollab:stop`。
@@ -125,6 +145,8 @@ Bot 都是在背景獨立執行，關掉視窗或 Claude Code 都不會停。
 - Bot 名稱、主人、綁定的頻道與工作資料夾、桌面捷徑的位置。
 - 怎麼用：在綁定的頻道 **@Bot 名稱** 加上要交辦的事，Bot 會開一個討論串回覆；之後在討論串裡直接講話就好。
 - 訊息上的表情：👀 收到（排隊中）、⚙️ 處理中、⏳ 等待確認、✅ 完成、❌ 失敗。
-- Bot 要改檔或執行指令時會出現按鈕，只有主人能按。
+- Bot 要改檔或執行指令時會出現按鈕，只有主人能按（設了 PIN 時要輸入 PIN；2 分鐘沒按會改成私訊卡片，稍後核准）。
+- 開了私訊的話：在 Discord 點自己的 Bot →「傳送訊息」就能直接交辦；打 `!help` 看指令。
+- 只有自己和名冊上的人、Bot 能叫這個 Bot（白名單）；要讓別人也能叫，用 `/channelcollab:roster` 加進名冊。
 - 常用指令：`/channelcollab:status`（狀態）、`/channelcollab:stop`（停止）、`/channelcollab:start`（啟動）、`/channelcollab:bind`（綁更多頻道）。
 - 交付檔還沒刪的話，再提醒一次。

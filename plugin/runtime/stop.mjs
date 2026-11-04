@@ -12,6 +12,7 @@ var CONFIG_PATH = path.join(DATA_DIR, "config.json");
 var PID_PATH = path.join(DATA_DIR, "bot.pid");
 var INBOX_DIR = path.join(DATA_DIR, "inbox");
 var STOP_PIPE = `\\\\.\\pipe\\channelcollab-${createHash("sha1").update(DATA_DIR.toLowerCase()).digest("hex").slice(0, 12)}`;
+var PIN_PATH = path.join(DATA_DIR, "pin.json");
 
 // src/stop.ts
 var WAIT_MS = 60 * 1e3;

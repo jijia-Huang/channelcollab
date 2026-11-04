@@ -35,6 +35,8 @@ export type Defaults = {
   permission_mode: PermissionMode;
   /** How long a permission request or question waits for an answer before it is denied. */
   permission_timeout_minutes: number;
+  /** A permission request waits this long (or permission_timeout_minutes, if shorter); then it goes on the approve-later list. */
+  owner_wait_minutes: number;
 };
 
 export type Config = {
@@ -42,7 +44,16 @@ export type Config = {
   discord: { token: string; guild_id?: string; owner_id?: string };
   defaults: Defaults;
   channels: Record<string, ChannelConfig>;
+  /** Direct messages from the owner: off unless set (and a PIN is set). Same fields as a channel binding. */
+  dm?: ChannelConfig;
+  /** pin_unlock_minutes: after a correct PIN, approvals and direct messages need no PIN for this long. */
+  security: { pin_unlock_minutes: number };
+  /** roster_only: only the owner and people / bots in the roster can trigger the bot. */
+  access: { roster_only: boolean };
 };
+
+/** Files the bot keeps in HOME besides config.json. */
+export const PIN_PATH = path.join(DATA_DIR, 'pin.json');
 
 /** Settings for one bound channel, with defaults applied. */
 export type ResolvedChannel = {
@@ -51,10 +62,14 @@ export type ResolvedChannel = {
   launcher: string;
   model?: string;
   permissionMode: PermissionMode;
+  /** The binding's own mode when `permissionMode` is temporarily different (plan through !plan). */
+  basePermissionMode?: PermissionMode;
   tools?: string[];
   history: number;
   maxHops: number;
   permissionTimeoutMs: number;
+  /** How long a permission request waits for the owner before it is deferred (approve later). */
+  ownerWaitMs: number;
 };
 
 const BUILTIN_DEFAULTS: Defaults = {
@@ -65,6 +80,7 @@ const BUILTIN_DEFAULTS: Defaults = {
   max_live_sessions: 4,
   permission_mode: 'default',
   permission_timeout_minutes: 10,
+  owner_wait_minutes: 2,
 };
 
 // bypassPermissions would skip every check on the owner's machine; not allowed from Discord.
@@ -84,15 +100,30 @@ export function loadConfig(): Config {
     discord: { token: c.discord.token, guild_id: c.discord.guild_id, owner_id: c.discord.owner_id },
     defaults: { ...BUILTIN_DEFAULTS, ...c.defaults },
     channels: c.channels ?? {},
+    dm: c.dm && typeof c.dm === 'object' && typeof c.dm.cwd === 'string' && c.dm.cwd ? c.dm : undefined,
+    security: { pin_unlock_minutes: positive(c.security?.pin_unlock_minutes, 30) },
+    access: { roster_only: c.access?.roster_only !== false },
   };
+}
+
+function positive(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fallback;
 }
 
 export function resolveChannel(config: Config, channelId: string): ResolvedChannel | undefined {
   const ch = config.channels[channelId];
-  if (!ch) return undefined;
+  return ch ? resolve(config, channelId, ch, `channel ${channelId}`) : undefined;
+}
+
+/** The direct-message settings, or undefined when direct messages are off. */
+export function resolveDm(config: Config): ResolvedChannel | undefined {
+  return config.dm ? resolve(config, 'dm', config.dm, 'dm') : undefined;
+}
+
+function resolve(config: Config, channelId: string, ch: ChannelConfig, what: string): ResolvedChannel {
   const permissionMode = ch.permission_mode ?? config.defaults.permission_mode;
   if (!ALLOWED_MODES.includes(permissionMode)) {
-    throw new Error(`channel ${channelId}: permission_mode "${permissionMode}" is not allowed`);
+    throw new Error(`${what}: permission_mode "${permissionMode}" is not allowed`);
   }
   return {
     channelId,
@@ -104,5 +135,6 @@ export function resolveChannel(config: Config, channelId: string): ResolvedChann
     history: config.defaults.history,
     maxHops: config.defaults.max_hops,
     permissionTimeoutMs: config.defaults.permission_timeout_minutes * 60 * 1000,
+    ownerWaitMs: Math.min(config.defaults.owner_wait_minutes, config.defaults.permission_timeout_minutes) * 60 * 1000,
   };
 }

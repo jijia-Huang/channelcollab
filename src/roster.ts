@@ -90,7 +90,8 @@ export function rosterPeople(roster: Roster): RosterPerson[] {
 }
 
 /** Identity, the other bots, the people and the collaboration rules, appended to the system prompt. */
-export function rosterPrompt(selfId: string, ownerId?: string, roster: Roster = loadRosterFile()): string {
+export function rosterPrompt(selfId: string, ownerId?: string, roster: Roster = loadRosterFile(), opts: { dm?: boolean } = {}): string {
+  if (opts.dm) return dmRosterPrompt(selfId, ownerId, roster);
   const self = roster.bots.find((b) => b.botId === selfId);
   const others = roster.bots.filter((b) => b.botId !== selfId);
   const people = rosterPeople(roster);
@@ -127,6 +128,41 @@ export function rosterPrompt(selfId: string, ownerId?: string, roster: Roster = 
     '- 一輪裡只在最後一則 reply 放 @，不要每則都 @。',
     '- 任務完成就停：完成報告是寫給人看的，不要 @ 任何 Bot（包括提供答案給你的 Bot）。',
     '- 被其他 Bot @ 但沒有需要你做的事（例如對方只是通知完成）時，不要呼叫 reply，這一輪直接結束。',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Direct messages: the same identity and team list, so Claude knows who is
+ * who, but no hand-off rules and no <@ID> hints: nobody else is in a DM.
+ */
+function dmRosterPrompt(selfId: string, ownerId: string | undefined, roster: Roster): string {
+  const self = roster.bots.find((b) => b.botId === selfId);
+  const others = roster.bots.filter((b) => b.botId !== selfId);
+  const people = rosterPeople(roster);
+  const owner = ownerId ? people.find((p) => p.discordId === ownerId) : undefined;
+  const team = people.filter((p) => p.discordId !== ownerId);
+  const lines = [
+    self
+      ? `【你的身分】你是 ${self.botName}（Discord ID ${selfId}）${self.ownerName ? `，${self.ownerName} 的 Bot` : ''}${self.role ? `，角色：${roleName(self.role)}` : ''}。`
+      : `【你的身分】你是 Discord ID ${selfId} 的 Bot（不在名冊中）。`,
+  ];
+  if (ownerId) lines.push(`【你的主人】${owner ? `${owner.name}，` : ''}Discord ID ${ownerId}；你現在就是在和主人私訊。`);
+  if (others.length || team.length) {
+    lines.push('【團隊】（名冊，讓你知道團隊有誰）');
+    for (const b of others) {
+      const details = botDetails(b);
+      lines.push(`- Bot ${b.botName}${details ? `：${details}` : ''}`);
+    }
+    for (const p of team) {
+      const details = [p.role ? `角色 ${roleName(p.role)}` : '', p.bots.length ? `Bot：${p.bots.join('、')}` : ''].filter(Boolean).join('，');
+      lines.push(`- ${p.name}${details ? `：${details}` : ''}`);
+    }
+  }
+  lines.push(
+    '【私訊守則】',
+    '- 這是你和主人的一對一私訊，別人看不到，也收不到通知。',
+    '- 不要 @ 任何人或任何 Bot；需要別人協助時，告訴主人該找誰，由主人決定。',
   );
   return lines.join('\n');
 }

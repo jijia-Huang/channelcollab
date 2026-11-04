@@ -15,6 +15,7 @@ import {
   TextInputStyle,
   type AnyThreadChannel,
   type ButtonInteraction,
+  type DMChannel,
   type Interaction,
   type Message,
   type ModalSubmitInteraction,
@@ -23,12 +24,18 @@ import {
 import { brief, log } from '../log.js';
 import { canAct, type PromptKind } from '../runner/policy.js';
 import type { PermissionAnswer, PermissionRequest, Question } from '../runner/session.js';
+import { approvalStep, pinGate } from '../security/pin.js';
+import { DEFER_MESSAGE } from '../runner/approvals.js';
+import { checkPin, LOCKED_REPLY, pinModal, pinOkFollowUp } from './pin-ui.js';
 
 const OTHER = '__other';
 const OTHER_LABEL = '其他…（自行輸入）';
 const MAX_CONTENT = 1900;
 
 export type Who = { ownerId?: string; requesterId?: string };
+
+/** Where a conversation's messages go: a thread, or the direct message with the owner. */
+export type Room = AnyThreadChannel | DMChannel;
 
 type Pending = {
   kind: PromptKind;
@@ -122,7 +129,7 @@ function settleOnce<T>(id: string, entry: PermissionPending | QuestionPending, t
 const minutes = (ms: number) => (ms < 60000 ? `${Math.round(ms / 1000)} 秒` : `${Math.round(ms / 60000)} 分鐘`);
 
 /** Post a permission request with allow / always / deny buttons and wait for the owner. */
-export async function askPermission(thread: AnyThreadChannel, req: PermissionRequest, who: Who, timeoutMs: number): Promise<PermissionAnswer> {
+export async function askPermission(thread: Room, req: PermissionRequest, who: Who, timeoutMs: number): Promise<PermissionAnswer> {
   const id = newId();
   if (!who.ownerId) {
     await thread.send({ content: `🔐 Claude 想執行 \`${req.toolName}\`，但這個 Bot 沒有設定主人（config 的 \`discord.owner_id\`），無法核准，已拒絕。`, allowedMentions: { parse: [] } });
@@ -131,14 +138,14 @@ export async function askPermission(thread: AnyThreadChannel, req: PermissionReq
   // Claude Code's reason text may carry terminal colour codes.
   const blocked = req.blockedReason?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
   const why = req.blockedReason !== undefined ? `\n🤖 自動模式擋下了這個動作${blocked ? `，原因：${clip(blocked, 300)}` : ''}。按「允許」就會照原樣執行。` : '';
-  const base = `🔐 **權限請求** \`${req.toolName}\`　<@${who.ownerId}> 請確認（${minutes(timeoutMs)}內沒有回應會自動拒絕）${why}\n${summarizeTool(req.toolName, req.input)}`;
+  const base = `🔐 **權限請求** \`${req.toolName}\`　<@${who.ownerId}> 請確認（${minutes(timeoutMs)}內沒有回應會先跳過，排入待核准清單，之後還可以核准）${pinGate.required ? '　按「允許」要輸入 PIN' : ''}${why}\n${summarizeTool(req.toolName, req.input)}`;
   const p: PermissionPending = { kind: 'permission', who, base: clip(base, MAX_CONTENT - 200), toolName: req.toolName, done: () => {} };
   const s = settleOnce<{ a: PermissionAnswer; note: string }>(
     id,
     p,
     timeoutMs,
     req.signal,
-    () => ({ a: { behavior: 'deny', message: `等待主人核准逾時（${minutes(timeoutMs)}），已自動拒絕。` }, note: `⌛ 逾時（${minutes(timeoutMs)}），已自動拒絕` }),
+    () => ({ a: { behavior: 'deny', message: DEFER_MESSAGE, deferred: true }, note: `⌛ 主人 ${minutes(timeoutMs)}內沒有回應，已排入待核准清單` }),
     () => ({ a: { behavior: 'deny', message: '這一輪已停止，請求已取消。' }, note: '⏹️ 這一輪已停止，請求已取消' }),
   );
   p.done = (a, note) => s.settle({ a, note });
@@ -184,7 +191,7 @@ function questionMenus(id: string, q: QuestionPending) {
 }
 
 /** Post AskUserQuestion as select menus (multi-select where asked, plus "其他…") and wait for the requester or the owner. */
-export async function askQuestion(thread: AnyThreadChannel, questions: Question[], who: Who, timeoutMs: number, signal: AbortSignal): Promise<Record<string, string> | undefined> {
+export async function askQuestion(thread: Room, questions: Question[], who: Who, timeoutMs: number, signal: AbortSignal): Promise<Record<string, string> | undefined> {
   const id = newId();
   const q: QuestionPending = { kind: 'question', who, base: '', questions: questions.slice(0, 5), answers: [], done: () => {} };
   const header = () => `❓ **Claude 想問**（${[who.requesterId, who.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`).join(' 或 ')} 回答；${minutes(timeoutMs)}內沒有回應就略過）`;
@@ -228,7 +235,7 @@ async function answerQuestion(i: StringSelectMenuInteraction | ModalSubmitIntera
  * after `delayMs`, so quick turns add nothing to the thread. Returns the
  * handle the caller uses to take the message over when the turn ends.
  */
-export function stopControl(thread: AnyThreadChannel, who: Who, delayMs: number, stop: (by: string) => void) {
+export function stopControl(thread: Room, who: Who, delayMs: number, stop: (by: string) => void) {
   const id = newId();
   const p: StopPending = { kind: 'stop', who, base: '⚙️ 處理中…', stop };
   let posting: Promise<Message | undefined> | undefined;
@@ -256,6 +263,10 @@ export function stopControl(thread: AnyThreadChannel, who: Who, delayMs: number,
   };
 }
 
+function allowNote(userId: string, action: string, toolName: string): string {
+  return action === 'always' ? `✅ <@${userId}> 已允許，這個 session 之後的 \`${toolName}\` 不再詢問` : `✅ <@${userId}> 已允許`;
+}
+
 function denyText(kind: PromptKind, who: Who): string {
   if (kind === 'permission') return '只有 Bot 擁有者可以核准。';
   const names = [who.requesterId, who.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
@@ -279,7 +290,7 @@ async function lookup(i: ButtonInteraction | StringSelectMenuInteraction | Modal
 
 export function isPromptInteraction(i: Interaction): boolean {
   if (!i.isButton() && !i.isStringSelectMenu() && !i.isModalSubmit()) return false;
-  return /^(perm|permdeny|ask|askother|stop):/.test(i.customId);
+  return /^(perm|permdeny|permpin|ask|askother|stop):/.test(i.customId);
 }
 
 export async function handlePromptInteraction(i: Interaction): Promise<void> {
@@ -302,9 +313,35 @@ export async function handlePromptInteraction(i: Interaction): Promise<void> {
       );
       return;
     }
-    const note = action === 'always' ? `✅ <@${i.user.id}> 已允許，這個 session 之後的 \`${p.toolName}\` 不再詢問` : `✅ <@${i.user.id}> 已允許`;
+    // Owner check (lookup) first, then the PIN: others never see the PIN prompt.
+    const step = approvalStep(true, pinGate);
+    if (step === 'locked') {
+      await i.reply({ content: LOCKED_REPLY, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (step === 'pin') {
+      await i.showModal(pinModal(`permpin:${id}:${action}`, `核准 ${p.toolName}`));
+      return;
+    }
+    const note = allowNote(i.user.id, action, p.toolName);
     await i.update({ content: clip(`${p.base}\n${note}`, MAX_CONTENT), components: [], allowedMentions: { parse: [] } });
     p.message = undefined;
+    p.done({ behavior: action === 'always' ? 'always' : 'allow' }, note);
+    return;
+  }
+  if (i.isModalSubmit() && i.customId.startsWith('permpin:')) {
+    const [, id, action] = i.customId.split(':');
+    const p = await lookup(i, id);
+    if (!p || p.kind !== 'permission') return;
+    const announce = (text: string) => (i.channel?.isSendable() ? i.channel.send({ content: text, allowedMentions: { parse: [] } }) : Promise.resolve());
+    if (!(await checkPin(i, announce))) return;
+    const note = allowNote(i.user.id, action, p.toolName);
+    if (i.isFromMessage()) {
+      await i.update({ content: clip(`${p.base}\n${note}`, MAX_CONTENT), components: [], allowedMentions: { parse: [] } });
+      p.message = undefined;
+    } else await i.deferUpdate();
+    await pinOkFollowUp(i);
+    log('prompt', `permission ${id} ${action} by ${i.user.username} after PIN`);
     p.done({ behavior: action === 'always' ? 'always' : 'allow' }, note);
     return;
   }

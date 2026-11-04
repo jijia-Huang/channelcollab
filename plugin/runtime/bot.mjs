@@ -13,6 +13,7 @@ var CONFIG_PATH = path.join(DATA_DIR, "config.json");
 var PID_PATH = path.join(DATA_DIR, "bot.pid");
 var INBOX_DIR = path.join(DATA_DIR, "inbox");
 var STOP_PIPE = `\\\\.\\pipe\\channelcollab-${createHash("sha1").update(DATA_DIR.toLowerCase()).digest("hex").slice(0, 12)}`;
+var PIN_PATH = path.join(DATA_DIR, "pin.json");
 var BUILTIN_DEFAULTS = {
   history: 30,
   max_hops: 5,
@@ -20,7 +21,8 @@ var BUILTIN_DEFAULTS = {
   idle_close_minutes: 120,
   max_live_sessions: 4,
   permission_mode: "default",
-  permission_timeout_minutes: 10
+  permission_timeout_minutes: 10,
+  owner_wait_minutes: 2
 };
 var ALLOWED_MODES = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
 function loadConfig() {
@@ -35,15 +37,26 @@ function loadConfig() {
   return {
     discord: { token: c.discord.token, guild_id: c.discord.guild_id, owner_id: c.discord.owner_id },
     defaults: { ...BUILTIN_DEFAULTS, ...c.defaults },
-    channels: c.channels ?? {}
+    channels: c.channels ?? {},
+    dm: c.dm && typeof c.dm === "object" && typeof c.dm.cwd === "string" && c.dm.cwd ? c.dm : void 0,
+    security: { pin_unlock_minutes: positive(c.security?.pin_unlock_minutes, 30) },
+    access: { roster_only: c.access?.roster_only !== false }
   };
+}
+function positive(v, fallback) {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : fallback;
 }
 function resolveChannel(config2, channelId) {
   const ch = config2.channels[channelId];
-  if (!ch) return void 0;
+  return ch ? resolve(config2, channelId, ch, `channel ${channelId}`) : void 0;
+}
+function resolveDm(config2) {
+  return config2.dm ? resolve(config2, "dm", config2.dm, "dm") : void 0;
+}
+function resolve(config2, channelId, ch, what) {
   const permissionMode = ch.permission_mode ?? config2.defaults.permission_mode;
   if (!ALLOWED_MODES.includes(permissionMode)) {
-    throw new Error(`channel ${channelId}: permission_mode "${permissionMode}" is not allowed`);
+    throw new Error(`${what}: permission_mode "${permissionMode}" is not allowed`);
   }
   return {
     channelId,
@@ -54,17 +67,22 @@ function resolveChannel(config2, channelId) {
     tools: ch.tools,
     history: config2.defaults.history,
     maxHops: config2.defaults.max_hops,
-    permissionTimeoutMs: config2.defaults.permission_timeout_minutes * 60 * 1e3
+    permissionTimeoutMs: config2.defaults.permission_timeout_minutes * 60 * 1e3,
+    ownerWaitMs: Math.min(config2.defaults.owner_wait_minutes, config2.defaults.permission_timeout_minutes) * 60 * 1e3
   };
 }
 
 // src/discord/bot.ts
-import path7 from "node:path";
 import {
+  ActionRowBuilder as ActionRowBuilder6,
+  ButtonBuilder as ButtonBuilder5,
+  ButtonStyle as ButtonStyle5,
   ChannelType,
   Client,
   Events,
   GatewayIntentBits,
+  MessageFlags as MessageFlags6,
+  Partials,
   ThreadAutoArchiveDuration
 } from "discord.js";
 
@@ -127,51 +145,65 @@ function countHops(messages) {
   return { hops };
 }
 
-// src/store/state.ts
-import { existsSync, mkdirSync, readFileSync as readFileSync2, renameSync, writeFileSync } from "node:fs";
+// src/runner/policy.ts
 import path2 from "node:path";
-var STATE_PATH = path2.join(DATA_DIR, "state.json");
-var state = { threads: {} };
-function loadState() {
-  if (!existsSync(STATE_PATH)) return;
-  state = JSON.parse(readFileSync2(STATE_PATH, "utf8"));
-  state.threads ??= {};
+var READ_ONLY = /* @__PURE__ */ new Set(["Read", "Glob", "Grep", "LS", "LSP", "NotebookRead", "ToolSearch", "TodoWrite", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "Skill"]);
+var EDITS = /* @__PURE__ */ new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+var PATH_KEYS = ["file_path", "notebook_path", "path"];
+function inside(file, roots) {
+  const abs = path2.resolve(roots[0] ?? ".", file);
+  return roots.some((r) => {
+    const rel = path2.relative(path2.resolve(r), abs);
+    return rel === "" || !rel.startsWith("..") && !path2.isAbsolute(rel);
+  });
 }
-function saveState() {
-  mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${STATE_PATH}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
-  renameSync(tmp, STATE_PATH);
+function targetPath(input) {
+  for (const k2 of PATH_KEYS) if (typeof input[k2] === "string" && input[k2]) return input[k2];
+  return void 0;
 }
-function getThread(threadId) {
-  return state.threads[threadId];
+function decideTool(name, input, ctx) {
+  if (name === "AskUserQuestion") return { kind: "cli", why: "question" };
+  if (name.startsWith(ctx.ownPrefix)) return { kind: "allow", why: "own tool" };
+  if (ctx.mode === "auto") {
+    if (ctx.alwaysAllowed.has(name)) return { kind: "allow", why: "always allowed this session" };
+    return { kind: "cli", why: "auto mode" };
+  }
+  if (READ_ONLY.has(name)) {
+    const p = targetPath(input);
+    if (p && !inside(p, ctx.roots)) return { kind: "ask", why: "read outside cwd" };
+    return { kind: "allow", why: "read-only" };
+  }
+  if (ctx.mode === "plan") return { kind: "deny", why: "plan mode" };
+  if (ctx.alwaysAllowed.has(name)) return { kind: "allow", why: "always allowed this session" };
+  if (ctx.mode === "acceptEdits" && EDITS.has(name)) {
+    const p = targetPath(input);
+    if (p && inside(p, ctx.roots)) return { kind: "allow", why: "acceptEdits inside cwd" };
+  }
+  if (ctx.mode === "dontAsk") return { kind: "deny", why: "dontAsk mode" };
+  return { kind: "ask", why: "needs approval" };
 }
-function registerThread(threadId, channelId) {
-  const t = { channelId, lastCostTotal: 0, resumeCostBase: 0, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
-  state.threads[threadId] = t;
-  saveState();
-  return t;
+function blockedByClassifier(mode) {
+  return mode === "auto" ? "ask" : "keep";
 }
-
-// src/runner/session.ts
-import { existsSync as existsSync3, realpathSync, statSync } from "node:fs";
-import path5 from "node:path";
-import {
-  createSdkMcpServer,
-  query,
-  tool
-} from "@anthropic-ai/claude-agent-sdk";
-import { z } from "zod";
+function retryKey(name, input) {
+  const { description: _label, ...rest } = input;
+  return `${name} ${JSON.stringify(rest)}`;
+}
+function canAct(kind, clickerId, who) {
+  if (who.ownerId && clickerId === who.ownerId) return true;
+  if (kind === "permission") return false;
+  return !!who.requesterId && clickerId === who.requesterId;
+}
 
 // src/roster.ts
-import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:fs";
+import { existsSync, readFileSync as readFileSync2 } from "node:fs";
 import path3 from "node:path";
 var ROSTER_PATH = path3.join(DATA_DIR, "roster.json");
 var ROLE_NAMES = { engineer: "\u5DE5\u7A0B\u5E2B", planner: "\u4F01\u5283" };
 function loadRosterFile() {
-  if (!existsSync2(ROSTER_PATH)) return { bots: [], members: [] };
+  if (!existsSync(ROSTER_PATH)) return { bots: [], members: [] };
   try {
-    const raw = JSON.parse(readFileSync3(ROSTER_PATH, "utf8").replace(/^﻿/, ""));
+    const raw = JSON.parse(readFileSync2(ROSTER_PATH, "utf8").replace(/^﻿/, ""));
     return {
       bots: Array.isArray(raw.bots) ? raw.bots.filter((b) => b && b.botId && b.botName) : [],
       members: Array.isArray(raw.members) ? raw.members.filter((m) => m && m.discordId && m.name) : []
@@ -209,7 +241,8 @@ function rosterPeople(roster) {
   }
   return [...people.values()];
 }
-function rosterPrompt(selfId, ownerId, roster = loadRosterFile()) {
+function rosterPrompt(selfId, ownerId, roster = loadRosterFile(), opts = {}) {
+  if (opts.dm) return dmRosterPrompt(selfId, ownerId, roster);
   const self = roster.bots.find((b) => b.botId === selfId);
   const others = roster.bots.filter((b) => b.botId !== selfId);
   const people = rosterPeople(roster);
@@ -247,6 +280,525 @@ function rosterPrompt(selfId, ownerId, roster = loadRosterFile()) {
   );
   return lines.join("\n");
 }
+function dmRosterPrompt(selfId, ownerId, roster) {
+  const self = roster.bots.find((b) => b.botId === selfId);
+  const others = roster.bots.filter((b) => b.botId !== selfId);
+  const people = rosterPeople(roster);
+  const owner = ownerId ? people.find((p) => p.discordId === ownerId) : void 0;
+  const team = people.filter((p) => p.discordId !== ownerId);
+  const lines = [
+    self ? `\u3010\u4F60\u7684\u8EAB\u5206\u3011\u4F60\u662F ${self.botName}\uFF08Discord ID ${selfId}\uFF09${self.ownerName ? `\uFF0C${self.ownerName} \u7684 Bot` : ""}${self.role ? `\uFF0C\u89D2\u8272\uFF1A${roleName(self.role)}` : ""}\u3002` : `\u3010\u4F60\u7684\u8EAB\u5206\u3011\u4F60\u662F Discord ID ${selfId} \u7684 Bot\uFF08\u4E0D\u5728\u540D\u518A\u4E2D\uFF09\u3002`
+  ];
+  if (ownerId) lines.push(`\u3010\u4F60\u7684\u4E3B\u4EBA\u3011${owner ? `${owner.name}\uFF0C` : ""}Discord ID ${ownerId}\uFF1B\u4F60\u73FE\u5728\u5C31\u662F\u5728\u548C\u4E3B\u4EBA\u79C1\u8A0A\u3002`);
+  if (others.length || team.length) {
+    lines.push("\u3010\u5718\u968A\u3011\uFF08\u540D\u518A\uFF0C\u8B93\u4F60\u77E5\u9053\u5718\u968A\u6709\u8AB0\uFF09");
+    for (const b of others) {
+      const details2 = botDetails(b);
+      lines.push(`- Bot ${b.botName}${details2 ? `\uFF1A${details2}` : ""}`);
+    }
+    for (const p of team) {
+      const details2 = [p.role ? `\u89D2\u8272 ${roleName(p.role)}` : "", p.bots.length ? `Bot\uFF1A${p.bots.join("\u3001")}` : ""].filter(Boolean).join("\uFF0C");
+      lines.push(`- ${p.name}${details2 ? `\uFF1A${details2}` : ""}`);
+    }
+  }
+  lines.push(
+    "\u3010\u79C1\u8A0A\u5B88\u5247\u3011",
+    "- \u9019\u662F\u4F60\u548C\u4E3B\u4EBA\u7684\u4E00\u5C0D\u4E00\u79C1\u8A0A\uFF0C\u5225\u4EBA\u770B\u4E0D\u5230\uFF0C\u4E5F\u6536\u4E0D\u5230\u901A\u77E5\u3002",
+    "- \u4E0D\u8981 @ \u4EFB\u4F55\u4EBA\u6216\u4EFB\u4F55 Bot\uFF1B\u9700\u8981\u5225\u4EBA\u5354\u52A9\u6642\uFF0C\u544A\u8A34\u4E3B\u4EBA\u8A72\u627E\u8AB0\uFF0C\u7531\u4E3B\u4EBA\u6C7A\u5B9A\u3002"
+  );
+  return lines.join("\n");
+}
+
+// src/security/access.ts
+function allowedTrigger(authorId, ownerId, roster) {
+  if (ownerId && authorId === ownerId) return true;
+  if (roster.members.some((m) => m.discordId === authorId)) return true;
+  return roster.bots.some((b) => b.botId === authorId || b.ownerDiscordId === authorId);
+}
+
+// src/security/pin.ts
+import { scryptSync, timingSafeEqual } from "node:crypto";
+import { existsSync as existsSync2, readFileSync as readFileSync3 } from "node:fs";
+var MAX_FAILURES = 3;
+function readPinFile(file = PIN_PATH) {
+  if (!existsSync2(file)) return void 0;
+  try {
+    const f = JSON.parse(readFileSync3(file, "utf8").replace(/^﻿/, ""));
+    if (f.algo !== "scrypt" || !f.salt || !f.hash || !(f.N > 1) || !(f.r > 0) || !(f.p > 0) || !(f.keylen >= 16)) return void 0;
+    return f;
+  } catch {
+    return void 0;
+  }
+}
+var normalizePin = (pin) => pin.normalize("NFKC").trim();
+function verifyPin(pin, f) {
+  const want = Buffer.from(f.hash, "base64");
+  let got;
+  try {
+    got = scryptSync(normalizePin(pin), Buffer.from(f.salt, "base64"), f.keylen, { N: f.N, r: f.r, p: f.p, maxmem: 256 * 1024 * 1024 });
+  } catch {
+    return false;
+  }
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+function approvalStep(isOwner, gate) {
+  if (!isOwner) return "refuse";
+  if (gate.locked) return "locked";
+  return gate.required ? "pin" : "approve";
+}
+var PinGate = class {
+  constructor(read, unlockMs, now = Date.now) {
+    this.read = read;
+    this.unlockMs = unlockMs;
+    this.now = now;
+  }
+  read;
+  unlockMs;
+  now;
+  unlockedUntil = 0;
+  failures = 0;
+  lockedAt;
+  /** A PIN has been set on this computer. */
+  get configured() {
+    return !!this.read();
+  }
+  get locked() {
+    return this.lockedAt !== void 0;
+  }
+  /** A correct PIN was entered recently and nothing is locked. */
+  get unlocked() {
+    return !this.locked && this.now() < this.unlockedUntil;
+  }
+  /** Approving needs the PIN now: one is set and the unlock window has passed. Locked counts as needing it. */
+  get required() {
+    return this.configured && !this.unlocked;
+  }
+  attempt(pin) {
+    if (this.locked) return { result: "locked", justLocked: false };
+    const f = this.read();
+    if (!f) return { result: "not-set" };
+    if (verifyPin(pin, f)) {
+      this.failures = 0;
+      this.unlockedUntil = this.now() + this.unlockMs();
+      return { result: "ok" };
+    }
+    this.failures++;
+    if (this.failures >= MAX_FAILURES) {
+      this.lockedAt = this.now();
+      this.unlockedUntil = 0;
+      return { result: "locked", justLocked: true };
+    }
+    return { result: "wrong", left: MAX_FAILURES - this.failures };
+  }
+  /** `unlock` from the computer: clear the lock and the failure count (the PIN is still needed). */
+  reset() {
+    this.lockedAt = void 0;
+    this.failures = 0;
+  }
+  state() {
+    return { configured: this.configured, locked: this.locked, unlockedUntil: this.unlocked ? this.unlockedUntil : 0, failures: this.failures };
+  }
+};
+var pinGate = new PinGate(
+  () => readPinFile(),
+  () => {
+    try {
+      return loadConfig().security.pin_unlock_minutes * 60 * 1e3;
+    } catch {
+      return 30 * 60 * 1e3;
+    }
+  }
+);
+
+// src/store/state.ts
+import { existsSync as existsSync3, mkdirSync, readFileSync as readFileSync4, renameSync, writeFileSync } from "node:fs";
+import path4 from "node:path";
+var STATE_PATH = path4.join(DATA_DIR, "state.json");
+var DM_KEY = "dm";
+var DM_HISTORY_MAX = 30;
+var state = { threads: {} };
+function loadState() {
+  if (!existsSync3(STATE_PATH)) return;
+  state = JSON.parse(readFileSync4(STATE_PATH, "utf8"));
+  state.threads ??= {};
+}
+function saveState() {
+  mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = `${STATE_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+  renameSync(tmp, STATE_PATH);
+}
+function getThread(threadId) {
+  return state.threads[threadId];
+}
+function registerThread(threadId, channelId, name) {
+  const t = { channelId, lastCostTotal: 0, resumeCostBase: 0, createdAt: (/* @__PURE__ */ new Date()).toISOString(), ...name ? { name } : {} };
+  state.threads[threadId] = t;
+  saveState();
+  return t;
+}
+function getBatch(id) {
+  return state.approvals?.[id];
+}
+function putBatch(b) {
+  const keep = Date.now() - 7 * 24 * 60 * 60 * 1e3;
+  state.approvals = Object.fromEntries(Object.entries(state.approvals ?? {}).filter(([, x]) => x.expiresAt > keep));
+  state.approvals[b.id] = b;
+  saveState();
+}
+function allThreads() {
+  return Object.entries(state.threads);
+}
+function freshDm() {
+  return { channelId: DM_KEY, lastCostTotal: 0, resumeCostBase: 0, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+}
+function getDm() {
+  state.dm ??= freshDm();
+  return state.dm;
+}
+function dmHistory() {
+  return state.dmHistory ?? [];
+}
+function switchDm(next) {
+  const cur = state.dm;
+  const rest = (state.dmHistory ?? []).filter((h) => h.sessionId && h.sessionId !== cur?.sessionId && h.sessionId !== next?.sessionId);
+  state.dmHistory = [...cur?.sessionId ? [cur] : [], ...rest].slice(0, DM_HISTORY_MAX);
+  state.dm = next ?? freshDm();
+  saveState();
+  return state.dm;
+}
+function getConversation(key) {
+  return key === DM_KEY ? state.dm : state.threads[key];
+}
+function findSession(key, sessionId) {
+  if (!sessionId) return void 0;
+  if (key !== DM_KEY) return state.threads[key]?.sessionId === sessionId ? state.threads[key] : void 0;
+  return [state.dm, ...state.dmHistory ?? []].find((d) => d?.sessionId === sessionId);
+}
+
+// src/discord/approvals-ui.ts
+import {
+  ActionRowBuilder as ActionRowBuilder4,
+  ButtonBuilder as ButtonBuilder3,
+  ButtonStyle as ButtonStyle3,
+  MessageFlags as MessageFlags4,
+  StringSelectMenuBuilder as StringSelectMenuBuilder2
+} from "discord.js";
+
+// src/runner/approvals.ts
+var APPROVAL_TTL_MS = 24 * 60 * 60 * 1e3;
+var DEFER_MESSAGE = "\u4E3B\u4EBA\u66AB\u6642\u4E0D\u5728\u3002\u9019\u500B\u52D5\u4F5C\u5DF2\u6392\u5165\u5F85\u6838\u51C6\u6E05\u55AE\u3002\u8ACB\u6539\u7528\u4E0D\u9700\u8981\u6B0A\u9650\u7684\u65B9\u5F0F\u628A\u80FD\u505A\u7684\u505A\u5B8C\uFF1B\u505A\u4E0D\u5230\u7684\u90E8\u5206\uFF0C\u5728 reply \u88E1\u6574\u7406\u6210\u300C\u5F85\u4E3B\u4EBA\u6838\u51C6\u300D\uFF0C\u8AAA\u660E\u8981\u505A\u4EC0\u9EBC\u3001\u70BA\u4EC0\u9EBC\uFF0C\u7136\u5F8C\u7D50\u675F\u9019\u4E00\u8F2A\u3002\u4E0D\u8981\u91CD\u8A66\u540C\u4E00\u500B\u52D5\u4F5C\u3002";
+function deferItem(toolName, input) {
+  return { toolName, input, key: retryKey(toolName, input) };
+}
+function deferredKeys(items) {
+  return items.map((x) => x.key);
+}
+function newBatch(f) {
+  const now = f.now ?? Date.now();
+  const seen = /* @__PURE__ */ new Set();
+  const items = f.items.filter((x) => seen.has(x.key) ? false : (seen.add(x.key), true));
+  return { id: f.id, convKey: f.convKey, kind: f.kind, ...f.requesterId ? { requesterId: f.requesterId } : {}, items, createdAt: now, expiresAt: now + APPROVAL_TTL_MS, status: "pending" };
+}
+function decide2(b, choice, now = Date.now()) {
+  if (b.status !== "pending") return { result: "already", status: b.status };
+  if (now >= b.expiresAt) {
+    b.status = "expired";
+    return { result: "expired" };
+  }
+  const picked = choice === "all" ? b.items.map((_, i) => i) : choice === "none" ? [] : choice.filter((i) => i >= 0 && i < b.items.length);
+  const allow = b.items.filter((_, i) => picked.includes(i));
+  const deny = b.items.filter((_, i) => !picked.includes(i));
+  b.status = !allow.length ? "denied" : deny.length ? "partial" : "approved";
+  return { result: "decided", status: b.status, allow, deny };
+}
+var line = (x, i) => `${i + 1}. ${x.toolName} ${JSON.stringify(x.input).slice(0, 400)}`;
+function approvedPrompt(allow, deny) {
+  const parts = [`\u4E3B\u4EBA\u5DF2\u6838\u51C6\uFF1A
+${allow.map(line).join("\n")}
+\u8ACB\u7528\u76F8\u540C\u53C3\u6578\u57F7\u884C\u9019\u4E9B\u52D5\u4F5C\uFF0C\u5B8C\u6210\u5269\u4E0B\u7684\u5DE5\u4F5C\uFF0C\u4E26\u7528 reply \u56DE\u5831\u3002`];
+  if (deny.length) parts.push(`\u4E3B\u4EBA\u62D2\u7D55\u4E86\u9019\u4E9B\u52D5\u4F5C\uFF0C\u4E0D\u8981\u505A\uFF1A
+${deny.map(line).join("\n")}`);
+  return parts.join("\n\n");
+}
+function deniedNote(deny) {
+  return `\u3010\u4E3B\u4EBA\u7684\u6C7A\u5B9A\u3011\u5148\u524D\u6392\u5165\u5F85\u6838\u51C6\u6E05\u55AE\u7684\u52D5\u4F5C\uFF0C\u4E3B\u4EBA\u62D2\u7D55\u4E86\uFF0C\u4E0D\u8981\u505A\u9019\u4E9B\u52D5\u4F5C\uFF1A
+${deny.map(line).join("\n")}`;
+}
+function noticeText(b, ownerId, where) {
+  const n = b.items.length;
+  if (b.status === "approved") return `\u2705 \u4E3B\u4EBA\u5DF2\u6838\u51C6\u5F85\u6838\u51C6\u7684 ${n} \u500B\u52D5\u4F5C\uFF0CBot \u63A5\u8457\u505A\u3002`;
+  if (b.status === "partial") return `\u2705 \u4E3B\u4EBA\u5DF2\u6838\u51C6\u90E8\u5206\u5F85\u6838\u51C6\u7684\u52D5\u4F5C\uFF0CBot \u63A5\u8457\u505A\uFF08\u5176\u9918\u5DF2\u62D2\u7D55\uFF09\u3002`;
+  if (b.status === "denied") return `\u{1F6AB} \u4E3B\u4EBA\u62D2\u7D55\u4E86\u5F85\u6838\u51C6\u7684 ${n} \u500B\u52D5\u4F5C\u3002`;
+  if (b.status === "expired") return `\u231B \u5F85\u6838\u51C6\u7684 ${n} \u500B\u52D5\u4F5C\u5DF2\u904E\u671F\uFF0824 \u5C0F\u6642\uFF09\uFF0C\u6C92\u6709\u57F7\u884C\u3002`;
+  return `\u23F3 \u6709 ${n} \u500B\u52D5\u4F5C\u7B49 <@${ownerId}> \u6838\u51C6\uFF08${where === "dm" ? "\u5DF2\u79C1\u8A0A\u4E3B\u4EBA" : "\u8ACB\u4E3B\u4EBA\u6309\u4E0B\u65B9\u7684\u5361\u7247"}\uFF09\u3002`;
+}
+function outcomeText(d, by) {
+  if (d.result === "expired") return "\u231B \u5DF2\u904E\u671F\uFF0824 \u5C0F\u6642\uFF09\uFF0C\u6309\u9215\u5931\u6548\u3002";
+  if (d.result === "already") return `\u5DF2\u8655\u7406\u904E\uFF08${d.status}\uFF09\u3002`;
+  if (d.status === "approved") return `\u2705 ${by} \u5DF2\u5168\u90E8\u6838\u51C6\uFF0CBot \u63A5\u8457\u505A\u3002`;
+  if (d.status === "denied") return `\u{1F6AB} ${by} \u5DF2\u5168\u90E8\u62D2\u7D55\u3002`;
+  return `\u2705 ${by} \u6838\u51C6\u4E86 ${d.allow.length} \u500B\uFF0C\u62D2\u7D55\u4E86 ${d.deny.length} \u500B\uFF0CBot \u63A5\u8457\u505A\u6838\u51C6\u7684\u90E8\u5206\u3002`;
+}
+async function deliverCard(send, onDmError) {
+  if (send.dm) {
+    try {
+      return { where: "dm", sent: await send.dm() };
+    } catch (e) {
+      onDmError?.(e);
+    }
+  }
+  return { where: "thread", sent: await send.thread() };
+}
+
+// src/discord/commands.ts
+var COMMANDS = {
+  help: { dmOnly: false, takesArg: false, desc: "\u5217\u51FA\u6307\u4EE4" },
+  clear: { dmOnly: true, takesArg: false, desc: "\u7D50\u675F\u76EE\u524D\u7684\u5C0D\u8A71\uFF0C\u4E0B\u4E00\u5247\u8A0A\u606F\u958B\u65B0\u7684" },
+  resume: { dmOnly: true, takesArg: false, desc: "\u5F9E\u6E05\u55AE\u9078\u4E00\u6BB5\u4EE5\u524D\u7684\u5C0D\u8A71\u63A5\u56DE\u4F86" },
+  stop: { dmOnly: false, takesArg: false, desc: "\u4E2D\u65B7 Claude \u6B63\u5728\u505A\u7684\u9019\u4E00\u8F2A\uFF08\u540C \u{1F6D1}\uFF09" },
+  status: { dmOnly: false, takesArg: false, desc: "\u5DE5\u4F5C\u76EE\u9304\u3001\u6A21\u578B\u3001\u6A21\u5F0F\u3001\u82B1\u8CBB\u3001\u4E0A\u4E0B\u6587\u548C\u984D\u5EA6" },
+  model: { dmOnly: false, takesArg: true, desc: "\u63DB\u6A21\u578B\uFF08haiku\uFF0Fsonnet\uFF0Fopus\uFF09\uFF0C\u4F8B\u5982 !model sonnet" },
+  plan: { dmOnly: false, takesArg: false, desc: "\u5207\u5230\u8A08\u756B\u6A21\u5F0F\uFF08\u53EA\u8A0E\u8AD6\u4E0D\u52D5\u624B\uFF09\uFF0C\u518D\u6253\u4E00\u6B21\u5207\u56DE" },
+  compact: { dmOnly: false, takesArg: false, desc: "\u58D3\u7E2E\u4E0A\u4E0B\u6587\uFF0C\u8B93\u5C0D\u8A71\u53EF\u4EE5\u7E7C\u7E8C" },
+  retry: { dmOnly: false, takesArg: false, desc: "\u628A\u4E0A\u4E00\u5247\u8A0A\u606F\u539F\u6A23\u91CD\u9001\u4E00\u6B21" }
+};
+var MODEL_CHOICES = [
+  { alias: "haiku", label: "Haiku", note: "\u6700\u5FEB\u3001\u6700\u4FBF\u5B9C" },
+  { alias: "sonnet", label: "Sonnet", note: "\u5747\u8861\uFF08\u5EFA\u8B70\uFF09" },
+  { alias: "opus", label: "Opus", note: "\u6700\u5F37\u3001\u6700\u8CB4" }
+];
+function stripMentions(text) {
+  return text.replace(/<@[!&]?\d+>/g, " ").replace(/\s+/g, " ").trim();
+}
+function parseCommand(text) {
+  const m = /^!([a-z]+)(?:\s+(\S+))?$/i.exec(stripMentions(text));
+  if (!m) return void 0;
+  const name = m[1].toLowerCase();
+  const spec = COMMANDS[name];
+  if (!spec) return void 0;
+  if (m[2] !== void 0 && !spec.takesArg) return void 0;
+  return m[2] !== void 0 ? { name, arg: m[2] } : { name };
+}
+function normalizeModel(arg) {
+  const a = arg.trim().toLowerCase();
+  if (MODEL_CHOICES.some((c) => c.alias === a)) return a;
+  return /^claude-[a-z0-9.[\]-]+$/.test(a) ? a : void 0;
+}
+function helpText(kind) {
+  const lines = Object.entries(COMMANDS).filter(([, s]) => kind === "dm" || !s.dmOnly).map(([n, s]) => `\`!${n}\`\u3000${s.desc}`);
+  const who = kind === "dm" ? "" : "\n\u8A0E\u8AD6\u4E32\u88E1\u53EA\u6709 Bot \u7684\u4E3B\u4EBA\u6216\u63D0\u51FA\u9700\u6C42\u7684\u4EBA\u80FD\u7528\uFF1B`!clear`\u3001`!resume` \u53EA\u80FD\u5728\u79C1\u8A0A\u7528\u3002";
+  return `**\u6307\u4EE4**\uFF08\u8A0A\u606F\u53EA\u6253\u6307\u4EE4\u624D\u7B97\uFF0C\u5927\u5C0F\u5BEB\u90FD\u53EF\u4EE5\uFF09
+${lines.join("\n")}${who}`;
+}
+function dmAccess(f) {
+  if (!f.ownerId || f.authorId !== f.ownerId) return "not-owner";
+  return f.dmEnabled ? "run" : "disabled";
+}
+function throttle(seen, key, now = Date.now(), windowMs = 10 * 60 * 1e3) {
+  const last = seen.get(key);
+  if (last !== void 0 && now - last < windowMs) return false;
+  seen.set(key, now);
+  return true;
+}
+function mentionsSelf(f, selfId, ownRoleId) {
+  if ([...f.userIds].includes(selfId)) return true;
+  return [...f.roles].some((r) => r.botId === selfId || !!ownRoleId && r.id === ownRoleId);
+}
+function mentionsOtherBotRole(roles, selfId) {
+  return [...roles].some((r) => !!r.botId && r.botId !== selfId);
+}
+var DISCORD_LIMIT = 2e3;
+function splitMessage(text, limit = DISCORD_LIMIT) {
+  const out = [];
+  let rest = text;
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf("\n", limit);
+    if (cut < limit / 2) cut = limit;
+    out.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^\n/, "");
+  }
+  if (rest.trim()) out.push(rest);
+  return out;
+}
+function splitReply(text, footer = "") {
+  const chunks = splitMessage(text);
+  if (!footer) return chunks;
+  const tail = `
+${footer}`;
+  const last = chunks.pop();
+  if (last === void 0) return [footer];
+  if (last.length + tail.length <= DISCORD_LIMIT) return [...chunks, last + tail];
+  const again = splitMessage(last, DISCORD_LIMIT - tail.length);
+  again[again.length - 1] += tail;
+  return [...chunks, ...again];
+}
+function duration(ms) {
+  const min = Math.max(0, Math.round(ms / 6e4));
+  if (min < 1) return "\u4E0D\u5230 1 \u5206\u9418";
+  const h = Math.floor(min / 60);
+  return h ? `${h} \u5C0F\u6642${min % 60 ? ` ${min % 60} \u5206` : ""}` : `${min} \u5206\u9418`;
+}
+function shortTime(iso) {
+  if (iso === void 0) return "\u6642\u9593\u4E0D\u660E";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "\u6642\u9593\u4E0D\u660E";
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+function resumeList(candidates, max = 10) {
+  const seen = /* @__PURE__ */ new Set();
+  return [...candidates].sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0)).filter((c) => seen.has(c.sessionId) ? false : (seen.add(c.sessionId), true)).slice(0, max);
+}
+function resumeOption(c) {
+  const src = c.kind === "dm" ? "\u79C1\u8A0A" : `\u8A0E\u8AD6\u4E32\u300C${c.source}\u300D`;
+  const clip3 = (s, n) => s.length > n ? `${s.slice(0, n - 1)}\u2026` : s;
+  return { label: clip3(`${shortTime(c.at)}\u3000${src}`, 100), description: clip3(c.summary.replace(/\s+/g, " ").trim() || "\uFF08\u6C92\u6709\u6458\u8981\uFF09", 100) };
+}
+
+// src/discord/conversation.ts
+import path8 from "node:path";
+
+// src/runner/failure.ts
+var SECRET_PATTERNS = [
+  /[MN][A-Za-z\d_-]{23,}\.[\w-]{6}\.[\w-]{27,}/g,
+  /sk-ant-[A-Za-z0-9_-]{8,}/g,
+  /\b(Bearer|Bot)\s+[A-Za-z0-9._~+/-]{16,}=*/gi,
+  /[A-Za-z0-9_-]{18,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}/g,
+  /(?<![\\/:.\w-])[A-Za-z0-9+/_-]{40,}={0,2}(?![\w-])/g
+];
+function maskSecrets(text) {
+  let out = text;
+  for (const re of SECRET_PATTERNS) out = out.replace(re, (m) => /^(Bearer|Bot)\s/i.test(m) ? `${m.split(/\s+/)[0]} ***` : "***");
+  return out;
+}
+var HINTS = [
+  {
+    test: (f, t) => f.apiError === "authentication_failed" || f.apiError === "oauth_org_not_allowed" || /not logged in|please run \/login|\/login|invalid api key|authentication|unauthori[sz]ed|\b401\b|oauth token|credentials/i.test(t),
+    hint: "Claude \u6C92\u767B\u5165\uFF08\u6216\u767B\u5165\u904E\u671F\uFF09\uFF1A\u8ACB\u5728\u9019\u53F0\u96FB\u8166\u958B\u7D42\u7AEF\u6A5F\u57F7\u884C claude\uFF0C\u7167\u756B\u9762\u767B\u5165\u5F8C\u518D\u8A66\u3002"
+  },
+  { test: (f, t) => f.apiError === "billing_error" || /credit balance|billing|payment/i.test(t), hint: "\u5E33\u865F\u7684\u4ED8\u8CBB\u6216\u984D\u5EA6\u8A2D\u5B9A\u6709\u554F\u984C\uFF0C\u8ACB\u627E\u7BA1\u7406\u54E1\u78BA\u8A8D\u3002" },
+  { test: (f, t) => f.apiError === "rate_limit" || /rate.?limit|usage limit|limit reached|\b429\b|hit your limit/i.test(t), hint: "\u984D\u5EA6\u66AB\u6642\u7528\u5B8C\u4E86\uFF0C\u7B49\u91CD\u7F6E\u5F8C\u518D\u8A66\uFF08\u6253 !status \u53EF\u4EE5\u770B\u984D\u5EA6\uFF09\u3002" },
+  { test: (f, t) => f.apiError === "model_not_found" || /model\b.*\b(not found|does not exist|not available|invalid)|invalid model/i.test(t), hint: "\u6A21\u578B\u540D\u7A31\u4E0D\u5C0D\u6216\u6C92\u6709\u4F7F\u7528\u6B0A\u9650\uFF0C\u6253 !model \u63DB\u4E00\u500B\u3002" },
+  { test: (_f, t) => /prompt is too long|context (length|window)|too many tokens|exceeds? the (maximum|context)/i.test(t), hint: "\u4E0A\u4E0B\u6587\u592A\u9577\u4E86\uFF1A\u6253 !compact \u58D3\u7E2E\uFF0C\u6216\u5728\u79C1\u8A0A\u6253 !clear \u958B\u65B0\u5C0D\u8A71\u3002" },
+  {
+    test: (f, t) => f.apiError === "overloaded" || f.apiError === "server_error" || /overloaded|\b5\d\d\b|ECONNRESET|ETIMEDOUT|ENOTFOUND|network|fetch failed|socket hang up/i.test(t),
+    hint: "Anthropic \u670D\u52D9\u66AB\u6642\u5FD9\u788C\u6216\u7DB2\u8DEF\u4E0D\u7A69\uFF0C\u7A0D\u5F8C\u518D\u8A66\u4E00\u6B21\uFF08\u53EF\u4EE5\u6253 !retry\uFF09\u3002"
+  },
+  { test: (f) => f.subtype === "error_max_turns", hint: "\u9019\u4E00\u8F2A\u7684\u6B65\u9A5F\u592A\u591A\u88AB\u4E2D\u6B62\u4E86\uFF0C\u53EF\u4EE5\u62C6\u6210\u5C0F\u4E00\u9EDE\u7684\u8ACB\u6C42\u518D\u8A66\u3002" },
+  { test: (f) => f.subtype === "timeout", hint: "\u9019\u4E00\u8F2A\u505A\u592A\u4E45\uFF08\u8D85\u904E 10 \u5206\u9418\u7684\u5DE5\u4F5C\u6642\u9593\uFF09\u88AB\u4E2D\u6B62\u4E86\uFF0C\u53EF\u4EE5\u62C6\u6210\u5C0F\u4E00\u9EDE\u7684\u8ACB\u6C42\u518D\u8A66\u3002" }
+];
+function failureHint(f) {
+  const text = `${f.error ?? ""}`;
+  return HINTS.find((h) => h.test(f, text))?.hint ?? "\u53EF\u4EE5\u518D\u8A66\u4E00\u6B21\uFF08\u6253 !retry\uFF09\uFF1B\u4E00\u76F4\u5931\u6557\u7684\u8A71\uFF0C\u8ACB\u5728\u96FB\u8166\u4E0A\u7528 /channelcollab:status \u770B\u6700\u8FD1\u7684\u932F\u8AA4\u3002";
+}
+function errorExcerpt(error, maxLines = 3, maxChars = 200) {
+  if (!error?.trim()) return [];
+  return maskSecrets(error).replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, maxLines).map((l) => l.length > maxChars ? `${l.slice(0, maxChars)}\u2026` : l);
+}
+function explainFailure(f, followUp = "\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u9019\u6BB5\u5C0D\u8A71\u3002") {
+  const head = `\u274C \u57F7\u884C\u5931\u6557${f.subtype && f.subtype !== "success" && f.subtype !== "error" ? `\uFF08${f.subtype}\uFF09` : ""}`;
+  const lines = errorExcerpt(f.error).map((l) => `> ${l.replace(/`/g, "'")}`);
+  if (!lines.length && f.apiError) lines.push(`> ${f.apiError}`);
+  return [head, ...lines, `\u{1F4A1} ${failureHint(f)}`, followUp].filter(Boolean).join("\n");
+}
+
+// src/runner/session.ts
+import { existsSync as existsSync4, realpathSync, statSync } from "node:fs";
+import path6 from "node:path";
+import {
+  createSdkMcpServer,
+  query,
+  tool
+} from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+
+// src/security/zones.ts
+import path5 from "node:path";
+var FILE_TOOLS = /* @__PURE__ */ new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "NotebookRead", "Grep", "Glob", "LS"]);
+var SHELL_TOOLS = /* @__PURE__ */ new Set(["Bash", "PowerShell"]);
+var PATH_KEYS2 = ["file_path", "notebook_path", "path"];
+var PATTERN_KEYS = ["pattern", "glob"];
+function normPath(p) {
+  return p.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+function under(abs, root) {
+  const r = normPath(root);
+  return abs === r || abs.startsWith(`${r}/`);
+}
+var WHY = {
+  home: "channelcollab \u7684\u8CC7\u6599\u593E\uFF08Bot \u8A2D\u5B9A\u3001token\u3001PIN\uFF09",
+  ssh: "SSH \u91D1\u9470\u8CC7\u6599\u593E\uFF08.ssh\uFF09",
+  env: ".env \u74B0\u5883\u8B8A\u6578\u6A94\uFF08\u5E38\u653E\u5BC6\u78BC\u8207\u91D1\u9470\uFF09",
+  cred: "Claude \u7684\u767B\u5165\u8CC7\u6599\uFF08.credentials.json\uFF09",
+  ctl: "channelcollab \u7684\u7E3D\u63A7\u8173\u672C\uFF08\u6539\u8A2D\u5B9A\u3001PIN\u3001\u767D\u540D\u55AE\u3001token \u90FD\u8981\u4E3B\u4EBA\u5728\u96FB\u8166\u4E0A\u81EA\u5DF1\u505A\uFF09"
+};
+function forbiddenPath(p, base, z2) {
+  const abs = normPath(path5.resolve(base, p));
+  if (z2.allow.some((a) => under(abs, a))) return void 0;
+  const parts = abs.split("/");
+  if (z2.homes.some((h) => under(abs, h)) || parts.some((s) => s.startsWith(".channelcollab"))) return WHY.home;
+  if (parts.includes(".ssh")) return WHY.ssh;
+  const name = parts.at(-1) ?? "";
+  if (/^\.env(\..+)?$/.test(name)) return WHY.env;
+  if (name === ".credentials.json") return WHY.cred;
+  return void 0;
+}
+function forbiddenText(text, z2) {
+  let t = normPath(text);
+  if (z2.allow.some((a) => t.includes(`${normPath(a)}/..`))) return WHY.home;
+  for (const a of z2.allow) t = t.split(normPath(a)).join(" ");
+  if (z2.homes.some((h) => t.includes(normPath(h))) || t.includes(".channelcollab")) return WHY.home;
+  if (/(^|[^\w.-])\.ssh([^\w-]|$)/.test(t)) return WHY.ssh;
+  if (/(^|[\s"'`/=:(,;|&<>*])\.env(\.[\w.*-]+)?(?=$|[\s"'`;|&)<>,}*])/.test(t)) return WHY.env;
+  if (t.includes(".credentials.json")) return WHY.cred;
+  if (/(^|[^\w-])(channelcollab|create-bot|ctl)\.mjs([^\w-]|$)/.test(t)) return WHY.ctl;
+  return void 0;
+}
+function strings(v, out = [], depth = 0) {
+  if (depth > 4) return out;
+  if (typeof v === "string") out.push(v);
+  else if (Array.isArray(v)) for (const x of v) strings(x, out, depth + 1);
+  else if (v && typeof v === "object") for (const x of Object.values(v)) strings(x, out, depth + 1);
+  return out;
+}
+function forbiddenUse(name, input, cwd, z2, ownPrefix) {
+  if (name.startsWith(ownPrefix)) {
+    const files = Array.isArray(input.files) ? input.files.filter((f) => typeof f === "string") : [];
+    for (const f of files) {
+      const why = forbiddenPath(f, cwd, z2);
+      if (why) return why;
+    }
+    return void 0;
+  }
+  if (SHELL_TOOLS.has(name)) return typeof input.command === "string" ? forbiddenText(input.command, z2) : void 0;
+  if (FILE_TOOLS.has(name)) {
+    for (const k2 of PATH_KEYS2) {
+      const v = input[k2];
+      if (typeof v === "string" && v) {
+        const why = forbiddenPath(v, cwd, z2);
+        if (why) return why;
+      }
+    }
+    for (const k2 of PATTERN_KEYS) {
+      const v = input[k2];
+      if (typeof v === "string" && v) {
+        const why = forbiddenText(v, z2);
+        if (why) return why;
+      }
+    }
+    return void 0;
+  }
+  if (name.startsWith("mcp__")) {
+    for (const s of strings(input)) {
+      const why = forbiddenText(s, z2);
+      if (why) return why;
+    }
+  }
+  return void 0;
+}
+function zoneDenyMessage(why) {
+  return `\u{1F6AB} \u9019\u500B\u52D5\u4F5C\u78B0\u5230 channelcollab \u7684\u7981\u5340\uFF1A${why}\u3002\u4EFB\u4F55\u6B0A\u9650\u6A21\u5F0F\u90FD\u4E0D\u80FD\u8B80\u5BEB\u9019\u88E1\uFF0C\u4E3B\u4EBA\u7684\u6309\u9215\u4E5F\u89E3\u4E0D\u958B\u3002\u4E0D\u8981\u518D\u8A66\uFF0C\u4E5F\u4E0D\u8981\u63DB\u5225\u7684\u65B9\u6CD5\u7E5E\u904E\uFF1B\u771F\u7684\u9700\u8981\u7684\u8A71\uFF0C\u8ACB\u4E3B\u4EBA\u81EA\u5DF1\u5728\u96FB\u8166\u4E0A\u8655\u7406\u3002`;
+}
 
 // src/runner/launcher.ts
 import { execFile, spawn } from "node:child_process";
@@ -264,7 +816,7 @@ function alive(child) {
 }
 function killTree(child) {
   if (!alive(child)) return Promise.resolve();
-  return new Promise((resolve) => execFile("taskkill", ["/T", "/F", "/PID", String(child.pid)], { windowsHide: true }, () => resolve()));
+  return new Promise((resolve2) => execFile("taskkill", ["/T", "/F", "/PID", String(child.pid)], { windowsHide: true }, () => resolve2()));
 }
 function track(child, o, onStderr, onSpawn) {
   child.stderr.on("data", (d) => onStderr(d.toString("utf8")));
@@ -282,8 +834,8 @@ function escapeCmdArg(arg) {
   return a.replace(CMD_META, "^$1");
 }
 function spawnViaCmd(o) {
-  const line = [o.command.replace(CMD_META, "^$1"), ...o.args.map(escapeCmdArg)].join(" ");
-  return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"${line}"`], {
+  const line2 = [o.command.replace(CMD_META, "^$1"), ...o.args.map(escapeCmdArg)].join(" ");
+  return spawn(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"${line2}"`], {
     cwd: o.cwd,
     env: o.env,
     stdio: ["pipe", "pipe", "pipe"],
@@ -292,54 +844,111 @@ function spawnViaCmd(o) {
   });
 }
 
-// src/runner/policy.ts
-import path4 from "node:path";
-var READ_ONLY = /* @__PURE__ */ new Set(["Read", "Glob", "Grep", "LS", "LSP", "NotebookRead", "ToolSearch", "TodoWrite", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "Skill"]);
-var EDITS = /* @__PURE__ */ new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
-var PATH_KEYS = ["file_path", "notebook_path", "path"];
-function inside(file, roots) {
-  const abs = path4.resolve(roots[0] ?? ".", file);
-  return roots.some((r) => {
-    const rel = path4.relative(path4.resolve(r), abs);
-    return rel === "" || !rel.startsWith("..") && !path4.isAbsolute(rel);
+// src/runner/usage.ts
+var CONTEXT_THRESHOLDS = [70, 85, 95];
+var FOOTER_FROM = 85;
+var NOTICE_AT = /* @__PURE__ */ new Set([70, 95]);
+function contextAlert(pct, notified) {
+  const kept = notified.filter((t) => t <= pct);
+  const crossed = CONTEXT_THRESHOLDS.filter((t) => pct >= t && !kept.includes(t));
+  const next = [.../* @__PURE__ */ new Set([...kept, ...crossed])].sort((a, b) => a - b);
+  const loud = crossed.filter((t) => NOTICE_AT.has(t));
+  return loud.length ? { notify: Math.max(...loud), notified: next } : { notified: next };
+}
+function contextNotice(pct, kind) {
+  const clear = kind === "dm" ? "\uFF0C\u6216 !clear \u958B\u65B0\u5C0D\u8A71" : "";
+  return pct >= 95 ? `\u{1F9E0} \u4E0A\u4E0B\u6587\u5DF2\u7528 ${pct}%\uFF0C\u5FEB\u6EFF\u4E86\uFF0C\u5EFA\u8B70\u73FE\u5728\u6253 !compact \u58D3\u7E2E${clear}\u3002` : `\u{1F9E0} \u4E0A\u4E0B\u6587\u5DF2\u7528 ${pct}%\uFF0C\u53EF\u4EE5\u6253 !compact \u58D3\u7E2E${clear}\u3002`;
+}
+function contextFooter(pct) {
+  if (pct === void 0 || pct < FOOTER_FROM) return "";
+  return `\u{1F9E0} \u4E0A\u4E0B\u6587 ${pct}%${pct >= 95 ? "\uFF0C\u5FEB\u6EFF\u4E86" : ""}\uFF0C\u53EF\u6253 !compact`;
+}
+function contextFromUsage(usage, window) {
+  if (!usage || !window) return void 0;
+  const tokens = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0);
+  if (!tokens) return void 0;
+  return { pct: Math.round(tokens / window * 100), tokens, max: window };
+}
+var LABELS = {
+  five_hour: "5 \u5C0F\u6642",
+  seven_day: "\u6BCF\u9031",
+  seven_day_opus: "\u6BCF\u9031 Opus",
+  seven_day_sonnet: "\u6BCF\u9031 Sonnet",
+  seven_day_overage_included: "\u6BCF\u9031\uFF08\u542B\u52A0\u8CFC\uFF09",
+  overage: "\u52A0\u8CFC"
+};
+var rateLabel = (type) => LABELS[type] ?? type;
+function rateWindows(info) {
+  const out = [];
+  for (const [type, w] of Object.entries(info.unifiedWindows ?? {})) {
+    if (w && typeof w === "object") out.push({ type, utilization: num(w.utilization), resetsAt: num(w.resetsAt), status: w.status, surpassedThreshold: num(w.surpassedThreshold) });
+  }
+  if (!out.length && info.rateLimitType) {
+    out.push({ type: info.rateLimitType, utilization: num(info.utilization), resetsAt: num(info.resetsAt), status: info.status, surpassedThreshold: num(info.surpassedThreshold) });
+  }
+  return out;
+}
+var num = (v) => typeof v === "number" && Number.isFinite(v) ? v : void 0;
+var pctOf = (u) => Math.round(u * 100);
+function formatReset(resetsAt, now = Date.now()) {
+  if (!resetsAt) return "";
+  const d = new Date(resetsAt * 1e3);
+  const n = new Date(now);
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return d.toDateString() === n.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+function level(w) {
+  if (w.status === "rejected") return 100;
+  if (w.utilization !== void 0 && w.utilization >= 0.95) return 95;
+  if (w.utilization !== void 0 && w.utilization >= 0.8) return 80;
+  if (w.status === "allowed_warning") return 1;
+  return 0;
+}
+function rateAlerts(info, notified, now = Date.now()) {
+  const out = [];
+  const windows = rateWindows(info);
+  for (const w of windows) {
+    const lv = level(w);
+    const prev = notified.get(w.type);
+    const fresh = !prev || prev.resetsAt !== w.resetsAt;
+    if (fresh || lv < prev.level) notified.set(w.type, { level: Math.min(lv, fresh ? 0 : lv), resetsAt: w.resetsAt });
+    const cur = notified.get(w.type);
+    if (lv <= cur.level || lv === 0) continue;
+    cur.level = lv;
+    const when = formatReset(w.resetsAt, now);
+    const reset = when ? `\uFF0C\u7D04 ${when} \u91CD\u7F6E` : "";
+    if (lv === 100) out.push(`\u26D4 ${rateLabel(w.type)}\u984D\u5EA6\u5DF2\u7528\u5B8C${reset}${when ? "\uFF0C\u5230\u6642\u518D\u8A66" : ""}\u3002`);
+    else if (lv === 1) out.push(`\u26A0\uFE0F ${rateLabel(w.type)}\u984D\u5EA6\u63A5\u8FD1\u4E0A\u9650${reset}\u3002`);
+    else out.push(`\u26A0\uFE0F ${rateLabel(w.type)}\u984D\u5EA6\u5DF2\u7528 ${pctOf(w.utilization)}%${reset}\u3002`);
+  }
+  if (info.status === "rejected" && !out.some((l) => l.startsWith("\u26D4")) && !windows.some((w) => w.status === "rejected")) {
+    const key = `rejected:${info.rateLimitType ?? "-"}`;
+    if (notified.get(key)?.resetsAt !== info.resetsAt) {
+      notified.set(key, { level: 100, resetsAt: info.resetsAt });
+      const when = formatReset(info.resetsAt, now);
+      out.push(`\u26D4 ${info.rateLimitType ? rateLabel(info.rateLimitType) : ""}\u984D\u5EA6\u5DF2\u7528\u5B8C${when ? `\uFF0C\u7D04 ${when} \u91CD\u7F6E\uFF0C\u5230\u6642\u518D\u8A66` : ""}\u3002`);
+    }
+  }
+  return out;
+}
+function rateSummary(info, now = Date.now()) {
+  if (!info) return "\u672A\u77E5\uFF08\u9019\u6B21\u555F\u52D5\u5F8C\u9084\u6C92\u6536\u5230\u984D\u5EA6\u8CC7\u8A0A\uFF0C\u8DD1\u904E\u4E00\u8F2A\u5F8C\u518D\u770B\uFF09";
+  const parts = rateWindows(info).map((w) => {
+    const used = w.utilization !== void 0 ? `${pctOf(w.utilization)}%` : w.status === "rejected" ? "\u5DF2\u7528\u5B8C" : w.status === "allowed_warning" ? "\u63A5\u8FD1\u4E0A\u9650" : "\u6B63\u5E38";
+    const when = formatReset(w.resetsAt, now);
+    return `${rateLabel(w.type)} ${used}${when ? `\uFF08${when} \u91CD\u7F6E\uFF09` : ""}`;
   });
+  const state2 = info.status === "rejected" ? "\u26D4 \u76EE\u524D\u88AB\u9650\u5236" : info.status === "allowed_warning" ? "\u26A0\uFE0F \u63A5\u8FD1\u4E0A\u9650" : "\u6B63\u5E38";
+  return parts.length ? `${state2}\uFF1A${parts.join("\u3001")}` : state2;
 }
-function targetPath(input) {
-  for (const k of PATH_KEYS) if (typeof input[k] === "string" && input[k]) return input[k];
-  return void 0;
+var latestRate;
+var rateNotified = /* @__PURE__ */ new Map();
+function recordRateLimit(info) {
+  latestRate = info;
+  return rateAlerts(info, rateNotified);
 }
-function decideTool(name, input, ctx) {
-  if (name === "AskUserQuestion") return { kind: "cli", why: "question" };
-  if (name.startsWith(ctx.ownPrefix)) return { kind: "allow", why: "own tool" };
-  if (ctx.mode === "auto") {
-    if (ctx.alwaysAllowed.has(name)) return { kind: "allow", why: "always allowed this session" };
-    return { kind: "cli", why: "auto mode" };
-  }
-  if (READ_ONLY.has(name)) {
-    const p = targetPath(input);
-    if (p && !inside(p, ctx.roots)) return { kind: "ask", why: "read outside cwd" };
-    return { kind: "allow", why: "read-only" };
-  }
-  if (ctx.mode === "plan") return { kind: "deny", why: "plan mode" };
-  if (ctx.alwaysAllowed.has(name)) return { kind: "allow", why: "always allowed this session" };
-  if (ctx.mode === "acceptEdits" && EDITS.has(name)) {
-    const p = targetPath(input);
-    if (p && inside(p, ctx.roots)) return { kind: "allow", why: "acceptEdits inside cwd" };
-  }
-  if (ctx.mode === "dontAsk") return { kind: "deny", why: "dontAsk mode" };
-  return { kind: "ask", why: "needs approval" };
-}
-function blockedByClassifier(mode) {
-  return mode === "auto" ? "ask" : "keep";
-}
-function retryKey(name, input) {
-  const { description: _label, ...rest } = input;
-  return `${name} ${JSON.stringify(rest)}`;
-}
-function canAct(kind, clickerId, who) {
-  if (who.ownerId && clickerId === who.ownerId) return true;
-  if (kind === "permission") return false;
-  return !!who.requesterId && clickerId === who.requesterId;
+function latestRateLimit() {
+  return latestRate;
 }
 
 // src/runner/session.ts
@@ -349,23 +958,31 @@ var TURN_TIMEOUT_MS = 10 * 60 * 1e3;
 var MAX_TURNS = 40;
 var CLOSE_GRACE_MS = 15 * 1e3;
 var MAX_REPLY_FILES = 10;
-function guidelines(selfId, auto) {
+function guidelines(selfId, auto, kind = "thread") {
   let configured;
   try {
     configured = loadConfig().discord.owner_id;
   } catch {
   }
+  const dm = kind === "dm";
+  const where = dm ? "\u79C1\u8A0A" : "\u8A0E\u8AD6\u4E32";
   return [
-    "\u4F60\u6B63\u5728\u4E00\u500B Discord \u8A0E\u8AD6\u4E32\u88E1\u548C\u4EBA\u5354\u4F5C\uFF0C\u8A0E\u8AD6\u4E32\u88E1\u53EF\u80FD\u9084\u6709\u5176\u4ED6\u4EBA\u7684 Bot\u3002\u6BCF\u5247\u4F7F\u7528\u8005\u8A0A\u606F\u6703\u6A19\u793A\u767C\u8A71\u8005\u3001\u4F4D\u7F6E\u548C\u6700\u8FD1\u7684\u5C0D\u8A71\u3002",
+    dm ? "\u4F60\u6B63\u5728 Discord \u79C1\u8A0A\u88E1\u548C\u4F60\u7684\u4E3B\u4EBA\u4E00\u5C0D\u4E00\u5C0D\u8A71\uFF08\u4E3B\u4EBA\u53EF\u80FD\u5728\u624B\u6A5F\u4E0A\uFF0C\u9060\u7AEF\u8ACB\u4F60\u5728\u9019\u53F0\u96FB\u8166\u4E0A\u505A\u4E8B\uFF09\u3002\u6BCF\u5247\u4F7F\u7528\u8005\u8A0A\u606F\u6703\u6A19\u793A\u767C\u8A71\u8005\u8207\u4F4D\u7F6E\u3002" : "\u4F60\u6B63\u5728\u4E00\u500B Discord \u8A0E\u8AD6\u4E32\u88E1\u548C\u4EBA\u5354\u4F5C\uFF0C\u8A0E\u8AD6\u4E32\u88E1\u53EF\u80FD\u9084\u6709\u5176\u4ED6\u4EBA\u7684 Bot\u3002\u6BCF\u5247\u4F7F\u7528\u8005\u8A0A\u606F\u6703\u6A19\u793A\u767C\u8A71\u8005\u3001\u4F4D\u7F6E\u548C\u6700\u8FD1\u7684\u5C0D\u8A71\u3002",
     `- \u4F60\u7684\u4E00\u822C\u6587\u5B57\u8F38\u51FA\u6C92\u6709\u4EBA\u770B\u5F97\u5230\uFF1B\u8981\u8B93\u4EBA\u770B\u5230\u7684\u5167\u5BB9\uFF0C\u4E00\u5F8B\u547C\u53EB ${REPLY_TOOL} \u5DE5\u5177\u3002`,
-    "- \u56DE\u8986\u8981\u7C21\u77ED\uFF0C\u53EA\u8B1B\u7D50\u8AD6\uFF1B\u505A\u4E86\u4FEE\u6539\u5C31\u8AAA\u660E\u6539\u4E86\u4EC0\u9EBC\u3002",
-    auto ? "- \u9019\u500B\u983B\u9053\u7528\u81EA\u52D5\u6A21\u5F0F\uFF1A\u52D5\u4F5C\u7531 Claude Code \u81EA\u52D5\u5224\u65B7\uFF1B\u88AB\u81EA\u52D5\u6A21\u5F0F\u64CB\u4E0B\u7684\u52D5\u4F5C\u6703\u6539\u5728 Discord \u4E0A\u8ACB Bot \u7684\u4E3B\u4EBA\u6C7A\u5B9A\uFF0C\u7B49\u5F85\u671F\u9593\u4E0D\u5FC5\u53E6\u5916\u8AAA\u660E\u3002\u4E4B\u5F8C\u82E5\u88AB\u544A\u77E5\u53EF\u4EE5\u91CD\u8A66\u9019\u500B\u547C\u53EB\uFF0C\u4EE3\u8868\u4E3B\u4EBA\u5DF2\u7D93\u56DE\u8986\uFF1A\u8ACB\u7528\u5B8C\u5168\u76F8\u540C\u7684\u53C3\u6578\u91CD\u8A66\u4E00\u6B21\uFF08\u4E0D\u8981\u6539\u6307\u4EE4\uFF09\uFF1B\u82E5\u7D50\u679C\u662F\u4E3B\u4EBA\u62D2\u7D55\uFF0C\u7167\u62D2\u7D55\u7406\u7531\u8ABF\u6574\u505A\u6CD5\uFF0C\u4E0D\u8981\u518D\u8A66\u3002" : "- \u9700\u8981\u6B0A\u9650\u7684\u5DE5\u5177\u6703\u5728 Discord \u4E0A\u8ACB Bot \u7684\u4E3B\u4EBA\u6838\u51C6\uFF0C\u7B49\u5F85\u671F\u9593\u4E0D\u5FC5\u53E6\u5916\u8AAA\u660E\u3002\u88AB\u62D2\u7D55\u6642\u7167\u62D2\u7D55\u7406\u7531\u8ABF\u6574\u505A\u6CD5\uFF0C\u4E0D\u8981\u539F\u6A23\u91CD\u8A66\u3002",
+    dm ? "- \u56DE\u8986\u8981\u7C21\u77ED\uFF0C\u53EA\u8B1B\u7D50\u8AD6\uFF08\u4E3B\u4EBA\u591A\u534A\u5728\u624B\u6A5F\u4E0A\u770B\uFF09\uFF1B\u505A\u4E86\u4FEE\u6539\u5C31\u8AAA\u660E\u6539\u4E86\u4EC0\u9EBC\u3002" : "- \u56DE\u8986\u8981\u7C21\u77ED\uFF0C\u53EA\u8B1B\u7D50\u8AD6\uFF1B\u505A\u4E86\u4FEE\u6539\u5C31\u8AAA\u660E\u6539\u4E86\u4EC0\u9EBC\u3002",
+    auto ? `- \u9019\u500B${dm ? "\u79C1\u8A0A" : "\u983B\u9053"}\u7528\u81EA\u52D5\u6A21\u5F0F\uFF1A\u52D5\u4F5C\u7531 Claude Code \u81EA\u52D5\u5224\u65B7\uFF1B\u88AB\u81EA\u52D5\u6A21\u5F0F\u64CB\u4E0B\u7684\u52D5\u4F5C\u6703\u6539\u5728 Discord \u4E0A\u8ACB Bot \u7684\u4E3B\u4EBA\u6C7A\u5B9A\uFF0C\u7B49\u5F85\u671F\u9593\u4E0D\u5FC5\u53E6\u5916\u8AAA\u660E\u3002\u4E4B\u5F8C\u82E5\u88AB\u544A\u77E5\u53EF\u4EE5\u91CD\u8A66\u9019\u500B\u547C\u53EB\uFF0C\u4EE3\u8868\u4E3B\u4EBA\u5DF2\u7D93\u56DE\u8986\uFF1A\u8ACB\u7528\u5B8C\u5168\u76F8\u540C\u7684\u53C3\u6578\u91CD\u8A66\u4E00\u6B21\uFF08\u4E0D\u8981\u6539\u6307\u4EE4\uFF09\uFF1B\u82E5\u7D50\u679C\u662F\u4E3B\u4EBA\u62D2\u7D55\uFF0C\u7167\u62D2\u7D55\u7406\u7531\u8ABF\u6574\u505A\u6CD5\uFF0C\u4E0D\u8981\u518D\u8A66\u3002` : "- \u9700\u8981\u6B0A\u9650\u7684\u5DE5\u5177\u6703\u5728 Discord \u4E0A\u8ACB Bot \u7684\u4E3B\u4EBA\u6838\u51C6\uFF0C\u7B49\u5F85\u671F\u9593\u4E0D\u5FC5\u53E6\u5916\u8AAA\u660E\u3002\u88AB\u62D2\u7D55\u6642\u7167\u62D2\u7D55\u7406\u7531\u8ABF\u6574\u505A\u6CD5\uFF0C\u4E0D\u8981\u539F\u6A23\u91CD\u8A66\u3002",
+    "- \u6B0A\u9650\u8ACB\u6C42\u7684\u7D50\u679C\u82E5\u662F\u300C\u4E3B\u4EBA\u66AB\u6642\u4E0D\u5728\u2026\u5DF2\u6392\u5165\u5F85\u6838\u51C6\u6E05\u55AE\u300D\uFF1A\u4E0D\u8981\u91CD\u8A66\u540C\u4E00\u500B\u52D5\u4F5C\uFF1B\u6539\u7528\u4E0D\u9700\u8981\u6B0A\u9650\u7684\u65B9\u5F0F\u628A\u80FD\u505A\u7684\u505A\u5B8C\uFF0C\u505A\u4E0D\u5230\u7684\u90E8\u5206\u5728 reply \u88E1\u6574\u7406\u6210\u300C\u5F85\u4E3B\u4EBA\u6838\u51C6\u300D\uFF08\u8981\u505A\u4EC0\u9EBC\u3001\u70BA\u4EC0\u9EBC\uFF09\uFF0C\u7136\u5F8C\u7D50\u675F\u9019\u4E00\u8F2A\u3002\u4E3B\u4EBA\u6838\u51C6\u5F8C\u6703\u518D\u544A\u8A34\u4F60\uFF0C\u5230\u6642\u7528\u76F8\u540C\u53C3\u6578\u57F7\u884C\u3002",
+    "- \u88AB\u300C\u7981\u5340\u300D\u64CB\u4E0B\u7684\u52D5\u4F5C\uFF08channelcollab \u7684\u8CC7\u6599\u593E\u3001.ssh\u3001.env\u3001Claude \u7684\u767B\u5165\u8CC7\u6599\uFF09\u4EFB\u4F55\u60C5\u6CC1\u90FD\u4E0D\u80FD\u505A\uFF0C\u4E0D\u8981\u518D\u8A66\uFF0C\u4E5F\u4E0D\u8981\u63DB\u65B9\u6CD5\u7E5E\u904E\u3002",
     "- \u9700\u8981\u4F7F\u7528\u8005\u505A\u9078\u64C7\u6642\uFF0C\u53EF\u4EE5\u7528 AskUserQuestion \u5DE5\u5177\uFF0C\u9078\u9805\u6703\u4EE5\u6309\u9215\u6216\u9078\u55AE\u5448\u73FE\u5728 Discord \u4E0A\u3002",
-    "- \u9700\u8981\u4E3B\u4EBA\u597D\u597D\u601D\u8003\u7684\u6C7A\u7B56\uFF08\u4F8B\u5982\u65B9\u5411\u3001\u53D6\u6368\u3001\u5F71\u97FF\u7BC4\u570D\u5927\u7684\u6539\u52D5\uFF09\uFF0C\u5728 reply \u88E1 @ \u4E3B\u4EBA\uFF0C\u8ACB\u4E3B\u4EBA\u6C7A\u5B9A\uFF0C\u4E0D\u8981\u81EA\u5DF1\u6C7A\u5B9A\u3002",
+    dm ? "- \u9700\u8981\u4E3B\u4EBA\u597D\u597D\u601D\u8003\u7684\u6C7A\u7B56\uFF08\u4F8B\u5982\u65B9\u5411\u3001\u53D6\u6368\u3001\u5F71\u97FF\u7BC4\u570D\u5927\u7684\u6539\u52D5\uFF09\uFF0C\u76F4\u63A5\u5728 reply \u88E1\u554F\u4E3B\u4EBA\uFF0C\u4E0D\u8981\u81EA\u5DF1\u6C7A\u5B9A\u3002" : "- \u9700\u8981\u4E3B\u4EBA\u597D\u597D\u601D\u8003\u7684\u6C7A\u7B56\uFF08\u4F8B\u5982\u65B9\u5411\u3001\u53D6\u6368\u3001\u5F71\u97FF\u7BC4\u570D\u5927\u7684\u6539\u52D5\uFF09\uFF0C\u5728 reply \u88E1 @ \u4E3B\u4EBA\uFF0C\u8ACB\u4E3B\u4EBA\u6C7A\u5B9A\uFF0C\u4E0D\u8981\u81EA\u5DF1\u6C7A\u5B9A\u3002",
     "- \u4F7F\u7528\u8005\u9644\u7684\u6A94\u6848\u6703\u4E0B\u8F09\u5230\u672C\u6A5F\uFF0C\u8DEF\u5F91\u5BEB\u5728\u8A0A\u606F\u7684\u3010\u9644\u4EF6\u3011\u88E1\uFF0C\u7528 Read \u8B80\u53D6\u3002",
-    `- \u8981\u628A\u6A94\u6848\u50B3\u5230\u8A0E\u8AD6\u4E32\uFF0C\u547C\u53EB ${REPLY_TOOL} \u6642\u5728 files \u5E36\u672C\u6A5F\u8DEF\u5F91\uFF08\u53EA\u80FD\u662F\u5DE5\u4F5C\u76EE\u9304\u6216\u9644\u4EF6\u8CC7\u6599\u593E\u5E95\u4E0B\u7684\u6A94\u6848\uFF09\u3002`,
-    rosterPrompt(selfId, botOwner(configured, selfId))
+    `- \u8981\u628A\u6A94\u6848\u50B3\u5230${where}\uFF0C\u547C\u53EB ${REPLY_TOOL} \u6642\u5728 files \u5E36\u672C\u6A5F\u8DEF\u5F91\uFF08\u53EA\u80FD\u662F\u5DE5\u4F5C\u76EE\u9304\u6216\u9644\u4EF6\u8CC7\u6599\u593E\u5E95\u4E0B\u7684\u6A94\u6848\uFF09\u3002`,
+    rosterPrompt(selfId, botOwner(configured, selfId), void 0, { dm })
   ].join("\n");
+}
+function modeDenyMessage(mode, toolName) {
+  if (mode === "plan") return `\u76EE\u524D\u662F\u8A08\u756B\u6A21\u5F0F\uFF08\u4E3B\u4EBA\u6253\u4E86 !plan\uFF09\uFF1A\u53EA\u8A0E\u8AD6\u3001\u4E0D\u52D5\u624B\uFF0C\u4E0D\u80FD\u57F7\u884C ${toolName}\u3002\u8ACB\u7528 reply \u628A\u4F60\u7684\u8A08\u756B\u8AAA\u660E\u7D66\u4E3B\u4EBA\uFF0C\u7B49\u4E3B\u4EBA\u518D\u6253\u4E00\u6B21 !plan \u5207\u56DE\u5F8C\u518D\u52D5\u624B\u3002`;
+  return `\u9019\u500B\u983B\u9053\u7684\u6B0A\u9650\u6A21\u5F0F\uFF08${mode}\uFF09\u4E0D\u5141\u8A31\u57F7\u884C ${toolName}\u3002`;
 }
 var SESSION_ENV = /* @__PURE__ */ new Set([
   "CLAUDECODE",
@@ -385,20 +1002,22 @@ var SESSION_ENV = /* @__PURE__ */ new Set([
 ]);
 function childEnv(source = process.env) {
   const env = {};
-  for (const [k, v] of Object.entries(source)) {
-    if (SESSION_ENV.has(k.toUpperCase()) || k === "ANTHROPIC_API_KEY" || k === "ANTHROPIC_AUTH_TOKEN") continue;
-    env[k] = v;
+  for (const [k2, v] of Object.entries(source)) {
+    if (SESSION_ENV.has(k2.toUpperCase()) || k2 === "ANTHROPIC_API_KEY" || k2 === "ANTHROPIC_AUTH_TOKEN") continue;
+    env[k2] = v;
   }
   return env;
 }
-function checkFiles(files, roots) {
+function checkFiles(files, roots, zones) {
   const ok = [];
   const rejected = [];
-  const realRoots = roots.filter((r) => existsSync3(r)).map((r) => realpathSync(r));
+  const realRoots = roots.filter((r) => existsSync4(r)).map((r) => realpathSync(r));
   for (const f of files) {
     try {
-      const real = realpathSync(path5.resolve(roots[0], f));
-      if (!inside(real, realRoots)) rejected.push(`${f}: not under the working directory or the attachment folder`);
+      const real = realpathSync(path6.resolve(roots[0], f));
+      const zone = forbiddenPath(real, roots[0], zones);
+      if (zone) rejected.push(`${f}: no-go zone (${zone})`);
+      else if (!inside(real, realRoots)) rejected.push(`${f}: not under the working directory or the attachment folder`);
       else if (!statSync(real).isFile()) rejected.push(`${f}: not a file`);
       else ok.push(real);
     } catch {
@@ -415,13 +1034,17 @@ var LiveSession = class {
    * it saved on its last clean exit (0 when new). A CLI that was killed does not
    * save, so its later turns are not part of the base.
    */
-  constructor(threadId, selfId, channel, resume, costBase, alwaysAllowed = []) {
+  constructor(threadId, selfId, channel, resume, costBase, alwaysAllowed = [], kind = "thread") {
     this.threadId = threadId;
+    this.kind = kind;
     this.tag = `live ${threadId}`;
     this.sessionId = resume;
     this.cost = costBase;
     this.alwaysAllowed = new Set(alwaysAllowed);
-    const roots = [channel.cwd, path5.join(INBOX_DIR, threadId)];
+    this.mode = channel.permissionMode;
+    this.cwd = channel.cwd;
+    const roots = [channel.cwd, path6.join(INBOX_DIR, threadId)];
+    const zones = { homes: [DATA_DIR], allow: [roots[1]] };
     const server = createSdkMcpServer({
       name: "channelcollab",
       version: "0.1.0",
@@ -429,14 +1052,14 @@ var LiveSession = class {
       tools: [
         tool(
           "reply",
-          "Send a message to the people in the current Discord thread. This is the only way anyone sees what you say. Optionally attach local files (under the working directory or the attachment folder).",
+          `Send a message to ${kind === "dm" ? "your owner in the current Discord direct message" : "the people in the current Discord thread"}. This is the only way anyone sees what you say. Optionally attach local files (under the working directory or the attachment folder).`,
           {
             text: z.string().describe("Message text (Markdown)"),
             files: z.array(z.string()).optional().describe("Local file paths to upload with the message")
           },
           async ({ text, files }) => {
             const t = this.turn;
-            const checked = checkFiles(files ?? [], roots);
+            const checked = checkFiles(files ?? [], roots, zones);
             log("reply", `${threadId} ${brief(text, 300)}${files?.length ? ` files=${JSON.stringify(checked.ok)} rejected=${JSON.stringify(checked.rejected)}` : ""}`);
             if (!t) return { content: [{ type: "text", text: "Not delivered: no active turn." }], isError: true };
             try {
@@ -456,13 +1079,19 @@ var LiveSession = class {
       if (hookInput.hook_event_name !== "PreToolUse") return {};
       const name = hookInput.tool_name;
       const toolInput = hookInput.tool_input ?? {};
+      const zone = forbiddenUse(name, toolInput, channel.cwd, zones, OWN_PREFIX);
+      if (zone) {
+        this.turn?.denials.push(name);
+        log("permission", `${threadId} deny ${name} (no-go zone: ${zone}) id=${toolUseId ?? "-"}`);
+        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: zoneDenyMessage(zone) } };
+      }
       const retry = this.turn?.retries.get(retryKey(name, toolInput));
       if (retry) {
         this.turn?.retries.delete(retryKey(name, toolInput));
-        log("permission", `${threadId} retry ${"deny" in retry ? "deny" : "allow"} ${name} (owner answered a classifier block) id=${toolUseId ?? "-"}`);
+        log("permission", `${threadId} retry ${"deny" in retry ? "deny" : "allow"} ${name} (owner answered: classifier block or approve-later) id=${toolUseId ?? "-"}`);
         return "deny" in retry ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: retry.deny } } : { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "approved by the owner after an auto mode block" } };
       }
-      const d = decideTool(name, toolInput, { mode: channel.permissionMode, roots, alwaysAllowed: this.alwaysAllowed, ownPrefix: OWN_PREFIX });
+      const d = decideTool(name, toolInput, { mode: this.mode, roots, alwaysAllowed: this.alwaysAllowed, ownPrefix: OWN_PREFIX });
       if (d.kind === "cli") return {};
       if (d.kind === "allow") {
         if (!name.startsWith(OWN_PREFIX)) log("permission", `${threadId} auto-allow ${name} (${d.why}) id=${toolUseId ?? "-"}`);
@@ -471,7 +1100,7 @@ var LiveSession = class {
       if (d.kind === "deny") {
         this.turn?.denials.push(name);
         log("permission", `${threadId} deny ${name} (${d.why}) id=${toolUseId ?? "-"}`);
-        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `\u9019\u500B\u983B\u9053\u7684\u6B0A\u9650\u6A21\u5F0F\uFF08${channel.permissionMode}\uFF09\u4E0D\u5141\u8A31\u57F7\u884C ${name}\u3002` } };
+        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: modeDenyMessage(this.mode, name) } };
       }
       const answer = await this.ask(name, toolInput, toolUseId ?? "", signal);
       return answer.behavior === "deny" ? { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: answer.message } } : { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "approved by the owner" } };
@@ -479,7 +1108,7 @@ var LiveSession = class {
     const permissionDenied = async (hookInput, toolUseId, { signal }) => {
       if (hookInput.hook_event_name !== "PermissionDenied") return {};
       const t = this.turn;
-      if (!t || blockedByClassifier(channel.permissionMode) !== "ask") return {};
+      if (!t || blockedByClassifier(this.mode) !== "ask") return {};
       const name = hookInput.tool_name;
       const toolInput = hookInput.tool_input ?? {};
       log("permission", `${threadId} classifier blocked ${name} (${brief(hookInput.reason, 200)}) id=${toolUseId ?? hookInput.tool_use_id}`);
@@ -489,6 +1118,7 @@ var LiveSession = class {
       return { hookSpecificOutput: { hookEventName: "PermissionDenied", retry: true } };
     };
     const canUseTool = async (toolName, input, { signal, toolUseID }) => {
+      if (toolName.startsWith(OWN_PREFIX)) return { behavior: "allow", updatedInput: input };
       if (toolName !== "AskUserQuestion") {
         const answer = await this.ask(toolName, input, toolUseID, signal);
         return answer.behavior === "deny" ? { behavior: "deny", message: answer.message } : { behavior: "allow", updatedInput: input };
@@ -514,7 +1144,7 @@ var LiveSession = class {
       log(this.tag, `spawned pid=${child.pid}`);
     };
     const hookTimeout = Math.ceil(channel.permissionTimeoutMs / 1e3) + 60;
-    log(this.tag, `start cwd=${channel.cwd} model=${channel.model ?? "-"} mode=${channel.permissionMode} launcher=${channel.launcher || "builtin"} resume=${resume ?? "-"} always=${JSON.stringify([...this.alwaysAllowed])}`);
+    log(this.tag, `start kind=${kind} cwd=${channel.cwd} model=${channel.model ?? "-"} mode=${channel.permissionMode} launcher=${channel.launcher || "builtin"} resume=${resume ?? "-"} always=${JSON.stringify([...this.alwaysAllowed])}`);
     this.q = query({
       prompt: this.input(),
       options: {
@@ -526,13 +1156,14 @@ var LiveSession = class {
         settingSources: ["user", "project"],
         // Always explicit: omitted, the user's own default (e.g. auto) applies and canUseTool is skipped.
         permissionMode: channel.permissionMode,
-        systemPrompt: { type: "preset", preset: "claude_code", append: guidelines(selfId, channel.permissionMode === "auto") },
+        systemPrompt: { type: "preset", preset: "claude_code", append: guidelines(selfId, (channel.basePermissionMode ?? channel.permissionMode) === "auto", kind) },
         allowedTools: [REPLY_TOOL],
         mcpServers: { channelcollab: server },
         // The hooks await the owner's answer in-process, so their timeout (seconds) must outlast the prompt's.
+        // PermissionDenied is always registered: !plan can switch an auto session out of auto and back.
         hooks: {
           PreToolUse: [{ hooks: [preToolUse], timeout: hookTimeout }],
-          ...blockedByClassifier(channel.permissionMode) === "ask" ? { PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }] } : {}
+          PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }]
         },
         canUseTool,
         maxTurns: MAX_TURNS,
@@ -544,6 +1175,7 @@ var LiveSession = class {
     this.done = this.read();
   }
   threadId;
+  kind;
   sessionId;
   model;
   /** When the last turn ended (or the session started); drives idle close and eviction. */
@@ -568,6 +1200,14 @@ var LiveSession = class {
   clean = false;
   child;
   stderrTail = [];
+  /** Usage of the last main-thread API call, and the context window from the last result (fallback for contextUsage). */
+  lastUsage;
+  contextWindow;
+  /** Permission mode in effect now (!plan switches it); the hooks read this. */
+  mode;
+  /** When this process was started (for !status). */
+  startedAt = Date.now();
+  cwd;
   /** A turn is running. */
   get busy() {
     return !!this.turn;
@@ -579,6 +1219,33 @@ var LiveSession = class {
   get pid() {
     return this.child?.pid;
   }
+  /** Switch the model for the following responses (!model); the session keeps running. */
+  async setModel(model) {
+    await this.q.setModel(model);
+    log(this.tag, `model set to ${model}`);
+  }
+  /** Switch the permission mode (!plan); the hooks follow it right away. */
+  async setMode(mode) {
+    await this.q.setPermissionMode(mode);
+    this.mode = mode;
+    log(this.tag, `permission mode set to ${mode}`);
+  }
+  /**
+   * How full the context window is after the last turn: Claude Code's own
+   * figure (getContextUsage, the /context numbers), else the last API call's
+   * tokens over the model's context window.
+   */
+  async contextUsage() {
+    if (this.usable) {
+      try {
+        const u = await Promise.race([this.q.getContextUsage({ detail: "summary" }), sleep(5e3).then(() => void 0)]);
+        if (u && Number.isFinite(u.percentage)) return { pct: Math.round(u.percentage), tokens: u.totalTokens, max: u.maxTokens };
+      } catch (e) {
+        log(this.tag, `getContextUsage failed: ${e.message}`);
+      }
+    }
+    return contextFromUsage(this.lastUsage, this.contextWindow);
+  }
   /** Cumulative total_cost_usd as of the last result. */
   get costTotal() {
     return this.cost;
@@ -588,10 +1255,10 @@ var LiveSession = class {
     return this.clean;
   }
   /** Run one turn. Never rejects: failures come back as `ok: false`. One turn at a time. */
-  run(prompt, callbacks) {
+  run(prompt, callbacks, opts = {}) {
     if (this.turn) throw new Error(`${this.tag}: a turn is already running`);
     const n = ++this.turns;
-    return new Promise((resolve) => {
+    return new Promise((resolve2) => {
       const t = {
         ...callbacks,
         n,
@@ -606,8 +1273,9 @@ var LiveSession = class {
         waits: 0,
         abort: new AbortController(),
         retries: /* @__PURE__ */ new Map(),
-        resolve
+        resolve: resolve2
       };
+      for (const k2 of opts.preapproved ?? []) t.retries.set(k2, { allow: true });
       this.turn = t;
       this.startClock(t);
       if (!this.usable) {
@@ -749,7 +1417,16 @@ var LiveSession = class {
       }
       this.sessionId = msg.session_id;
       this.model = msg.model;
+    } else if (msg.type === "rate_limit_event") {
+      const info = msg.rate_limit_info;
+      log(this.tag, `rate limit ${brief(info, 400)}`);
+      for (const text of recordRateLimit(info)) {
+        if (t?.notice) t.notice(text).catch((e) => log(this.tag, `rate limit notice failed: ${e.message}`));
+        else log(this.tag, `rate limit notice (no turn to post it): ${text}`);
+      }
     } else if (msg.type === "assistant" && t) {
+      if (msg.error) t.apiError = msg.error;
+      if (msg.parent_tool_use_id === null && msg.message.usage) this.lastUsage = msg.message.usage;
       for (const block of msg.message.content) {
         if (block.type === "tool_use") {
           if (!t.acted) {
@@ -780,6 +1457,11 @@ var LiveSession = class {
     const turnCost = costTotal >= this.cost ? costTotal - this.cost : costTotal;
     this.cost = costTotal;
     if (result?.session_id) this.sessionId = result.session_id;
+    const windowOf = result?.modelUsage && this.model ? result.modelUsage[this.model]?.contextWindow : void 0;
+    if (windowOf) this.contextWindow = windowOf;
+    if (result?.is_error && !error) {
+      error = result.subtype === "success" ? result.result : result.errors?.join("\n");
+    }
     const out = {
       ok: !!result && result.subtype === "success" && !result.is_error,
       // An interrupted turn ends as error_during_execution; report it as what it was.
@@ -795,7 +1477,8 @@ var LiveSession = class {
       lastText: result?.subtype === "success" && result.result.trim() ? result.result : t.lastText,
       denials: t.denials,
       stoppedBy: t.stoppedBy,
-      error
+      error,
+      apiError: t.apiError
     };
     log("result", `${this.threadId} turn=${t.n} pid=${this.pid ?? "-"} ok=${out.ok} subtype=${out.subtype} session=${out.sessionId} turns=${out.numTurns} replies=${out.replies} tools=${out.tools.length} denials=${JSON.stringify(out.denials)}${out.stoppedBy ? ` stopped_by=${out.stoppedBy}` : ""} turn_cost_usd=${turnCost.toFixed(4)} total_cost_usd=${costTotal.toFixed(4)} duration_ms=${out.durationMs}`);
     t.resolve(out);
@@ -808,6 +1491,9 @@ var live = /* @__PURE__ */ new Map();
 var closing = /* @__PURE__ */ new Map();
 var stopping = false;
 var sweeper;
+function liveSession(threadId) {
+  return live.get(threadId);
+}
 function limits() {
   const d = loadConfig().defaults;
   return { idleMs: d.idle_close_minutes * 60 * 1e3, max: d.max_live_sessions };
@@ -824,17 +1510,17 @@ function retire(s, reason, force = false) {
   });
   return p;
 }
-async function acquire(threadId, selfId, channel, resume, costBase) {
+async function acquire(threadId, selfId, channel, resume, costBase, kind = "thread") {
   if (stopping) throw new Error("bot is shutting down");
   const current = live.get(threadId);
   if (current?.usable) return current;
   if (current) retire(current, "ended");
   await closing.get(threadId);
   if (stopping) throw new Error("bot is shutting down");
-  const s = new LiveSession(threadId, selfId, channel, resume, costBase, getThread(threadId)?.alwaysAllow);
+  const s = new LiveSession(threadId, selfId, channel, resume, costBase, getConversation(threadId)?.alwaysAllow, kind);
   live.set(threadId, s);
   void s.done.then(() => {
-    const ts = getThread(threadId);
+    const ts = findSession(threadId, s.sessionId);
     if (ts && s.cleanExit) {
       ts.resumeCostBase = s.costTotal;
       saveState();
@@ -884,6 +1570,10 @@ function sweep() {
     }
   }
 }
+function release(threadId, reason) {
+  const s = live.get(threadId);
+  return s ? retire(s, reason) : closing.get(threadId) ?? Promise.resolve();
+}
 async function closeAll() {
   stopping = true;
   if (sweeper) clearInterval(sweeper);
@@ -894,16 +1584,16 @@ async function closeAll() {
 
 // src/discord/attachments.ts
 import { mkdirSync as mkdirSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import path6 from "node:path";
+import path7 from "node:path";
 var MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 function safeName(name) {
-  const base = path6.basename(name).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/^\.+/, "_");
+  const base = path7.basename(name).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/^\.+/, "_");
   return base.slice(-120) || "file";
 }
 async function saveAttachments(message, threadId) {
   const saved = /* @__PURE__ */ new Map();
   if (!message.attachments.size) return saved;
-  const dir = path6.join(INBOX_DIR, threadId);
+  const dir = path7.join(INBOX_DIR, threadId);
   mkdirSync2(dir, { recursive: true });
   for (const a of message.attachments.values()) {
     if (a.size > MAX_ATTACHMENT_BYTES) {
@@ -916,7 +1606,7 @@ async function saveAttachments(message, threadId) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length > MAX_ATTACHMENT_BYTES) throw new Error("too large");
-      const file = path6.join(dir, `${message.id}-${safeName(a.name)}`);
+      const file = path7.join(dir, `${message.id}-${safeName(a.name)}`);
       writeFileSync2(file, buf);
       saved.set(a.id, { path: file });
       log("attach", `${message.id} saved ${a.name} bytes=${buf.length} -> ${file}`);
@@ -1008,7 +1698,7 @@ async function recent(thread, trigger, limit, afterId) {
   if (limit <= 0) return [];
   const fetched = await thread.messages.fetch({ limit, before: trigger.id });
   const me = trigger.client.user.id;
-  return [...fetched.values()].filter((m) => !m.system).filter((m) => !afterId || BigInt(m.id) > BigInt(afterId) && m.author.id !== me).sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
+  return [...fetched.values()].filter((m) => !m.system).filter((m) => m.author.bot || !parseCommand(m.content)).filter((m) => !afterId || BigInt(m.id) > BigInt(afterId) && m.author.id !== me).sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
 }
 async function buildPrompt(opts) {
   const { thread, trigger } = opts;
@@ -1026,18 +1716,61 @@ async function buildPrompt(opts) {
   parts.push("\u3010\u672C\u5247\u8A0A\u606F\u3011", body(trigger, opts.attachments));
   return parts.join("\n");
 }
+function buildDmPrompt(trigger, attachments, roster = loadRosterFile()) {
+  return [`\u3010\u767C\u8A71\u8005\u3011${speaker(trigger, roster)}\uFF08\u4F60\u7684\u4E3B\u4EBA\uFF09`, "\u3010\u4F4D\u7F6E\u3011Discord \u79C1\u8A0A\uFF08\u4F60\u548C\u4E3B\u4EBA\u4E00\u5C0D\u4E00\uFF09", "\u3010\u672C\u5247\u8A0A\u606F\u3011", body(trigger, attachments)].join("\n");
+}
 
 // src/discord/prompts.ts
 import {
-  ActionRowBuilder as ActionRowBuilder2,
+  ActionRowBuilder as ActionRowBuilder3,
   ButtonBuilder as ButtonBuilder2,
   ButtonStyle as ButtonStyle2,
-  MessageFlags as MessageFlags2,
-  ModalBuilder,
+  MessageFlags as MessageFlags3,
+  ModalBuilder as ModalBuilder2,
   StringSelectMenuBuilder,
-  TextInputBuilder,
-  TextInputStyle
+  TextInputBuilder as TextInputBuilder2,
+  TextInputStyle as TextInputStyle2
 } from "discord.js";
+
+// src/discord/pin-ui.ts
+import { ActionRowBuilder as ActionRowBuilder2, MessageFlags as MessageFlags2, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
+var LOCK_NOTICE = `\u{1F512} PIN \u9023\u7E8C\u8F38\u932F ${MAX_FAILURES} \u6B21\uFF0C\u5DF2\u9396\u5B9A\uFF1A\u6838\u51C6\u6B0A\u9650\u548C\u79C1\u8A0A\u90FD\u66AB\u505C\u3002\u8ACB\u5728\u96FB\u8166\u4E0A\u57F7\u884C channelcollab \u7684 unlock\uFF08\u6216\u91CD\u555F Bot\uFF09\u89E3\u9664\u3002`;
+var LOCKED_REPLY = "\u{1F512} \u5DF2\u9396\u5B9A\uFF08PIN \u8F38\u932F\u592A\u591A\u6B21\uFF09\u3002\u8ACB\u5728\u96FB\u8166\u4E0A\u57F7\u884C unlock \u6216\u91CD\u555F Bot \u89E3\u9664\u3002";
+function pinModal(customId, title) {
+  return new ModalBuilder().setCustomId(customId).setTitle(title.slice(0, 45)).addComponents(
+    new ActionRowBuilder2().addComponents(
+      new TextInputBuilder().setCustomId("pin").setLabel("PIN\uFF08\u8F38\u5165\u6846\u4E0D\u6703\u906E\u4F4F\uFF0C\u6CE8\u610F\u65C1\u4EBA\uFF09").setStyle(TextInputStyle.Short).setRequired(true).setMinLength(4).setMaxLength(32)
+    )
+  );
+}
+var unlockMinutes = () => Math.round((pinGate.state().unlockedUntil - Date.now()) / 6e4);
+async function checkPin(i, announce) {
+  const r = pinGate.attempt(i.fields.getTextInputValue("pin"));
+  if (r.result === "ok") {
+    log("pin", `correct PIN from ${i.user.username}; no PIN needed for ${unlockMinutes()} min`);
+    return true;
+  }
+  if (r.result === "not-set") {
+    log("pin", `no PIN set any more; ${i.user.username} passes`);
+    return true;
+  }
+  if (r.result === "wrong") {
+    log("pin", `wrong PIN from ${i.user.username} (${r.left} tries left)`);
+    await i.reply({ content: `\u274C PIN \u4E0D\u5C0D\uFF0C\u9084\u53EF\u4EE5\u518D\u8A66 ${r.left} \u6B21\uFF08\u9023\u7E8C\u932F ${MAX_FAILURES} \u6B21\u6703\u9396\u5B9A\uFF09\u3002`, flags: MessageFlags2.Ephemeral });
+    return false;
+  }
+  log("pin", r.justLocked ? `wrong PIN from ${i.user.username}; locked after ${MAX_FAILURES} wrong PINs` : `attempt by ${i.user.username} while locked`);
+  await i.reply({ content: r.justLocked ? LOCK_NOTICE : LOCKED_REPLY, flags: MessageFlags2.Ephemeral });
+  if (r.justLocked) await announce?.(LOCK_NOTICE)?.catch((e) => log("pin", `lock notice failed: ${e.message}`));
+  return false;
+}
+async function pinOkFollowUp(i) {
+  const min = unlockMinutes();
+  await i.followUp({ content: `\u{1F513} PIN \u6B63\u78BA${min > 0 ? `\uFF0C\u63A5\u4E0B\u4F86\u7D04 ${min} \u5206\u9418\u5167\u6838\u51C6\u548C\u79C1\u8A0A\u4E0D\u7528\u518D\u8F38\u5165` : ""}\u3002`, flags: MessageFlags2.Ephemeral }).catch(() => {
+  });
+}
+
+// src/discord/prompts.ts
 var OTHER = "__other";
 var OTHER_LABEL = "\u5176\u4ED6\u2026\uFF08\u81EA\u884C\u8F38\u5165\uFF09";
 var MAX_CONTENT = 1900;
@@ -1056,7 +1789,7 @@ function clipLines(s, maxLines, maxChars) {
   return clip(head, maxChars) + more;
 }
 function summarizeTool(name, input) {
-  const str = (k) => typeof input[k] === "string" ? input[k] : "";
+  const str = (k2) => typeof input[k2] === "string" ? input[k2] : "";
   if (name === "Bash" || name === "PowerShell") {
     const desc = str("description");
     return `${desc ? `${clip(desc, 200)}
@@ -1079,7 +1812,7 @@ ${fence(clipLines(content, 10, 600))}`;
   return fence(brief(input, 600));
 }
 function rows(...builders) {
-  return builders.map((b) => new ActionRowBuilder2().addComponents(...b));
+  return builders.map((b) => new ActionRowBuilder3().addComponents(...b));
 }
 async function edit(p, extra, keepComponents = false) {
   const content = clip(`${p.base}
@@ -1088,8 +1821,8 @@ ${extra}`, MAX_CONTENT);
 }
 function settleOnce(id, entry, timeoutMs, signal, onTimeout, onAbort) {
   pending2.set(id, entry);
-  let finish;
-  const result = new Promise((r) => finish = r);
+  let finish2;
+  const result = new Promise((r) => finish2 = r);
   let settled = false;
   const timer = setTimeout(() => settle(onTimeout()), timeoutMs);
   const abort = () => settle(onAbort());
@@ -1100,7 +1833,7 @@ function settleOnce(id, entry, timeoutMs, signal, onTimeout, onAbort) {
     clearTimeout(timer);
     signal.removeEventListener("abort", abort);
     pending2.delete(id);
-    finish(v);
+    finish2(v);
   }
   if (signal.aborted) abort();
   return { result, settle };
@@ -1115,7 +1848,7 @@ async function askPermission(thread, req, who, timeoutMs) {
   const blocked = req.blockedReason?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "").trim();
   const why = req.blockedReason !== void 0 ? `
 \u{1F916} \u81EA\u52D5\u6A21\u5F0F\u64CB\u4E0B\u4E86\u9019\u500B\u52D5\u4F5C${blocked ? `\uFF0C\u539F\u56E0\uFF1A${clip(blocked, 300)}` : ""}\u3002\u6309\u300C\u5141\u8A31\u300D\u5C31\u6703\u7167\u539F\u6A23\u57F7\u884C\u3002` : "";
-  const base = `\u{1F510} **\u6B0A\u9650\u8ACB\u6C42** \`${req.toolName}\`\u3000<@${who.ownerId}> \u8ACB\u78BA\u8A8D\uFF08${minutes(timeoutMs)}\u5167\u6C92\u6709\u56DE\u61C9\u6703\u81EA\u52D5\u62D2\u7D55\uFF09${why}
+  const base = `\u{1F510} **\u6B0A\u9650\u8ACB\u6C42** \`${req.toolName}\`\u3000<@${who.ownerId}> \u8ACB\u78BA\u8A8D\uFF08${minutes(timeoutMs)}\u5167\u6C92\u6709\u56DE\u61C9\u6703\u5148\u8DF3\u904E\uFF0C\u6392\u5165\u5F85\u6838\u51C6\u6E05\u55AE\uFF0C\u4E4B\u5F8C\u9084\u53EF\u4EE5\u6838\u51C6\uFF09${pinGate.required ? "\u3000\u6309\u300C\u5141\u8A31\u300D\u8981\u8F38\u5165 PIN" : ""}${why}
 ${summarizeTool(req.toolName, req.input)}`;
   const p = { kind: "permission", who, base: clip(base, MAX_CONTENT - 200), toolName: req.toolName, done: () => {
   } };
@@ -1124,7 +1857,7 @@ ${summarizeTool(req.toolName, req.input)}`;
     p,
     timeoutMs,
     req.signal,
-    () => ({ a: { behavior: "deny", message: `\u7B49\u5F85\u4E3B\u4EBA\u6838\u51C6\u903E\u6642\uFF08${minutes(timeoutMs)}\uFF09\uFF0C\u5DF2\u81EA\u52D5\u62D2\u7D55\u3002` }, note: `\u231B \u903E\u6642\uFF08${minutes(timeoutMs)}\uFF09\uFF0C\u5DF2\u81EA\u52D5\u62D2\u7D55` }),
+    () => ({ a: { behavior: "deny", message: DEFER_MESSAGE, deferred: true }, note: `\u231B \u4E3B\u4EBA ${minutes(timeoutMs)}\u5167\u6C92\u6709\u56DE\u61C9\uFF0C\u5DF2\u6392\u5165\u5F85\u6838\u51C6\u6E05\u55AE` }),
     () => ({ a: { behavior: "deny", message: "\u9019\u4E00\u8F2A\u5DF2\u505C\u6B62\uFF0C\u8ACB\u6C42\u5DF2\u53D6\u6D88\u3002" }, note: "\u23F9\uFE0F \u9019\u4E00\u8F2A\u5DF2\u505C\u6B62\uFF0C\u8ACB\u6C42\u5DF2\u53D6\u6D88" })
   );
   p.done = (a2, note2) => s.settle({ a: a2, note: note2 });
@@ -1155,7 +1888,7 @@ ${opts}${answer}`;
 }
 function questionMenus(id, q) {
   return q.questions.map(
-    (x, i) => new ActionRowBuilder2().addComponents(
+    (x, i) => new ActionRowBuilder3().addComponents(
       new StringSelectMenuBuilder().setCustomId(`ask:${id}:${i}`).setPlaceholder(clip(q.answers[i] !== void 0 ? `\u5DF2\u9078\uFF1A${q.answers[i]}` : `${x.header || `\u554F\u984C ${i + 1}`}\uFF1A\u8ACB\u9078\u64C7`, 150)).setMinValues(1).setMaxValues(x.multiSelect ? x.options.length + 1 : 1).addOptions(
         ...x.options.map((o, j) => ({ label: clip(o.label, 100), value: String(j), ...o.description ? { description: clip(o.description, 100) } : {} })),
         { label: OTHER_LABEL, value: OTHER }
@@ -1199,7 +1932,7 @@ ${questionText(q)}`, MAX_CONTENT);
   const by = `\u2705 \u7531 <@${i.user.id}> \u56DE\u7B54`;
   if (i.isStringSelectMenu() || i.isFromMessage()) await i.update({ content: complete ? `${content}
 ${by}` : content, components: complete ? [] : questionMenus(id, q), allowedMentions: { parse: [] } });
-  else await i.reply({ content: "\u5DF2\u8A18\u9304\u3002", flags: MessageFlags2.Ephemeral });
+  else await i.reply({ content: "\u5DF2\u8A18\u9304\u3002", flags: MessageFlags3.Ephemeral });
   if (complete) {
     const answers = Object.fromEntries(q.questions.map((x, j) => [x.question, q.answers[j]]));
     q.base = content;
@@ -1231,6 +1964,9 @@ function stopControl(thread, who, delayMs, stop) {
     }
   };
 }
+function allowNote(userId, action, toolName) {
+  return action === "always" ? `\u2705 <@${userId}> \u5DF2\u5141\u8A31\uFF0C\u9019\u500B session \u4E4B\u5F8C\u7684 \`${toolName}\` \u4E0D\u518D\u8A62\u554F` : `\u2705 <@${userId}> \u5DF2\u5141\u8A31`;
+}
 function denyText(kind, who) {
   if (kind === "permission") return "\u53EA\u6709 Bot \u64C1\u6709\u8005\u53EF\u4EE5\u6838\u51C6\u3002";
   const names = [who.requesterId, who.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
@@ -1239,19 +1975,19 @@ function denyText(kind, who) {
 async function lookup(i, id) {
   const p = pending2.get(id);
   if (!p) {
-    await i.reply({ content: "\u9019\u500B\u8ACB\u6C42\u5DF2\u7D93\u8655\u7406\u904E\uFF0C\u6216\u5DF2\u5931\u6548\uFF08\u4F8B\u5982 Bot \u91CD\u555F\u904E\uFF09\u3002", flags: MessageFlags2.Ephemeral });
+    await i.reply({ content: "\u9019\u500B\u8ACB\u6C42\u5DF2\u7D93\u8655\u7406\u904E\uFF0C\u6216\u5DF2\u5931\u6548\uFF08\u4F8B\u5982 Bot \u91CD\u555F\u904E\uFF09\u3002", flags: MessageFlags3.Ephemeral });
     return void 0;
   }
   if (!canAct(p.kind, i.user.id, p.who)) {
     log("prompt", `${p.kind} ${id} refused ${i.user.username} (${i.user.id})`);
-    await i.reply({ content: denyText(p.kind, p.who), flags: MessageFlags2.Ephemeral, allowedMentions: { parse: [] } });
+    await i.reply({ content: denyText(p.kind, p.who), flags: MessageFlags3.Ephemeral, allowedMentions: { parse: [] } });
     return void 0;
   }
   return p;
 }
 function isPromptInteraction(i) {
   if (!i.isButton() && !i.isStringSelectMenu() && !i.isModalSubmit()) return false;
-  return /^(perm|permdeny|ask|askother|stop):/.test(i.customId);
+  return /^(perm|permdeny|permpin|ask|askother|stop):/.test(i.customId);
 }
 async function handlePromptInteraction(i) {
   if (i.isButton() && i.customId.startsWith("perm:")) {
@@ -1261,18 +1997,44 @@ async function handlePromptInteraction(i) {
     log("prompt", `permission ${id} ${action} clicked by ${i.user.username}`);
     if (action === "deny") {
       await i.showModal(
-        new ModalBuilder().setCustomId(`permdeny:${id}`).setTitle(clip(`\u62D2\u7D55 ${p.toolName}`, 45)).addComponents(
-          new ActionRowBuilder2().addComponents(
-            new TextInputBuilder().setCustomId("reason").setLabel("\u62D2\u7D55\u7406\u7531\uFF08\u9078\u586B\uFF0C\u6703\u8F49\u544A Claude\uFF09").setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1e3)
+        new ModalBuilder2().setCustomId(`permdeny:${id}`).setTitle(clip(`\u62D2\u7D55 ${p.toolName}`, 45)).addComponents(
+          new ActionRowBuilder3().addComponents(
+            new TextInputBuilder2().setCustomId("reason").setLabel("\u62D2\u7D55\u7406\u7531\uFF08\u9078\u586B\uFF0C\u6703\u8F49\u544A Claude\uFF09").setStyle(TextInputStyle2.Paragraph).setRequired(false).setMaxLength(1e3)
           )
         )
       );
       return;
     }
-    const note = action === "always" ? `\u2705 <@${i.user.id}> \u5DF2\u5141\u8A31\uFF0C\u9019\u500B session \u4E4B\u5F8C\u7684 \`${p.toolName}\` \u4E0D\u518D\u8A62\u554F` : `\u2705 <@${i.user.id}> \u5DF2\u5141\u8A31`;
+    const step = approvalStep(true, pinGate);
+    if (step === "locked") {
+      await i.reply({ content: LOCKED_REPLY, flags: MessageFlags3.Ephemeral });
+      return;
+    }
+    if (step === "pin") {
+      await i.showModal(pinModal(`permpin:${id}:${action}`, `\u6838\u51C6 ${p.toolName}`));
+      return;
+    }
+    const note = allowNote(i.user.id, action, p.toolName);
     await i.update({ content: clip(`${p.base}
 ${note}`, MAX_CONTENT), components: [], allowedMentions: { parse: [] } });
     p.message = void 0;
+    p.done({ behavior: action === "always" ? "always" : "allow" }, note);
+    return;
+  }
+  if (i.isModalSubmit() && i.customId.startsWith("permpin:")) {
+    const [, id, action] = i.customId.split(":");
+    const p = await lookup(i, id);
+    if (!p || p.kind !== "permission") return;
+    const announce = (text) => i.channel?.isSendable() ? i.channel.send({ content: text, allowedMentions: { parse: [] } }) : Promise.resolve();
+    if (!await checkPin(i, announce)) return;
+    const note = allowNote(i.user.id, action, p.toolName);
+    if (i.isFromMessage()) {
+      await i.update({ content: clip(`${p.base}
+${note}`, MAX_CONTENT), components: [], allowedMentions: { parse: [] } });
+      p.message = void 0;
+    } else await i.deferUpdate();
+    await pinOkFollowUp(i);
+    log("prompt", `permission ${id} ${action} by ${i.user.username} after PIN`);
     p.done({ behavior: action === "always" ? "always" : "allow" }, note);
     return;
   }
@@ -1301,9 +2063,9 @@ ${note}`, MAX_CONTENT), components: [], allowedMentions: { parse: [] } });
     log("prompt", `question ${id} q${index} picked ${JSON.stringify(i.values)} by ${i.user.username}`);
     if (i.values.includes(OTHER)) {
       await i.showModal(
-        new ModalBuilder().setCustomId(`askother:${id}:${index}:${i.values.filter((v) => v !== OTHER).join(",")}`).setTitle(clip(x.header || "\u5176\u4ED6", 45)).addComponents(
-          new ActionRowBuilder2().addComponents(
-            new TextInputBuilder().setCustomId("answer").setLabel(clip(x.question, 45)).setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1e3)
+        new ModalBuilder2().setCustomId(`askother:${id}:${index}:${i.values.filter((v) => v !== OTHER).join(",")}`).setTitle(clip(x.header || "\u5176\u4ED6", 45)).addComponents(
+          new ActionRowBuilder3().addComponents(
+            new TextInputBuilder2().setCustomId("answer").setLabel(clip(x.question, 45)).setStyle(TextInputStyle2.Paragraph).setRequired(true).setMaxLength(1e3)
           )
         )
       );
@@ -1332,6 +2094,174 @@ ${note}`, MAX_CONTENT), components: [], allowedMentions: { parse: [] } });
     pending2.delete(id);
     await i.update({ content: `\u23F9\uFE0F <@${i.user.id}> \u6309\u4E86\u505C\u6B62\uFF0C\u6B63\u5728\u505C\u6B62\u2026`, components: [], allowedMentions: { parse: [] } });
     p.stop(i.user.displayName || i.user.username);
+  }
+}
+
+// src/discord/conversation.ts
+var FALLBACK_MAX = 500;
+var STOP_BUTTON_DELAY_MS = 5e3;
+function convState(c) {
+  return c.kind === "dm" ? getDm() : getConversation(c.key);
+}
+function effective(c, ts = convState(c)) {
+  const cwd = c.kind === "dm" ? ts.cwd ?? c.base.cwd : c.base.cwd;
+  return { ...c.base, cwd, model: ts.model ?? c.base.model, permissionMode: ts.plan ? "plan" : c.base.permissionMode, basePermissionMode: c.base.permissionMode };
+}
+var running = /* @__PURE__ */ new Map();
+async function convFor(client2, key) {
+  const config2 = loadConfig();
+  if (key === DM_KEY) {
+    const base2 = resolveDm(config2);
+    const owner = botOwner(config2.discord.owner_id, client2.user.id);
+    if (!base2 || !owner) return void 0;
+    const room2 = await (await client2.users.fetch(owner)).createDM();
+    return { key, kind: "dm", room: room2, base: base2, selfId: client2.user.id };
+  }
+  const ts = getThread(key);
+  const base = ts && resolveChannel(config2, ts.channelId);
+  const room = base ? await client2.channels.fetch(key).catch(() => null) : null;
+  if (!base || !room?.isThread()) return void 0;
+  return { key, kind: "thread", room, base, selfId: client2.user.id };
+}
+async function checkContext(c, session, ts) {
+  const u = await session.contextUsage().catch(() => void 0);
+  if (!u) return void 0;
+  ts.ctx = { pct: u.pct, ...u.tokens !== void 0 ? { tokens: u.tokens } : {}, ...u.max !== void 0 ? { max: u.max } : {}, at: (/* @__PURE__ */ new Date()).toISOString() };
+  const alert = contextAlert(u.pct, ts.ctxNotified ?? []);
+  ts.ctxNotified = alert.notified;
+  saveState();
+  log("context", `${c.key} ${u.pct}% (${u.tokens ?? "?"}/${u.max ?? "?"})${alert.notify ? ` notify ${alert.notify}%` : ""}`);
+  if (alert.notify) await c.room.send({ content: contextNotice(u.pct, c.kind), allowedMentions: { parse: [] } }).catch((e) => log("error", `context notice ${c.key}: ${e.message}`));
+  return u.pct;
+}
+async function runTurn(c, trigger, status, who, input = {}) {
+  const kind = input.kind ?? "normal";
+  const room = c.room;
+  let progress;
+  running.set(c.key, who);
+  try {
+    await status.set("running");
+    const ts = convState(c);
+    const channel = effective(c, ts);
+    let prompt = input.prompt;
+    if (prompt === void 0) {
+      const attachments = await saveAttachments(trigger, c.key);
+      prompt = c.kind === "dm" ? buildDmPrompt(trigger, attachments) : await buildPrompt({ thread: room, trigger, history: channel.history, afterId: ts.sessionId ? ts.lastSeenMessageId : void 0, attachments });
+      ts.lastPrompt = prompt;
+      const text = trigger.cleanContent.replace(/\s+/g, " ").trim().slice(0, 120);
+      if (text) {
+        ts.first ??= text;
+        ts.last = text;
+      }
+    }
+    if (ts.pendingNote && kind !== "compact") {
+      prompt = `${ts.pendingNote}
+
+${prompt}`;
+      ts.pendingNote = void 0;
+    }
+    const deferred = [];
+    const before = ts.ctx?.pct;
+    let lastReply;
+    let waits = 0;
+    const waiting = async (wait) => {
+      if (waits++ === 0) await status.set("waiting");
+      try {
+        return await wait();
+      } finally {
+        if (--waits === 0) await status.set("running");
+      }
+    };
+    const session = await acquire(c.key, c.selfId, channel, ts.sessionId, ts.resumeCostBase ?? ts.lastCostTotal, c.kind);
+    progress = stopControl(room, who, STOP_BUTTON_DELAY_MS, (by) => void session.interrupt(by));
+    const turn = await session.run(prompt, {
+      sendReply: async (text, files) => {
+        const chunks = splitReply(text, contextFooter(convState(c).ctx?.pct));
+        if (!chunks.length && files.length) chunks.push("");
+        for (const [i, chunk] of chunks.entries()) {
+          const attach = i === chunks.length - 1 ? files.map((f) => ({ attachment: f, name: path8.basename(f) })) : [];
+          lastReply = await room.send({ ...chunk ? { content: chunk } : {}, files: attach, allowedMentions: { parse: c.kind === "dm" ? [] : ["users"] } });
+        }
+      },
+      askPermission: (req) => waiting(async () => {
+        try {
+          const answer = await askPermission(room, req, who, channel.ownerWaitMs);
+          if (answer.behavior === "deny" && answer.deferred) deferred.push(deferItem(req.toolName, req.input));
+          if (answer.behavior === "always") {
+            ts.alwaysAllow = [.../* @__PURE__ */ new Set([...ts.alwaysAllow ?? [], req.toolName])];
+            saveState();
+          }
+          return answer;
+        } catch (e) {
+          log("error", `permission prompt ${c.key}: ${e.message}`);
+          return { behavior: "deny", message: `\u7121\u6CD5\u5728 Discord \u4E0A\u8A62\u554F\u4E3B\u4EBA\uFF08${e.message}\uFF09\uFF0C\u5DF2\u62D2\u7D55\u3002` };
+        }
+      }),
+      askQuestion: (questions, signal) => waiting(
+        () => askQuestion(room, questions, who, channel.permissionTimeoutMs, signal).catch((e) => {
+          log("error", `question prompt ${c.key}: ${e.message}`);
+          return void 0;
+        })
+      ),
+      notice: async (text) => {
+        await room.send({ content: text, allowedMentions: { parse: [] } });
+      }
+    }, { preapproved: input.preapproved });
+    const progressMessage = await progress.end();
+    if (deferred.length && who.ownerId) {
+      await sendApprovalBatch(c, deferred, who).catch((e) => log("error", `approval card ${c.key}: ${e.stack ?? e}`));
+    }
+    if (turn.sessionId) ts.sessionId = turn.sessionId;
+    ts.lastCostTotal = turn.costTotal;
+    if (kind === "normal") ts.lastSeenMessageId = trigger.id;
+    ts.lastAt = (/* @__PURE__ */ new Date()).toISOString();
+    saveState();
+    const notice = async (content) => progressMessage ? await progressMessage.edit({ content, components: [], allowedMentions: { parse: [] } }) : await room.send({ content, allowedMentions: { parse: [] } });
+    if (turn.stoppedBy) {
+      log("stopped", `${c.key} by ${turn.stoppedBy} subtype=${turn.subtype}`);
+      const msg = await notice(`\u23F9\uFE0F \u5DF2\u7531 ${turn.stoppedBy} \u505C\u6B62\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u9019\u6BB5\u5C0D\u8A71\u3002`);
+      await attachDetails(msg, rememberTurn(c.key, turn));
+      await status.set("stopped");
+      await checkContext(c, session, ts);
+      return;
+    }
+    if (kind === "compact") {
+      const after = turn.ok ? await checkContext(c, session, ts) : void 0;
+      const text = turn.ok ? `\u{1F5DC}\uFE0F \u5DF2\u58D3\u7E2E\u4E0A\u4E0B\u6587${before !== void 0 && after !== void 0 ? `\uFF1A${before}% \u2192 ${after}%` : after !== void 0 ? `\uFF0C\u73FE\u5728 ${after}%` : ""}\u3002` : explainFailure({ subtype: turn.subtype, error: turn.error, apiError: turn.apiError }, "\u9019\u6BB5\u5C0D\u8A71\u6C92\u6709\u88AB\u58D3\u7E2E\u3002");
+      log(turn.ok ? "compact" : "fallback", `${c.key} ${brief(text, 200)}`);
+      await attachDetails(await notice(text), rememberTurn(c.key, turn));
+      await status.set(turn.ok ? "done" : "failed");
+      return;
+    }
+    if (turn.ok && turn.replies === 0 && trigger.author.bot) {
+      log("silent", `${c.key} no reply to bot ${trigger.author.username} ${brief(turn.lastText, 200)}`);
+      await progressMessage?.delete().catch(() => {
+      });
+      await status.set("done");
+      await checkContext(c, session, ts);
+      return;
+    }
+    if (!turn.ok || turn.replies === 0 || !lastReply) {
+      const text = turn.ok ? `\uFF08\u6C92\u6709\u547C\u53EB reply\uFF0C\u4EE5\u4E0B\u70BA\u81EA\u52D5\u6458\u8981\uFF09
+${turn.lastText.trim().slice(0, FALLBACK_MAX) || "\uFF08\u6C92\u6709\u8F38\u51FA\uFF09"}` : explainFailure({ subtype: turn.subtype, error: turn.error, apiError: turn.apiError }, c.kind === "dm" ? "\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u9019\u6BB5\u5C0D\u8A71\u3002" : "\u4E0B\u6B21\u89F8\u767C\u6642\u6703\u63A5\u56DE\u9019\u6BB5\u5C0D\u8A71\u3002");
+      log("fallback", `${c.key} ${brief(text, 200)}`);
+      lastReply = await notice(text);
+    } else {
+      await progressMessage?.delete().catch(() => {
+      });
+    }
+    await attachDetails(lastReply, rememberTurn(c.key, turn));
+    await status.set(turn.ok ? "done" : "failed");
+    await checkContext(c, session, ts);
+  } catch (e) {
+    log("error", `run ${c.key}: ${e.stack ?? e}`);
+    await (await progress?.end())?.delete().catch(() => {
+    });
+    await room.send({ content: explainFailure({ subtype: "error", error: e.message }), allowedMentions: { parse: [] } }).catch(() => {
+    });
+    await status.set("failed");
+  } finally {
+    if (running.get(c.key) === who) running.delete(c.key);
   }
 }
 
@@ -1368,28 +2298,422 @@ var StatusReactions = class {
   }
 };
 
-// src/discord/bot.ts
-var DISCORD_LIMIT = 2e3;
-var FALLBACK_MAX = 500;
-var STOP_BUTTON_DELAY_MS = 5e3;
-function splitMessage(text) {
-  const out = [];
-  let rest = text;
-  while (rest.length > DISCORD_LIMIT) {
-    let cut = rest.lastIndexOf("\n", DISCORD_LIMIT);
-    if (cut < DISCORD_LIMIT / 2) cut = DISCORD_LIMIT;
-    out.push(rest.slice(0, cut));
-    rest = rest.slice(cut).replace(/^\n/, "");
-  }
-  if (rest.trim()) out.push(rest);
-  return out;
+// src/discord/approvals-ui.ts
+var MAX_CONTENT2 = 1900;
+var clip2 = (s, n) => s.length > n ? `${s.slice(0, n - 1)}\u2026` : s;
+var newId2 = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+function cardText(b) {
+  const where = b.kind === "dm" ? "\u79C1\u8A0A" : `\u8A0E\u8AD6\u4E32 <#${b.convKey}>`;
+  const who = b.requesterId ? `<@${b.requesterId}>` : "\u5176\u4ED6 Bot";
+  const each = Math.max(200, Math.floor(1300 / b.items.length));
+  const items = b.items.map((x, i) => `**${i + 1}. \`${x.toolName}\`**
+${clip2(summarizeTool(x.toolName, x.input), each)}`);
+  const pin = pinGate.configured ? "\u6309\u300C\u5141\u8A31\u300D\u8981\u8F38\u5165 PIN\u3002" : "";
+  return clip2(`\u23F3 **\u5F85\u6838\u51C6**\uFF08${where}\uFF0C\u9700\u6C42\u4F86\u81EA ${who}\uFF09
+Claude \u505A\u5230\u4E00\u534A\uFF0C\u4E0B\u9762\u7684\u52D5\u4F5C\u8981\u4F60\u6838\u51C6\uFF1B\u6838\u51C6\u5F8C Bot \u6703\u63A5\u8457\u505A\u3002
+
+${items.join("\n")}
+
+\u6709\u6548\u5230 ${shortTime(b.expiresAt)}\u3002${pin}`, MAX_CONTENT2 - 200);
 }
+function cardButtons(b) {
+  const row = new ActionRowBuilder4().addComponents(new ButtonBuilder3().setCustomId(`appr:${b.id}:all`).setLabel("\u5168\u90E8\u5141\u8A31").setStyle(ButtonStyle3.Success));
+  if (b.items.length > 1) row.addComponents(new ButtonBuilder3().setCustomId(`appr:${b.id}:pick`).setLabel("\u9010\u9805\u9078\u64C7").setStyle(ButtonStyle3.Primary));
+  row.addComponents(new ButtonBuilder3().setCustomId(`appr:${b.id}:deny`).setLabel("\u5168\u90E8\u62D2\u7D55").setStyle(ButtonStyle3.Danger));
+  return [row];
+}
+async function sendApprovalBatch(c, items, who) {
+  const ownerId = who.ownerId;
+  const b = newBatch({ id: newId2(), convKey: c.key, kind: c.kind, requesterId: who.requesterId, items });
+  const payload = { content: cardText(b), components: cardButtons(b), allowedMentions: { parse: [] } };
+  const { where, sent } = await deliverCard(
+    {
+      // In a direct message conversation the card simply goes there.
+      dm: c.kind === "dm" ? void 0 : async () => (await c.room.client.users.fetch(ownerId)).send(payload),
+      thread: () => c.room.send(payload)
+    },
+    (e) => log("approval", `${b.id} direct message to the owner failed (${e.message}); card goes to the thread`)
+  );
+  b.card = { channelId: sent.channelId, messageId: sent.id, where: c.kind === "dm" ? "dm" : where };
+  if (c.kind === "thread") {
+    const n = await c.room.send({ content: noticeText(b, ownerId, where), allowedMentions: { users: [ownerId] } });
+    b.notice = { channelId: n.channelId, messageId: n.id };
+  }
+  putBatch(b);
+  log("approval", `${b.id} ${c.key} ${b.items.length} deferred call(s) [${b.items.map((x) => x.toolName).join(", ")}] card=${b.card.where}`);
+  return b;
+}
+async function fetchStored(client2, ref) {
+  if (!ref) return void 0;
+  const ch = await client2.channels.fetch(ref.channelId).catch(() => null);
+  if (!ch?.isTextBased()) return void 0;
+  return await ch.messages.fetch(ref.messageId).catch(() => void 0) ?? void 0;
+}
+async function refresh(client2, b, outcome, skipCard = false) {
+  const ownerId = botOwner(loadConfig().discord.owner_id, client2.user.id) ?? "";
+  if (!skipCard) await (await fetchStored(client2, b.card))?.edit({ content: clip2(`${cardText(b)}
+${outcome}`, MAX_CONTENT2), components: [], allowedMentions: { parse: [] } }).catch(() => {
+  });
+  await (await fetchStored(client2, b.notice))?.edit({ content: noticeText(b, ownerId, b.card?.where ?? "thread"), allowedMentions: { parse: [] } }).catch(() => {
+  });
+}
+async function continueAfter(client2, b, allow, deny) {
+  const c = await convFor(client2, b.convKey);
+  if (!c) {
+    log("approval", `${b.id} conversation ${b.convKey} is no longer available`);
+    return;
+  }
+  if (!allow.length) {
+    convState(c).pendingNote = deniedNote(deny);
+    saveState();
+    return;
+  }
+  const trigger = await fetchStored(client2, b.notice ?? b.card) ?? await c.room.send({ content: "\u25B6\uFE0F \u63A5\u8457\u505A\u4E3B\u4EBA\u6838\u51C6\u7684\u52D5\u4F5C\u3002", allowedMentions: { parse: [] } });
+  const ownerId = botOwner(loadConfig().discord.owner_id, client2.user.id);
+  const who = { ownerId, requesterId: b.requesterId };
+  const status = new StatusReactions(trigger);
+  await status.set("received");
+  log("approval", `${b.id} continue ${b.convKey} with ${allow.length} approved call(s)`);
+  enqueue(c.key, () => runTurn(c, trigger, status, who, { prompt: approvedPrompt(allow, deny), kind: "approved", preapproved: deferredKeys(allow) }));
+}
+async function finish(i, b, choice, viaPin) {
+  const d = decide2(b, choice);
+  putBatch(b);
+  const by = i.user.displayName || i.user.username;
+  const outcome = outcomeText(d, by);
+  log("approval", `${b.id} ${d.result === "decided" ? d.status : d.result} by ${i.user.username}${viaPin ? " after PIN" : ""}`);
+  const onCard = i.message?.id === b.card?.messageId;
+  if (onCard && (i.isButton() || i.isModalSubmit() && i.isFromMessage())) {
+    await i.update({ content: clip2(`${cardText(b)}
+${outcome}`, MAX_CONTENT2), components: [], allowedMentions: { parse: [] } });
+  } else if (i.isStringSelectMenu() || i.isModalSubmit() && i.isFromMessage()) {
+    await i.update({ content: outcome, components: [] });
+  } else {
+    await i.reply({ content: outcome, flags: MessageFlags4.Ephemeral });
+  }
+  if (viaPin && i.isModalSubmit()) await pinOkFollowUp(i);
+  await refresh(i.client, b, outcome, onCard);
+  if (d.result === "decided") await continueAfter(i.client, b, d.allow, d.deny);
+}
+function isApprovalInteraction(i) {
+  if (!i.isButton() && !i.isStringSelectMenu() && !i.isModalSubmit()) return false;
+  return /^(appr|apprpick|apprpin):/.test(i.customId);
+}
+var parseChoice = (s) => s === "all" ? "all" : s === "none" ? "none" : s.split(".").map(Number);
+async function handleApprovalInteraction(i) {
+  if (!i.isButton() && !i.isStringSelectMenu() && !i.isModalSubmit()) return;
+  const [kind, id, arg] = i.customId.split(":");
+  const b = getBatch(id);
+  if (!b) {
+    await i.reply({ content: "\u627E\u4E0D\u5230\u9019\u4EFD\u5F85\u6838\u51C6\u6E05\u55AE\uFF08\u53EF\u80FD\u5DF2\u7D93\u904E\u671F\u5F88\u4E45\uFF09\u3002", flags: MessageFlags4.Ephemeral });
+    return;
+  }
+  const ownerId = botOwner(loadConfig().discord.owner_id, i.client.user.id);
+  if (!canAct("permission", i.user.id, { ownerId })) {
+    log("approval", `${id} refused ${i.user.username} (${i.user.id})`);
+    await i.reply({ content: "\u53EA\u6709 Bot \u64C1\u6709\u8005\u53EF\u4EE5\u6838\u51C6\u3002", flags: MessageFlags4.Ephemeral });
+    return;
+  }
+  if (b.status !== "pending" || Date.now() >= b.expiresAt) {
+    const d = decide2(b, "none");
+    putBatch(b);
+    if (d.result === "expired") await refresh(i.client, b, outcomeText(d, ""));
+    await i.reply({ content: outcomeText(d, ""), flags: MessageFlags4.Ephemeral });
+    return;
+  }
+  if (i.isButton() && kind === "appr") {
+    if (arg === "deny") return finish(i, b, "none", false);
+    if (arg === "pick") {
+      await i.reply({
+        content: "\u9078\u8981\u5141\u8A31\u7684\u52D5\u4F5C\uFF08\u6C92\u9078\u7684\u6703\u62D2\u7D55\uFF09\uFF1A",
+        flags: MessageFlags4.Ephemeral,
+        components: [
+          new ActionRowBuilder4().addComponents(
+            new StringSelectMenuBuilder2().setCustomId(`apprpick:${b.id}`).setMinValues(1).setMaxValues(b.items.length).setPlaceholder("\u9078\u64C7\u8981\u5141\u8A31\u7684\u52D5\u4F5C").addOptions(b.items.map((x, n) => ({ label: clip2(`${n + 1}. ${x.toolName}`, 100), value: String(n), description: clip2(JSON.stringify(x.input), 100) })))
+          )
+        ]
+      });
+      return;
+    }
+    return approve(i, b, "all");
+  }
+  if (i.isStringSelectMenu() && kind === "apprpick") return approve(i, b, i.values.map(Number));
+  if (i.isModalSubmit() && kind === "apprpin") {
+    const announce = (text) => i.channel?.isSendable() ? i.channel.send({ content: text, allowedMentions: { parse: [] } }) : Promise.resolve();
+    if (!await checkPin(i, announce)) return;
+    return finish(i, b, parseChoice(arg), true);
+  }
+}
+async function approve(i, b, choice) {
+  const step = approvalStep(true, pinGate);
+  if (step === "locked") {
+    await i.reply({ content: LOCKED_REPLY, flags: MessageFlags4.Ephemeral });
+    return;
+  }
+  if (step === "pin") {
+    const arg = choice === "all" || choice === "none" ? choice : choice.join(".");
+    await i.showModal(pinModal(`apprpin:${b.id}:${arg}`, "\u6838\u51C6\u5F85\u6838\u51C6\u7684\u52D5\u4F5C"));
+    return;
+  }
+  return finish(i, b, choice, false);
+}
+
+// src/discord/command-run.ts
+import { forkSession } from "@anthropic-ai/claude-agent-sdk";
+import {
+  ActionRowBuilder as ActionRowBuilder5,
+  ButtonBuilder as ButtonBuilder4,
+  ButtonStyle as ButtonStyle4,
+  MessageFlags as MessageFlags5,
+  StringSelectMenuBuilder as StringSelectMenuBuilder3
+} from "discord.js";
+var MODE_NAMES = {
+  default: "\u4E00\u822C\uFF08\u6539\u6A94\u3001\u57F7\u884C\u6307\u4EE4\u8981\u4E3B\u4EBA\u6838\u51C6\uFF09",
+  acceptEdits: "\u81EA\u52D5\u6539\u6A94\uFF08\u57F7\u884C\u6307\u4EE4\u8981\u4E3B\u4EBA\u6838\u51C6\uFF09",
+  plan: "\u8A08\u756B\u6A21\u5F0F\uFF08\u53EA\u8A0E\u8AD6\u4E0D\u52D5\u624B\uFF09",
+  dontAsk: "\u4E0D\u8A62\u554F\uFF08\u6539\u6A94\u3001\u57F7\u884C\u6307\u4EE4\u4E00\u5F8B\u62D2\u7D55\uFF09",
+  auto: "\u81EA\u52D5\uFF08Claude Code \u81EA\u52D5\u5224\u65B7\uFF0C\u64CB\u4E0B\u7684\u624D\u554F\u4E3B\u4EBA\uFF09"
+};
+var modeName = (m) => MODE_NAMES[m] ?? m;
+var k = (n) => n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n);
+var menus = /* @__PURE__ */ new Map();
+var seq3 = 0;
+function remember(conv, who, candidates) {
+  const now = Date.now();
+  for (const [id2, m] of menus) if (now - m.at > 15 * 60 * 1e3) menus.delete(id2);
+  const id = `${now.toString(36)}${(++seq3).toString(36)}`;
+  menus.set(id, { conv, who, candidates, at: now });
+  return id;
+}
+var say = (message, content) => message.reply({ content, allowedMentions: { parse: [] } });
+async function applyModel(c, model) {
+  const ts = convState(c);
+  ts.model = model;
+  saveState();
+  const s = liveSession(c.key);
+  if (s?.usable) {
+    try {
+      await s.setModel(model);
+    } catch (e) {
+      log("command", `${c.key} setModel ${model} failed: ${e.message}`);
+      return `\u26A0\uFE0F \u5DF2\u8A18\u4E0B **${model}**\uFF0C\u4F46\u76EE\u524D\u7684 session \u5207\u63DB\u5931\u6557\uFF0C\u4E0B\u4E00\u6BB5\u5C0D\u8A71\u958B\u59CB\u751F\u6548\u3002`;
+    }
+  }
+  log("command", `${c.key} model -> ${model}${s?.usable ? " (live)" : ""}`);
+  return `\u{1F501} \u6A21\u578B\u5DF2\u5207\u63DB\u70BA **${model}**\uFF0C\u63A5\u4E0B\u4F86\u7684\u56DE\u61C9\u5C31\u7528\u5B83\u3002`;
+}
+async function statusText(c) {
+  const ts = convState(c);
+  const ch = effective(c, ts);
+  const s = liveSession(c.key);
+  const pin = pinGate.state();
+  const lines = [
+    `\u{1F4CA} **\u72C0\u614B**\uFF08${c.kind === "dm" ? "\u79C1\u8A0A" : "\u9019\u500B\u8A0E\u8AD6\u4E32"}\uFF09`,
+    `\u30FB\u5DE5\u4F5C\u76EE\u9304\uFF1A\`${s?.cwd ?? ch.cwd}\``,
+    `\u30FB\u6A21\u578B\uFF1A${ts.model ?? ch.model ?? "Claude Code \u9810\u8A2D"}${s?.model ? `\uFF08\u5BE6\u969B\uFF1A${s.model}\uFF09` : ""}`,
+    `\u30FB\u6B0A\u9650\u6A21\u5F0F\uFF1A${modeName(s?.mode ?? ch.permissionMode)}${ts.plan ? "\uFF0C\u7528 !plan \u53EF\u5207\u56DE" : ""}`,
+    `\u30FB\u5C0D\u8A71\uFF1A${s?.usable ? `session \u5DF2\u958B ${duration(Date.now() - s.startedAt)}${s.busy ? "\uFF0C\u6B63\u5728\u5DE5\u4F5C" : "\uFF0C\u9592\u7F6E\u4E2D"}` : ts.sessionId ? "\u5DF2\u66AB\u505C\uFF08\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u56DE\uFF09" : "\u9084\u6C92\u6709\u5C0D\u8A71"}`,
+    ...c.kind === "dm" && ts.source ? [`\u30FB\u4F86\u6E90\uFF1A${ts.source}`] : [],
+    `\u30FB\u672C\u6BB5\u5C0D\u8A71\u82B1\u8CBB\uFF1A\u7D04 $${ts.lastCostTotal.toFixed(2)}`,
+    `\u30FB\u4E0A\u4E0B\u6587\uFF1A${ts.ctx ? `${ts.ctx.pct}%${ts.ctx.tokens && ts.ctx.max ? `\uFF08${k(ts.ctx.tokens)} / ${k(ts.ctx.max)} tokens\uFF09` : ""}` : "\u672A\u77E5\uFF08\u8DD1\u904E\u4E00\u8F2A\u5F8C\u624D\u77E5\u9053\uFF09"}`,
+    `\u30FB\u984D\u5EA6\uFF1A${rateSummary(latestRateLimit())}`,
+    `\u30FBPIN\uFF1A${!pin.configured ? "\u672A\u8A2D\u5B9A" : pin.locked ? "\u{1F512} \u5DF2\u9396\u5B9A" : pin.unlockedUntil ? `\u514D\u8F38\u5165\u5230 ${shortTime(pin.unlockedUntil)}` : "\u6838\u51C6\u6642\u8981\u8F38\u5165"}`
+  ];
+  return lines.join("\n");
+}
+async function queueTurn(c, message, who, prompt, kind) {
+  const status = new StatusReactions(message);
+  await status.set("received");
+  const { queued } = enqueue(c.key, () => runTurn(c, message, status, who, { prompt, kind }));
+  if (queued) await status.set("waiting");
+}
+function resumeCandidates() {
+  const config2 = loadConfig();
+  const dmCwd = resolveDm(config2)?.cwd ?? "";
+  const out = [];
+  for (const d of dmHistory()) {
+    if (!d.sessionId) continue;
+    out.push({ kind: "dm", id: d.sessionId, sessionId: d.sessionId, cwd: d.cwd ?? dmCwd, at: d.lastAt ?? d.createdAt, source: d.source ?? "\u79C1\u8A0A", summary: d.last ?? d.first ?? d.source ?? "" });
+  }
+  for (const [id, t] of allThreads()) {
+    const cwd = config2.channels[t.channelId]?.cwd;
+    if (!t.sessionId || !cwd) continue;
+    out.push({ kind: "thread", id, sessionId: t.sessionId, cwd, at: t.lastAt ?? t.createdAt, source: t.name ?? `\u8A0E\u8AD6\u4E32 ${id}`, summary: t.last ?? t.first ?? t.name ?? "" });
+  }
+  return resumeList(out);
+}
+async function runCommand(cmd, c, message, who) {
+  const ts = convState(c);
+  log("command", `${c.key} !${cmd.name}${cmd.arg ? ` ${cmd.arg}` : ""} by ${message.author.username}`);
+  switch (cmd.name) {
+    case "help":
+      await say(message, helpText(c.kind));
+      return;
+    case "status":
+      await say(message, await statusText(c));
+      return;
+    case "stop": {
+      const s = liveSession(c.key);
+      if (s?.busy && await s.interrupt(message.author.displayName || message.author.username)) await message.react("\u23F9\uFE0F").catch(() => {
+      });
+      else await say(message, "\u76EE\u524D\u6C92\u6709\u5728\u57F7\u884C\u7684\u5DE5\u4F5C\u3002");
+      return;
+    }
+    case "model": {
+      if (cmd.arg) {
+        const model = normalizeModel(cmd.arg);
+        await say(message, model ? await applyModel(c, model) : `\u4E0D\u8A8D\u5F97\u300C${cmd.arg}\u300D\u3002\u53EF\u4EE5\u7528 haiku\u3001sonnet\u3001opus\u3002`);
+        return;
+      }
+      const id = remember(c, who);
+      const current = ts.model ?? effective(c, ts).model ?? "Claude Code \u9810\u8A2D";
+      await message.reply({
+        content: `\u76EE\u524D\u7684\u6A21\u578B\uFF1A**${current}**\u3002\u8981\u63DB\u6210\u54EA\u4E00\u500B\uFF1F`,
+        components: [
+          new ActionRowBuilder5().addComponents(
+            ...MODEL_CHOICES.map((m) => new ButtonBuilder4().setCustomId(`ccmd:model:${id}:${m.alias}`).setLabel(`${m.label}\uFF08${m.note}\uFF09`).setStyle(m.alias === current ? ButtonStyle4.Primary : ButtonStyle4.Secondary))
+          )
+        ],
+        allowedMentions: { parse: [] }
+      });
+      return;
+    }
+    case "plan": {
+      const next = !ts.plan;
+      const mode = next ? "plan" : c.base.permissionMode;
+      const s = liveSession(c.key);
+      if (s?.usable) {
+        try {
+          await s.setMode(mode);
+        } catch (e) {
+          log("command", `${c.key} setMode ${mode} failed: ${e.message}`);
+          await say(message, "\u26A0\uFE0F \u5207\u63DB\u5931\u6557\uFF0C\u6A21\u5F0F\u6C92\u6709\u6539\u8B8A\u3002");
+          return;
+        }
+      }
+      ts.plan = next || void 0;
+      saveState();
+      await say(message, next ? `\u{1F4DD} \u5DF2\u5207\u5230\u8A08\u756B\u6A21\u5F0F\uFF1AClaude \u53EA\u8A0E\u8AD6\u3001\u4E0D\u6539\u6A94\u4E5F\u4E0D\u57F7\u884C\u6307\u4EE4\u3002\u518D\u6253\u4E00\u6B21 !plan \u5207\u56DE\uFF08${modeName(c.base.permissionMode)}\uFF09\u3002` : `\u25B6\uFE0F \u5DF2\u5207\u56DE${modeName(mode)}\uFF0CClaude \u53EF\u4EE5\u52D5\u624B\u4E86\u3002`);
+      return;
+    }
+    case "compact":
+      if (!ts.sessionId) return void await say(message, "\u9084\u6C92\u6709\u5C0D\u8A71\uFF0C\u4E0D\u9700\u8981\u58D3\u7E2E\u3002");
+      await queueTurn(c, message, who, "/compact", "compact");
+      return;
+    case "retry":
+      if (!ts.lastPrompt) return void await say(message, "\u6C92\u6709\u53EF\u4EE5\u91CD\u9001\u7684\u8A0A\u606F\u3002");
+      await queueTurn(c, message, who, ts.lastPrompt, "retry");
+      return;
+    case "clear": {
+      if (liveSession(c.key)?.busy || isPending(c.key)) return void await say(message, "Claude \u9084\u5728\u8655\u7406\uFF0C\u5148\u6253 !stop \u505C\u4E0B\u4F86\uFF0C\u518D\u6253 !clear\u3002");
+      await release(c.key, "clear");
+      switchDm();
+      await say(message, "\u{1F195} \u5DF2\u7D50\u675F\u76EE\u524D\u7684\u5C0D\u8A71\uFF08\u4E4B\u5F8C\u53EF\u4EE5\u7528 !resume \u63A5\u56DE\uFF09\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u958B\u65B0\u7684\u5C0D\u8A71\u3002");
+      return;
+    }
+    case "resume": {
+      const list = resumeCandidates();
+      if (!list.length) return void await say(message, "\u9084\u6C92\u6709\u53EF\u4EE5\u63A5\u56DE\u7684\u5C0D\u8A71\u3002");
+      for (const cand of list) {
+        if (cand.kind !== "thread" || getThread(cand.id)?.name) continue;
+        const ch = await message.client.channels.fetch(cand.id).catch(() => null);
+        if (ch && "name" in ch && ch.name) {
+          cand.source = ch.name;
+          if (!cand.summary || cand.summary.startsWith("\u8A0E\u8AD6\u4E32 ")) cand.summary = ch.name;
+          getThread(cand.id).name = ch.name;
+        }
+      }
+      saveState();
+      const id = remember(c, who, list);
+      await message.reply({
+        content: "\u8981\u63A5\u56DE\u54EA\u4E00\u6BB5\u5C0D\u8A71\uFF1F\uFF08\u8A0E\u8AD6\u4E32\u7684\u5C0D\u8A71\u6703\u8907\u88FD\u4E00\u4EFD\u5206\u652F\u4F86\u63A5\uFF0C\u4E0D\u5F71\u97FF\u8A0E\u8AD6\u4E32\u672C\u8EAB\uFF09",
+        components: [
+          new ActionRowBuilder5().addComponents(
+            new StringSelectMenuBuilder3().setCustomId(`ccmd:resume:${id}`).setPlaceholder("\u9078\u4E00\u6BB5\u5C0D\u8A71").addOptions(list.map((cand, n) => ({ ...resumeOption(cand), value: String(n) })))
+          )
+        ],
+        allowedMentions: { parse: [] }
+      });
+      return;
+    }
+  }
+}
+function isCommandInteraction(i) {
+  return (i.isButton() || i.isStringSelectMenu()) && i.customId.startsWith("ccmd:");
+}
+async function handleCommandInteraction(i) {
+  if (!i.isButton() && !i.isStringSelectMenu()) return;
+  const [, what, id, arg] = i.customId.split(":");
+  const m = menus.get(id);
+  if (!m) {
+    await i.reply({ content: "\u9019\u500B\u9078\u55AE\u5DF2\u7D93\u5931\u6548\uFF08\u8D85\u904E 15 \u5206\u9418\u6216 Bot \u91CD\u555F\u904E\uFF09\uFF0C\u8ACB\u91CD\u6253\u4E00\u6B21\u6307\u4EE4\u3002", flags: MessageFlags5.Ephemeral });
+    return;
+  }
+  if (!canAct("stop", i.user.id, m.who)) {
+    await i.reply({ content: "\u53EA\u6709 Bot \u7684\u4E3B\u4EBA\u6216\u63D0\u51FA\u9700\u6C42\u7684\u4EBA\u53EF\u4EE5\u7528\u9019\u500B\u9078\u55AE\u3002", flags: MessageFlags5.Ephemeral });
+    return;
+  }
+  if (what === "model" && i.isButton()) {
+    menus.delete(id);
+    const text = await applyModel(m.conv, arg);
+    await i.update({ content: text, components: [] });
+    return;
+  }
+  if (what === "resume" && i.isStringSelectMenu()) {
+    const pick = m.candidates?.[Number(i.values[0])];
+    if (!pick) return;
+    if (liveSession(DM_KEY)?.busy || isPending(DM_KEY)) {
+      await i.reply({ content: "Claude \u9084\u5728\u8655\u7406\uFF0C\u5148\u6253 !stop \u505C\u4E0B\u4F86\u518D\u63A5\u56DE\u3002", flags: MessageFlags5.Ephemeral });
+      return;
+    }
+    menus.delete(id);
+    await i.update({ content: "\u23F3 \u63A5\u56DE\u4E2D\u2026", components: [] });
+    try {
+      const text = await resumeInto(i.client, pick);
+      await i.editReply({ content: text });
+    } catch (e) {
+      log("error", `resume ${pick.sessionId}: ${e.stack ?? e}`);
+      await i.editReply({ content: `\u274C \u63A5\u56DE\u5931\u6557\uFF1A${e.message.slice(0, 200)}` });
+    }
+  }
+}
+async function resumeInto(_client, pick) {
+  await release(DM_KEY, "resume");
+  if (pick.kind === "dm") {
+    const rec = dmHistory().find((h) => h.sessionId === pick.sessionId);
+    switchDm(rec);
+    log("command", `dm resumed ${pick.sessionId}`);
+    return `\u21A9\uFE0F \u5DF2\u63A5\u56DE ${shortTime(pick.at)} \u7684\u79C1\u8A0A\u5C0D\u8A71\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u804A\u3002`;
+  }
+  const t = getThread(pick.id);
+  const fork = await forkSession(pick.sessionId, { dir: pick.cwd });
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  switchDm({
+    channelId: DM_KEY,
+    sessionId: fork.sessionId,
+    cwd: pick.cwd,
+    source: `\u8A0E\u8AD6\u4E32\u300C${pick.source}\u300D\u7684\u5206\u652F`,
+    lastCostTotal: t?.lastCostTotal ?? 0,
+    resumeCostBase: t?.resumeCostBase ?? t?.lastCostTotal ?? 0,
+    createdAt: now,
+    lastAt: now,
+    first: `\uFF08\u63A5\u7E8C\u8A0E\u8AD6\u4E32\u300C${pick.source}\u300D\uFF09`,
+    ...t?.model ? { model: t.model } : {}
+  });
+  log("command", `dm forked thread ${pick.id} session ${pick.sessionId} -> ${fork.sessionId} cwd=${pick.cwd}`);
+  return `\u21A9\uFE0F \u5DF2\u5F9E\u8A0E\u8AD6\u4E32\u300C${pick.source}\u300D\u8907\u88FD\u4E00\u4EFD\u5C0D\u8A71\u63A5\u56DE\uFF08\u8A0E\u8AD6\u4E32\u672C\u8EAB\u4E0D\u53D7\u5F71\u97FF\uFF09\u3002\u5DE5\u4F5C\u76EE\u9304\uFF1A\`${pick.cwd}\`\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u804A\u3002`;
+}
+
+// src/discord/bot.ts
 function threadName(message) {
   const text = message.content.replace(/<@[!&]?\d+>/g, "").replace(/\s+/g, " ").trim();
   return (text || "Claude \u4EFB\u52D9").slice(0, 60);
 }
+function roleMentions(message) {
+  return [...message.mentions.roles.values()].map((r) => ({ id: r.id, botId: r.tags?.botId ?? null }));
+}
 function mentionsBot(message, exceptId) {
-  return message.mentions.users.some((u) => u.bot && u.id !== exceptId);
+  return message.mentions.users.some((u) => u.bot && u.id !== exceptId) || message.inGuild() && mentionsOtherBotRole(roleMentions(message), exceptId);
 }
 async function openThread(message) {
   try {
@@ -1420,36 +2744,50 @@ async function starterHuman(thread) {
 }
 function createBot() {
   const client2 = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
+    // A direct message channel is often not cached yet; without this its messages never arrive.
+    partials: [Partials.Channel]
   });
   client2.on(Events.MessageCreate, (message) => {
     onMessage(message).catch((e) => log("error", `message ${message.id}: ${e.stack ?? e}`));
   });
   client2.once(Events.ClientReady, (c) => {
-    let configured;
+    let config2;
     try {
-      configured = loadConfig().discord.owner_id;
+      config2 = loadConfig();
     } catch {
     }
+    const configured = config2?.discord.owner_id;
     const owner = botOwner(configured, c.user.id);
     log("owner", owner ? `${owner} (${configured ? "discord.owner_id" : "roster"})` : "none: set discord.owner_id, or permission requests are denied");
     const roster = loadRosterFile();
     log("roster", `${roster.bots.length} bots, ${roster.members.length} members from ${ROSTER_PATH}`);
+    const dm = config2 && resolveDm(config2);
+    log("dm", `intent DirectMessages on; ${dm ? `dm configured cwd=${dm.cwd} mode=${dm.permissionMode} model=${dm.model ?? "-"} launcher=${dm.launcher || "builtin"}${pinGate.configured ? "" : " (closed until a PIN is set)"}` : "dm not configured (direct messages closed)"}`);
+    log("security", `pin=${pinGate.configured ? "set" : "not set"} unlock_minutes=${config2?.security.pin_unlock_minutes ?? "-"} roster_only=${config2?.access.roster_only ?? "-"} owner_wait_minutes=${config2?.defaults.owner_wait_minutes ?? "-"}`);
   });
   client2.on(Events.InteractionCreate, (i) => {
-    if (i.isButton() && isDetailsButton(i.customId)) {
-      log("details", `${i.customId} clicked by ${i.user.username}`);
-      handleDetailsClick(i).catch((e) => log("error", `details ${i.customId}: ${e.message}`));
-    } else if (isPromptInteraction(i)) {
-      handlePromptInteraction(i).catch((e) => log("error", `prompt interaction: ${e.stack ?? e}`));
-    }
+    onInteraction(i).catch((e) => log("error", `interaction ${"customId" in i ? i.customId : i.type}: ${e.stack ?? e}`));
   });
   return client2;
 }
+async function onInteraction(i) {
+  if (i.isButton() && isDetailsButton(i.customId)) {
+    log("details", `${i.customId} clicked by ${i.user.username}`);
+    await handleDetailsClick(i);
+  } else if (isPromptInteraction(i)) await handlePromptInteraction(i);
+  else if (isApprovalInteraction(i)) await handleApprovalInteraction(i);
+  else if (isCommandInteraction(i)) await handleCommandInteraction(i);
+  else if ((i.isButton() || i.isModalSubmit()) && /^dmunlock/.test(i.customId)) await handleDmUnlock(i);
+}
 async function onMessage(message) {
-  if (!message.inGuild()) return;
   const me = message.client.user.id;
   if (message.author.id === me) return;
+  if (pinGate.locked) {
+    log("ignore", `${message.id} locked (wrong PINs) author=${message.author.username}`);
+    return;
+  }
+  if (!message.inGuild()) return onDirectMessage(message);
   let config2;
   let channel;
   const ch = message.channel;
@@ -1464,7 +2802,7 @@ async function onMessage(message) {
   }
   if (config2.discord.guild_id && message.guildId !== config2.discord.guild_id) return;
   const fromBot = message.author.bot;
-  const mentionsMe = message.mentions.users.has(me);
+  const mentionsMe = mentionsSelf({ userIds: message.mentions.users.keys(), roles: roleMentions(message) }, me, message.guild.members.me?.roles.botRole?.id);
   let ownerId = null;
   if (inThread && channel) ownerId = ch.ownerId ?? (await ch.fetch().catch(() => ch)).ownerId;
   const decision = decide({
@@ -1478,12 +2816,22 @@ async function onMessage(message) {
     baseChannelBound: !!channel,
     openedByMe: ownerId === me
   });
-  const mentions = [...message.mentions.users.keys()].join(",");
+  const mentions = [...message.mentions.users.keys(), ...message.mentions.roles.keys()].join(",");
   if (decision.action === "ignore") {
     if (decision.reason !== "unbound-channel") log("ignore", `${message.id} ${decision.reason} channel=${ch.id} owner=${ownerId ?? "-"} author=${message.author.username} mentions=[${mentions}] text=${brief(message.content, 80)}`);
     return;
   }
   if (!channel) return;
+  const botOwnerId = botOwner(config2.discord.owner_id, me);
+  if (config2.access.roster_only && !allowedTrigger(message.author.id, botOwnerId, loadRosterFile())) {
+    log("ignore", `${message.id} not-allowed author=${message.author.username} (${message.author.id}) channel=${ch.id}`);
+    return;
+  }
+  const cmd = fromBot ? void 0 : parseCommand(message.content);
+  if (cmd && decision.action === "open-thread") {
+    await message.reply({ content: "\u6307\u4EE4\u8ACB\u5728\u8A0E\u8AD6\u4E32\u88E1\uFF08\u6216\u79C1\u8A0A Bot\uFF09\u4F7F\u7528\u3002", allowedMentions: { parse: [] } });
+    return;
+  }
   let thread;
   if (decision.action === "open-thread") {
     if (ch.type !== ChannelType.GuildText) {
@@ -1497,10 +2845,16 @@ async function onMessage(message) {
   } else {
     thread = ch;
   }
-  if (!getThread(thread.id)) {
-    registerThread(thread.id, baseChannelId);
+  const known = getThread(thread.id);
+  if (!known) {
+    registerThread(thread.id, baseChannelId, thread.name);
     if (ownerId !== me) log("thread", `adopted ${thread.id} "${thread.name}" owner=${ownerId ?? "-"}`);
+  } else if (known.name !== thread.name) {
+    known.name = thread.name;
+    saveState();
   }
+  const conv = { key: thread.id, kind: "thread", room: thread, base: channel, selfId: me };
+  if (cmd) return threadCommand(cmd, conv, thread, message, botOwnerId);
   const hop = fromBot && decision.action === "run" ? await threadHops(thread, message, channel.maxHops) : { hops: 0 };
   if (hop.hops > channel.maxHops) {
     log("ignore", `${message.id} max-hops hops=${hop.hops} max=${channel.maxHops} thread=${thread.id} author=${message.author.username}`);
@@ -1515,108 +2869,139 @@ async function onMessage(message) {
   const status = new StatusReactions(message);
   await status.set("received");
   const who = {
-    ownerId: botOwner(config2.discord.owner_id, me),
+    ownerId: botOwnerId,
     // A bot cannot click, and naming it in a prompt could trigger it.
     requesterId: fromBot ? void 0 : message.author.id
   };
-  const { queued } = enqueue(thread.id, () => runInThread(thread, message, channel, status, who));
+  const { queued } = enqueue(thread.id, () => runTurn(conv, message, status, who));
   if (queued) {
     log("queue", `${message.id} waiting for thread ${thread.id}`);
     await status.set("waiting");
   }
 }
-async function runInThread(thread, trigger, channel, status, who) {
-  let progress;
+async function threadCommand(cmd, conv, thread, message, ownerId) {
+  if (COMMANDS[cmd.name].dmOnly) {
+    await message.reply({ content: `\`!${cmd.name}\` \u53EA\u80FD\u5728\u79C1\u8A0A Bot \u6642\u4F7F\u7528\u3002`, allowedMentions: { parse: [] } });
+    return;
+  }
+  const who = { ownerId, requesterId: running.get(conv.key)?.requesterId ?? await starterHuman(thread) };
+  if (!canAct("stop", message.author.id, who)) {
+    log("command", `${conv.key} !${cmd.name} refused ${message.author.username}`);
+    const names = [who.requesterId, who.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
+    await message.reply({ content: `\u53EA\u6709 ${names.join(" \u6216 ") || "Bot \u7684\u4E3B\u4EBA"} \u53EF\u4EE5\u5728\u9019\u500B\u8A0E\u8AD6\u4E32\u7528\u6307\u4EE4\u3002`, allowedMentions: { parse: [] } });
+    return;
+  }
+  await runCommand(cmd, conv, message, { ownerId, requesterId: message.author.id === ownerId ? who.requesterId : message.author.id });
+}
+var refused = /* @__PURE__ */ new Map();
+var held = [];
+var HELD_MAX = 20;
+var unlockPrompted = 0;
+async function dmChannel(message) {
+  const ch = message.channel.partial ? await message.channel.fetch().catch(() => void 0) : message.channel;
+  return ch?.type === ChannelType.DM ? ch : void 0;
+}
+async function onDirectMessage(message) {
+  if (message.author.bot) return;
+  const room = await dmChannel(message);
+  if (!room) return;
+  const me = message.client.user.id;
+  let config2;
   try {
-    await status.set("running");
-    const ts = getThread(thread.id);
-    const attachments = await saveAttachments(trigger, thread.id);
-    const prompt = await buildPrompt({
-      thread,
-      trigger,
-      history: channel.history,
-      afterId: ts.sessionId ? ts.lastSeenMessageId : void 0,
-      attachments
-    });
-    let lastReply;
-    let waits = 0;
-    const waiting = async (wait) => {
-      if (waits++ === 0) await status.set("waiting");
-      try {
-        return await wait();
-      } finally {
-        if (--waits === 0) await status.set("running");
-      }
-    };
-    const session = await acquire(thread.id, trigger.client.user.id, channel, ts.sessionId, ts.resumeCostBase ?? ts.lastCostTotal);
-    progress = stopControl(thread, who, STOP_BUTTON_DELAY_MS, (by) => void session.interrupt(by));
-    const turn = await session.run(prompt, {
-      sendReply: async (text, files) => {
-        const chunks = splitMessage(text);
-        if (!chunks.length && files.length) chunks.push("");
-        for (const [i, chunk] of chunks.entries()) {
-          const attach = i === chunks.length - 1 ? files.map((f) => ({ attachment: f, name: path7.basename(f) })) : [];
-          lastReply = await thread.send({ ...chunk ? { content: chunk } : {}, files: attach, allowedMentions: { parse: ["users"] } });
-        }
-      },
-      askPermission: (req) => waiting(async () => {
-        try {
-          const answer = await askPermission(thread, req, who, channel.permissionTimeoutMs);
-          if (answer.behavior === "always") {
-            ts.alwaysAllow = [.../* @__PURE__ */ new Set([...ts.alwaysAllow ?? [], req.toolName])];
-            saveState();
-          }
-          return answer;
-        } catch (e) {
-          log("error", `permission prompt ${thread.id}: ${e.message}`);
-          return { behavior: "deny", message: `\u7121\u6CD5\u5728 Discord \u4E0A\u8A62\u554F\u4E3B\u4EBA\uFF08${e.message}\uFF09\uFF0C\u5DF2\u62D2\u7D55\u3002` };
-        }
-      }),
-      askQuestion: (questions, signal) => waiting(
-        () => askQuestion(thread, questions, who, channel.permissionTimeoutMs, signal).catch((e) => {
-          log("error", `question prompt ${thread.id}: ${e.message}`);
-          return void 0;
-        })
-      )
-    });
-    const progressMessage = await progress.end();
-    if (turn.sessionId) ts.sessionId = turn.sessionId;
-    ts.lastCostTotal = turn.costTotal;
-    ts.lastSeenMessageId = trigger.id;
-    saveState();
-    const notice = async (content) => progressMessage ? await progressMessage.edit({ content, components: [], allowedMentions: { parse: [] } }) : await thread.send({ content, allowedMentions: { parse: [] } });
-    if (turn.stoppedBy) {
-      log("stopped", `${thread.id} by ${turn.stoppedBy} subtype=${turn.subtype}`);
-      const msg = await notice(`\u23F9\uFE0F \u5DF2\u7531 ${turn.stoppedBy} \u505C\u6B62\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u9019\u6BB5\u5C0D\u8A71\u3002`);
-      await attachDetails(msg, rememberTurn(thread.id, turn));
-      await status.set("stopped");
-      return;
-    }
-    if (turn.ok && turn.replies === 0 && trigger.author.bot) {
-      log("silent", `${thread.id} no reply to bot ${trigger.author.username} ${brief(turn.lastText, 200)}`);
-      await progressMessage?.delete().catch(() => {
-      });
-      await status.set("done");
-      return;
-    }
-    if (!turn.ok || turn.replies === 0 || !lastReply) {
-      const text = turn.ok ? `\uFF08\u6C92\u6709\u547C\u53EB reply\uFF0C\u4EE5\u4E0B\u70BA\u81EA\u52D5\u6458\u8981\uFF09
-${turn.lastText.trim().slice(0, FALLBACK_MAX) || "\uFF08\u6C92\u6709\u8F38\u51FA\uFF09"}` : `\u57F7\u884C\u5931\u6557\uFF1A${turn.subtype}${turn.error ? `\uFF08${turn.error.slice(0, 200)}\uFF09` : ""}\u3002\u4E0B\u6B21\u89F8\u767C\u6642\u6703\u63A5\u56DE\u9019\u6BB5\u5C0D\u8A71\u3002`;
-      log("fallback", `${thread.id} ${brief(text, 200)}`);
-      lastReply = await notice(text);
-    } else {
-      await progressMessage?.delete().catch(() => {
-      });
-    }
-    await attachDetails(lastReply, rememberTurn(thread.id, turn));
-    await status.set(turn.ok ? "done" : "failed");
+    config2 = loadConfig();
   } catch (e) {
-    log("error", `run ${thread.id}: ${e.stack ?? e}`);
-    await (await progress?.end())?.delete().catch(() => {
+    log("config", e.message);
+    return;
+  }
+  const ownerId = botOwner(config2.discord.owner_id, me);
+  let dm;
+  try {
+    dm = resolveDm(config2);
+  } catch (e) {
+    log("config", e.message);
+  }
+  const access = dmAccess({ authorId: message.author.id, ownerId, dmEnabled: !!dm });
+  const answer = async (text) => {
+    if (throttle(refused, message.author.id)) await room.send({ content: text, allowedMentions: { parse: [] } }).catch(() => {
     });
-    await thread.send({ content: `\u57F7\u884C\u5931\u6557\uFF1A${e.message.slice(0, 200)}`, allowedMentions: { parse: [] } }).catch(() => {
+  };
+  if (access === "not-owner") {
+    log("ignore", `${message.id} dm-not-owner author=${message.author.username} (${message.author.id})`);
+    return answer("\u9019\u96BB Bot \u53EA\u63A5\u53D7\u4E3B\u4EBA\u79C1\u8A0A\u3002");
+  }
+  if (access === "disabled" || !dm) {
+    log("ignore", `${message.id} dm-disabled`);
+    return answer("\u79C1\u8A0A\u672A\u958B\u555F\uFF1A\u8ACB\u5728\u96FB\u8166\u4E0A\u7528 /channelcollab:bind \u958B\u555F\u79C1\u8A0A\uFF08\u8981\u5148\u8A2D\u5B9A PIN\uFF09\u3002");
+  }
+  if (!pinGate.configured) {
+    log("ignore", `${message.id} dm-no-pin`);
+    return answer("\u79C1\u8A0A\u8981\u5148\u8A2D\u5B9A PIN \u624D\u80FD\u7528\uFF1A\u8ACB\u5728\u96FB\u8166\u4E0A\u57F7\u884C channelcollab \u7684 set-pin\uFF08\u6216\u96D9\u64CA\u684C\u9762\u7684\u300C\u8A2D\u5B9A channelcollab PIN.bat\u300D\uFF09\u3002");
+  }
+  if (!pinGate.unlocked) {
+    if (held.length < HELD_MAX) held.push(message);
+    log("dm", `${message.id} held until the PIN is entered (${held.length} waiting)`);
+    await message.react("\u{1F512}").catch(() => {
     });
-    await status.set("failed");
+    if (Date.now() - unlockPrompted > 60 * 1e3) {
+      unlockPrompted = Date.now();
+      await room.send({
+        content: `\u{1F512} \u79C1\u8A0A\u8981\u5148\u8F38\u5165 PIN \u89E3\u9396\uFF08\u89E3\u9396\u5F8C ${config2.security.pin_unlock_minutes} \u5206\u9418\u5167\u4E0D\u7528\u518D\u8F38\u5165\uFF09\u3002\u525B\u525B\u7684\u8A0A\u606F\u6703\u5728\u89E3\u9396\u5F8C\u63A5\u8457\u8655\u7406\u3002`,
+        components: [new ActionRowBuilder6().addComponents(new ButtonBuilder5().setCustomId("dmunlock").setLabel("\u89E3\u9396").setEmoji("\u{1F513}").setStyle(ButtonStyle5.Primary))]
+      });
+    }
+    return;
+  }
+  await handleDm(message, dm, ownerId);
+}
+async function handleDm(message, dm, ownerId) {
+  const room = await dmChannel(message);
+  if (!room) return;
+  const conv = { key: DM_KEY, kind: "dm", room, base: dm, selfId: message.client.user.id };
+  const who = { ownerId };
+  const cmd = parseCommand(message.content);
+  if (cmd) return runCommand(cmd, conv, message, who);
+  log("trigger", `${message.id} dm author=${message.author.username} text=${brief(message.content, 120)}`);
+  const status = new StatusReactions(message);
+  await status.set("received");
+  const { queued } = enqueue(DM_KEY, () => runTurn(conv, message, status, who));
+  if (queued) {
+    log("queue", `${message.id} waiting for dm`);
+    await status.set("waiting");
+  }
+}
+async function handleDmUnlock(i) {
+  if (!i.isButton() && !i.isModalSubmit()) return;
+  const config2 = loadConfig();
+  const ownerId = botOwner(config2.discord.owner_id, i.client.user.id);
+  if (!canAct("permission", i.user.id, { ownerId })) {
+    await i.reply({ content: "\u53EA\u6709 Bot \u7684\u4E3B\u4EBA\u53EF\u4EE5\u89E3\u9396\u3002", flags: MessageFlags6.Ephemeral });
+    return;
+  }
+  if (pinGate.locked) {
+    await i.reply({ content: LOCKED_REPLY, flags: MessageFlags6.Ephemeral });
+    return;
+  }
+  if (i.isButton()) {
+    if (pinGate.unlocked) {
+      await i.update({ content: "\u{1F513} \u5DF2\u7D93\u89E3\u9396\u4E86\u3002", components: [] });
+      return;
+    }
+    await i.showModal(pinModal("dmunlockpin", "\u89E3\u9396\u79C1\u8A0A"));
+    return;
+  }
+  const announce = (text) => i.channel?.isSendable() ? i.channel.send({ content: text, allowedMentions: { parse: [] } }) : Promise.resolve();
+  if (!await checkPin(i, announce)) return;
+  if (i.isFromMessage()) await i.update({ content: "\u{1F513} \u5DF2\u89E3\u9396\u3002", components: [] });
+  else await i.deferUpdate();
+  await pinOkFollowUp(i);
+  const dm = resolveDm(config2);
+  const waiting = held.splice(0);
+  log("dm", `unlocked; handling ${waiting.length} held message(s)`);
+  if (!dm || !ownerId) return;
+  for (const m of waiting) {
+    await m.reactions.cache.get("\u{1F512}")?.users.remove(i.client.user.id).catch(() => {
+    });
+    await handleDm(m, dm, ownerId).catch((e) => log("error", `held dm ${m.id}: ${e.stack ?? e}`));
   }
 }
 
@@ -1629,18 +3014,28 @@ var stopServer = net.createServer((socket) => {
   socket.on("error", () => {
   });
   socket.once("data", (d) => {
-    if (d.toString().trim() !== "stop") return void socket.end("unknown command\n");
+    const cmd = d.toString().trim();
+    if (cmd === "unlock") {
+      const was = pinGate.locked;
+      pinGate.reset();
+      log("pin", was ? "unlocked from the computer" : "unlock requested (was not locked)");
+      return void socket.end(`${was ? "unlocked" : "not-locked"}
+`);
+    }
+    if (cmd === "pin-state") return void socket.end(`${JSON.stringify(pinGate.state())}
+`);
+    if (cmd !== "stop") return void socket.end("unknown command\n");
     socket.end(`stopping pid=${process.pid}
 `);
     void shutdown("stop command");
   });
 });
-await new Promise((resolve) => {
+await new Promise((resolve2) => {
   stopServer.once("error", (e) => {
     log("start", `cannot listen on ${STOP_PIPE} (${e.code}); is another bot running? exiting`);
     process.exit(1);
   });
-  stopServer.listen(STOP_PIPE, resolve);
+  stopServer.listen(STOP_PIPE, resolve2);
 });
 var client = createBot();
 client.once(Events2.ClientReady, (c) => {

@@ -5,7 +5,9 @@
 //   check                      檢查 Node、npm、runtime、設定檔、Bot 是否在跑
 //   install-runtime [--force]  把 plugin 內的 runtime 安裝到 <HOME>\runtime（npm ci，依賴版本固定）
 //   set-owner <Discord ID>     寫入 config.json 的 discord.owner_id（Bot 的主人，可以按權限按鈕）
-//   bind ...                   新增、修改、移除、列出頻道綁定
+//   bind ...                   新增、修改、移除、列出頻道綁定；bind --dm 設定私訊
+//   set-pin | clear-pin | unlock   核准用 PIN（一律在主控台視窗裡輸入，不經過 Claude）、解除鎖定
+//   access --roster-only on|off    白名單：只有主人和名冊上的人／Bot 能叫 Bot（預設開）
 //   roster list|add|remove|import  管理自己的名冊 <HOME>\roster.json（Bot 和成員；add 只要 Discord ID）
 //   start | stop | status      啟動（背景執行）、停止、查看狀態
 //   shortcut [--dir <資料夾>]   產生雙擊用的「啟動／停止 channelcollab Bot.bat」（預設放桌面）
@@ -16,7 +18,7 @@
 // 向 Discord 查名稱，任何輸出都不含 token。
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -50,6 +52,7 @@ export function paths(home) {
     home,
     config: path.join(home, 'config.json'),
     roster: path.join(home, 'roster.json'),
+    pin: path.join(home, 'pin.json'),
     pid: path.join(home, 'bot.pid'),
     log: path.join(home, 'bot.log'),
     errLog: path.join(home, 'bot.err.log'),
@@ -110,6 +113,7 @@ export function configSummary(file) {
   for (const [id, ch] of Object.entries(c.channels ?? {})) {
     channels[id] = { cwd: ch?.cwd, model: ch?.model ?? null, permission_mode: ch?.permission_mode ?? null, launcher: ch?.launcher ?? null };
   }
+  const dm = c.dm && typeof c.dm === 'object' && c.dm.cwd ? { cwd: c.dm.cwd, model: c.dm.model ?? null, permission_mode: c.dm.permission_mode ?? null, launcher: c.dm.launcher ?? null } : null;
   return {
     exists: true,
     hasToken: typeof c.discord?.token === 'string' && c.discord.token.length > 0,
@@ -117,6 +121,10 @@ export function configSummary(file) {
     guildId: c.discord?.guild_id ?? null,
     defaultMode: c.defaults?.permission_mode ?? null,
     channels,
+    dm,
+    rosterOnly: c.access?.roster_only !== false,
+    pinUnlockMinutes: typeof c.security?.pin_unlock_minutes === 'number' ? c.security.pin_unlock_minutes : 30,
+    ownerWaitMinutes: typeof c.defaults?.owner_wait_minutes === 'number' ? c.defaults.owner_wait_minutes : 2,
   };
 }
 
@@ -133,6 +141,41 @@ export function bindChannel(file, { channel, cwd, model, permissionMode, launche
   const c = readConfig(file);
   const prev = c.channels?.[channel];
   if (!prev && !cwd) throw new CliError('新增綁定時一定要給 --cwd（這個頻道的工作資料夾）');
+  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, tools });
+  c.channels = { ...(c.channels ?? {}), [channel]: next };
+  c.defaults = { permission_mode: 'default', ...(c.defaults ?? {}) };
+  writeJson(file, c);
+  return { action: prev ? 'updated' : 'added', channel: next };
+}
+
+/** 私訊設定（config 的 dm 區塊，欄位和頻道綁定相同）；只動 dm，其他欄位原樣保留。 */
+export function bindDm(file, { cwd, model, permissionMode, launcher }) {
+  const c = readConfig(file);
+  const prev = c.dm && typeof c.dm === 'object' ? c.dm : undefined;
+  if (!prev && !cwd) throw new CliError('開啟私訊時一定要給 --cwd（私訊用的工作資料夾）');
+  const next = applyBinding(prev, { cwd, model, permissionMode, launcher });
+  c.dm = next;
+  c.defaults = { permission_mode: 'default', ...(c.defaults ?? {}) };
+  writeJson(file, c);
+  return { action: prev ? 'updated' : 'added', dm: next };
+}
+
+export function unbindDm(file) {
+  const c = readConfig(file);
+  if (!c.dm) return false;
+  delete c.dm;
+  writeJson(file, c);
+  return true;
+}
+
+/** 白名單（access.roster_only，預設開）。 */
+export function setRosterOnly(file, on) {
+  const c = readConfig(file);
+  c.access = { ...(c.access ?? {}), roster_only: !!on };
+  writeJson(file, c);
+}
+
+function applyBinding(prev, { cwd, model, permissionMode, launcher, tools }) {
   const next = { ...(prev ?? {}) };
   if (cwd) {
     const abs = path.resolve(cwd);
@@ -156,10 +199,180 @@ export function bindChannel(file, { channel, cwd, model, permissionMode, launche
     if (tools === '' || tools === 'all') delete next.tools;
     else next.tools = String(tools).split(',').map((s) => s.trim()).filter(Boolean);
   }
-  c.channels = { ...(c.channels ?? {}), [channel]: next };
-  c.defaults = { permission_mode: 'default', ...(c.defaults ?? {}) };
-  writeJson(file, c);
-  return { action: prev ? 'updated' : 'added', channel: next };
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// 核准用 PIN（<HOME>\pin.json 只存 scrypt 雜湊與 salt；Bot 端在 src/security/pin.ts 用同樣的參數驗證）
+// ---------------------------------------------------------------------------
+export const PIN_SCRYPT = { N: 16384, r: 8, p: 1, keylen: 32 };
+export const normalizePin = (pin) => String(pin).normalize('NFKC').trim();
+
+/** PIN 格式：4～32 個字元、中間不能有空白。回傳錯誤訊息，沒問題時回傳 null。 */
+export function pinFormatError(pin) {
+  const v = normalizePin(pin);
+  if (v.length < 4) return 'PIN 至少要 4 個字元（建議 6 位數字）';
+  if (v.length > 32) return 'PIN 最多 32 個字元';
+  if (/\s/.test(v)) return 'PIN 中間不能有空白';
+  return null;
+}
+
+export function hashPin(pin, salt = randomBytes(16)) {
+  const { N, r, p, keylen } = PIN_SCRYPT;
+  const hash = scryptSync(normalizePin(pin), salt, keylen, { N, r, p });
+  return { v: 1, algo: 'scrypt', N, r, p, keylen, salt: salt.toString('base64'), hash: hash.toString('base64'), setAt: new Date().toISOString() };
+}
+
+export function verifyPinRecord(pin, f) {
+  const want = Buffer.from(f.hash, 'base64');
+  const got = scryptSync(normalizePin(pin), Buffer.from(f.salt, 'base64'), f.keylen, { N: f.N, r: f.r, p: f.p });
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+/** 不回顯地讀一行（只能在主控台裡用）；Ctrl+C 取消。 */
+function readSecret(question) {
+  return new Promise((resolve, reject) => {
+    const stdin = process.stdin;
+    process.stdout.write(question);
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding('utf8');
+    let buf = '';
+    const done = (fn) => {
+      stdin.setRawMode(false);
+      stdin.pause();
+      stdin.removeListener('data', onData);
+      process.stdout.write('\n');
+      fn();
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === '\r' || ch === '\n') return done(() => resolve(buf));
+        if (ch === '\u0003') return done(() => reject(new CliError('已取消')));
+        if (ch === '\b' || ch === '\u007f') {
+          if (buf.length) {
+            buf = buf.slice(0, -1);
+            process.stdout.write('\b \b');
+          }
+        } else if (ch >= ' ') {
+          buf += ch;
+          process.stdout.write('*');
+        }
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+async function readLine(question) {
+  process.stdout.write(question);
+  return new Promise((resolve) => {
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    process.stdin.once('data', (d) => {
+      process.stdin.pause();
+      resolve(String(d).trim());
+    });
+  });
+}
+
+const isConsole = () => !!process.stdin.isTTY && typeof process.stdin.setRawMode === 'function';
+
+/**
+ * 這幾個指令要在電腦前的人親手輸入：不是在主控台裡執行時（例如由 Claude Code 執行），
+ * 另開一個主控台視窗讓使用者輸入，這裡等它關閉。PIN 不會出現在命令列、shell 歷史或 Claude 的對話裡。
+ */
+function runInConsoleWindow(p, action) {
+  if (process.platform !== 'win32') throw new CliError(`${action} 要在主控台裡執行（請直接在終端機執行這個指令）`);
+  const q = (x) => `"${String(x)}"`;
+  const line = `start "channelcollab" /wait ${q(process.execPath)} ${q(SCRIPT_PATH)} ${action} --console --home ${q(p.home)}`;
+  console.log(`已開一個新視窗「channelcollab」，請在那個視窗裡操作（${action}）；完成後視窗會關閉…`);
+  const r = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', `"${line}"`], { stdio: 'ignore', windowsVerbatimArguments: true, windowsHide: false });
+  if (r.error) throw new CliError(`開不了新視窗：${r.error.message}。請改成雙擊桌面的 .bat，或直接在終端機執行。`);
+}
+
+async function pressEnterToClose(opts) {
+  if (opts.console) await readLine('\n按 Enter 關閉這個視窗…');
+}
+
+async function setPin(p, opts) {
+  if (!isConsole()) {
+    const before = fs.existsSync(p.pin) ? fs.statSync(p.pin).mtimeMs : 0;
+    runInConsoleWindow(p, 'set-pin');
+    const after = fs.existsSync(p.pin) ? fs.statSync(p.pin).mtimeMs : 0;
+    console.log(after > before ? `✅ PIN 已設定（${p.pin}，只存雜湊）。` : '⚠️ PIN 沒有變更（視窗被關掉或取消了）。');
+    return;
+  }
+  try {
+    console.log(`設定 channelcollab 的核准用 PIN（HOME：${p.home}）`);
+    console.log('之後在 Discord 按「允許」、或用私訊時，要輸入這個 PIN。建議 6 位數字，不要用生日或和其他密碼相同。');
+    console.log('輸入時畫面只會顯示 *；按 Ctrl+C 取消。\n');
+    const a = await readSecret('新的 PIN：');
+    const err = pinFormatError(a);
+    if (err) throw new CliError(err);
+    const b = await readSecret('再輸入一次：');
+    if (normalizePin(a) !== normalizePin(b)) throw new CliError('兩次輸入不一樣，PIN 沒有變更。');
+    writeJson(p.pin, hashPin(a));
+    console.log(`✅ PIN 已設定（${p.pin}，只存雜湊）。Bot 不用重啟，下一次核准就會要求 PIN。`);
+  } catch (e) {
+    console.log(`❌ ${e instanceof CliError ? e.message : e}`);
+    process.exitCode = 1;
+  }
+  await pressEnterToClose(opts);
+}
+
+async function confirmInConsole(p, opts, action, question) {
+  if (!isConsole()) {
+    runInConsoleWindow(p, action);
+    return null;
+  }
+  const ans = await readLine(`${question}（輸入 y 確認）：`);
+  return /^y(es)?$/i.test(ans);
+}
+
+async function clearPin(p, opts) {
+  const ok = await confirmInConsole(p, opts, 'clear-pin', '要移除 PIN 嗎？移除後核准不用 PIN，私訊會關閉');
+  if (ok === null) return console.log(fs.existsSync(p.pin) ? '⚠️ PIN 還在（沒有確認）。' : '✅ 已移除 PIN。');
+  if (!ok) console.log('沒有變更。');
+  else if (fs.existsSync(p.pin)) {
+    fs.rmSync(p.pin);
+    console.log('✅ 已移除 PIN。核准權限不再要求 PIN；私訊在重新設定 PIN 之前不開放。');
+  } else console.log('本來就沒有設定 PIN。');
+  await pressEnterToClose(opts);
+}
+
+/** 經 Bot 的 named pipe 送一個指令，回傳回應文字；Bot 沒在執行時回傳 null。 */
+export function pipeRequest(pipe, text, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const sock = net.connect(pipe);
+    let out = '';
+    const timer = setTimeout(() => {
+      sock.destroy();
+      resolve(null);
+    }, timeoutMs);
+    sock.on('connect', () => sock.write(`${text}\n`));
+    sock.on('data', (d) => (out += d.toString()));
+    sock.on('end', () => {
+      clearTimeout(timer);
+      resolve(out.trim());
+    });
+    sock.on('error', () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
+async function unlock(p, opts) {
+  const ok = await confirmInConsole(p, opts, 'unlock', '要解除 PIN 鎖定嗎？（請確認是你本人輸錯，不是別人在試）');
+  if (ok === null) return console.log('（解除鎖定的結果顯示在剛剛的視窗裡）');
+  if (!ok) console.log('沒有變更。');
+  else {
+    const r = await pipeRequest(stopPipe(p.home), 'unlock');
+    if (r === null) console.log('Bot 沒有在執行（重新啟動本來就會解除鎖定）。');
+    else console.log(r === 'unlocked' ? '✅ 已解除鎖定。下一次核准或私訊仍要輸入 PIN。' : '目前沒有鎖定。');
+  }
+  await pressEnterToClose(opts);
 }
 
 export function unbindChannel(file, channel) {
@@ -588,6 +801,7 @@ async function getStatus(p) {
     recentErrors: log.errors,
     stderrTail: errTail,
     config: configSummary(p.config),
+    pin: { set: fs.existsSync(p.pin), ...(running ? JSON.parse((await pipeRequest(stopPipe(p.home), 'pin-state')) || '{}') : {}) },
     roster: rosterCounts(p.roster),
     runtime: runtimeState(p),
   };
@@ -723,7 +937,12 @@ async function stop(p) {
 // ---------------------------------------------------------------------------
 // 雙擊用的啟動／停止檔（.bat）
 // ---------------------------------------------------------------------------
-export const LAUNCHER_NAMES = { start: '啟動 channelcollab Bot.bat', stop: '停止 channelcollab Bot.bat' };
+export const LAUNCHER_NAMES = {
+  start: '啟動 channelcollab Bot.bat',
+  stop: '停止 channelcollab Bot.bat',
+  'set-pin': '設定 channelcollab PIN.bat',
+  unlock: '解除 channelcollab 鎖定.bat',
+};
 
 /** cmd 的 % 要寫成 %%，其他字元在雙引號裡原樣保留。 */
 const batq = (s) => `"${String(s).replace(/%/g, '%%')}"`;
@@ -763,7 +982,7 @@ function makeLaunchers(p, dir) {
   const target = path.resolve(dir || desktopDir());
   fs.mkdirSync(target, { recursive: true });
   const files = [];
-  for (const action of ['start', 'stop']) {
+  for (const action of Object.keys(LAUNCHER_NAMES)) {
     const file = path.join(target, LAUNCHER_NAMES[action]);
     fs.writeFileSync(file, launcherBat(p, action), 'utf8');
     files.push(file);
@@ -774,6 +993,11 @@ function makeLaunchers(p, dir) {
 // ---------------------------------------------------------------------------
 // 輸出
 // ---------------------------------------------------------------------------
+function printDm(dm, pinSet) {
+  if (!dm) return console.log('私訊：未開啟（要用的話：bind --dm --cwd <資料夾>，並先設定 PIN）');
+  console.log(`私訊：開啟 → ${dm.cwd}（模型 ${dm.model ?? '預設'}，權限模式 ${dm.permission_mode ?? '沿用預設'}${dm.launcher ? `，啟動器 ${dm.launcher}` : ''}）${pinSet ? '' : '　⚠️ 還沒設定 PIN，私訊暫不開放'}`);
+}
+
 function printChannels(channels) {
   const ids = Object.keys(channels);
   if (!ids.length) return console.log('  （還沒有綁定任何頻道）');
@@ -795,7 +1019,12 @@ function printStatus(s) {
     console.log(`${c.ownerId ? '✅' : '⚠️ '} 主人 Discord ID：${c.ownerId ?? '未設定（權限按鈕需要）'}`);
     console.log('綁定的頻道：');
     printChannels(c.channels);
+    printDm(c.dm, s.pin?.set);
+    console.log(`白名單：${c.rosterOnly ? '開啟（只有主人和名冊上的人、Bot 能叫 Bot）' : '⚠️ 關閉（伺服器裡任何人都能叫 Bot）'}`);
   }
+  const pin = s.pin ?? {};
+  if (!pin.set) console.log('⚠️  PIN：未設定（建議設定：set-pin，或雙擊桌面的「設定 channelcollab PIN.bat」；私訊需要 PIN）');
+  else console.log(`✅ PIN：已設定${pin.locked ? '，🔒 目前鎖定中（輸錯太多次，用 unlock 解除）' : ''}`);
   const r = s.roster;
   if (r?.broken) console.log('⚠️  名冊：<HOME>\\roster.json 格式不對，Bot 會當作空名冊');
   else if (!r || (!r.bots && !r.members)) console.log('名冊：空的（可以用 /channelcollab:roster 把常合作的人和 Bot 加進來）');
@@ -847,7 +1076,22 @@ const commands = {
   async bind(p, opts) {
     if (opts.list) {
       console.log(`${p.config} 的頻道綁定：`);
-      return printChannels(configSummary(p.config).channels);
+      const c = configSummary(p.config);
+      printChannels(c.channels);
+      return printDm(c.dm, fs.existsSync(p.pin));
+    }
+    if (opts.dm) {
+      if (opts.remove) return console.log(unbindDm(p.config) ? '✅ 已關閉私訊' : '私訊本來就沒有開啟');
+      const r = bindDm(p.config, {
+        cwd: opts.cwd === true ? undefined : opts.cwd,
+        model: opts.model === true ? undefined : opts.model,
+        permissionMode: opts['permission-mode'] === true ? undefined : opts['permission-mode'],
+        launcher: opts.launcher === true ? undefined : opts.launcher,
+      });
+      console.log(`✅ ${r.action === 'added' ? '開啟' : '更新'}私訊設定：`);
+      printDm(r.dm, fs.existsSync(p.pin));
+      console.log('   只有主人能私訊 Bot；私訊要先設定 PIN 才會開放（set-pin）。設定檔會自動重新載入。');
+      return;
     }
     if (opts.remove) {
       const ok = unbindChannel(p.config, String(opts.channel ?? opts.remove));
@@ -874,6 +1118,25 @@ const commands = {
     // 舊名稱：等同 roster import
     await rosterCommands.import(p, { ...opts, _: ['roster', 'import', ...opts._.slice(1)] });
   },
+  async 'set-pin'(p, opts) {
+    await setPin(p, opts);
+  },
+  async 'clear-pin'(p, opts) {
+    await clearPin(p, opts);
+  },
+  async unlock(p, opts) {
+    await unlock(p, opts);
+  },
+  async access(p, opts) {
+    const v = opts['roster-only'];
+    if (v === undefined || v === true) {
+      const on = configSummary(p.config).rosterOnly;
+      return console.log(`白名單：${on ? '開啟' : '關閉'}（改用 access --roster-only on|off）`);
+    }
+    if (!/^(on|off)$/.test(String(v))) throw new CliError('用法：access --roster-only on|off');
+    setRosterOnly(p.config, v === 'on');
+    console.log(v === 'on' ? '✅ 白名單已開啟：只有主人和名冊上的人、Bot 能叫 Bot。' : '⚠️ 白名單已關閉：伺服器裡任何人都能叫 Bot（權限核准仍只有主人能按）。');
+  },
   async start(p, opts) {
     await start(p, { wait: opts.wait === undefined ? READY_WAIT_S : Number(opts.wait), update: !opts['no-update'] });
   },
@@ -890,6 +1153,7 @@ const commands = {
     console.log('✅ 已建立雙擊用的檔案：');
     for (const f of files) console.log(`  - ${f}`);
     console.log('   雙擊「啟動」會在背景啟動 Bot 並顯示是否上線；看到結果後按任意鍵關閉視窗，Bot 會繼續執行。');
+    console.log('   「設定 PIN」設定核准用 PIN；「解除鎖定」在 PIN 輸錯太多次被鎖定時使用。');
   },
 };
 
@@ -982,7 +1246,14 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
        [--launcher <路徑>] [--tools Read,Grep,...]
                                           新增或修改頻道綁定（只給要改的欄位）
   bind --remove --channel <ID>            移除頻道綁定
-  bind --list                             列出頻道綁定
+  bind --dm --cwd <資料夾> [--model ...] [--permission-mode ...] [--launcher <路徑>]
+                                          開啟或修改私訊（只有主人能用，要先設定 PIN）
+  bind --dm --remove                      關閉私訊
+  bind --list                             列出頻道綁定與私訊設定
+  set-pin                                 設定核准用 PIN（另開主控台視窗輸入，不回顯）
+  clear-pin                               移除 PIN（要在主控台視窗確認）
+  unlock                                  PIN 輸錯太多次被鎖定時解除（要在主控台視窗確認）
+  access [--roster-only on|off]           白名單：只有主人和名冊上的人、Bot 能叫 Bot（預設開）
   roster list [--json]                    列出自己的名冊（Bot 和成員）
   roster add <Discord ID> [--name <名字>] [--role engineer|planner] [--bot|--member]
              [--owner-id <ID>] [--owner-name <名字>]
@@ -1105,6 +1376,56 @@ async function selfTest() {
       eq(e.message.includes(FAKE), false, '不含 token');
     }
     eq(fs.readFileSync(f, 'utf-8').includes(FAKE), true, '原檔不變');
+  });
+
+  console.log('私訊設定');
+  await t('bind --dm：新增、只改給的欄位、拒絕 bypassPermissions、沒給 cwd 不能新增、移除；不動頻道與 token', () => {
+    const f = path.join(tmp, 'dm.json');
+    fs.writeFileSync(f, JSON.stringify({ discord: { token: FAKE }, channels: { [CH]: { cwd: tmp, permission_mode: 'default' } } }), 'utf-8');
+    throws(() => bindDm(f, {}), /--cwd/);
+    eq(bindDm(f, { cwd: tmp, permissionMode: 'auto', launcher: 'C:\\x\\l.cmd' }).action, 'added');
+    bindDm(f, { model: 'sonnet' });
+    const c = JSON.parse(fs.readFileSync(f, 'utf-8'));
+    eq(c.dm, { cwd: path.resolve(tmp), permission_mode: 'auto', launcher: 'C:\\x\\l.cmd', model: 'sonnet' });
+    eq(c.discord.token, FAKE);
+    eq(Object.keys(c.channels), [CH]);
+    throws(() => bindDm(f, { permissionMode: 'bypassPermissions' }), /bypassPermissions/);
+    const sum = configSummary(f);
+    eq(sum.dm.cwd, path.resolve(tmp));
+    eq(JSON.stringify(sum).includes(FAKE), false, '摘要不含 token');
+    eq(unbindDm(f), true);
+    eq(unbindDm(f), false);
+    eq(configSummary(f).dm, null);
+  });
+  await t('白名單預設開，可以關；摘要顯示 PIN 免輸入時間與主人等待時間的預設', () => {
+    const f = path.join(tmp, 'acc.json');
+    fs.writeFileSync(f, JSON.stringify({ discord: { token: FAKE } }), 'utf-8');
+    eq(configSummary(f).rosterOnly, true);
+    eq(configSummary(f).pinUnlockMinutes, 30);
+    eq(configSummary(f).ownerWaitMinutes, 2);
+    setRosterOnly(f, false);
+    eq(configSummary(f).rosterOnly, false);
+    eq(JSON.parse(fs.readFileSync(f, 'utf-8')).discord.token, FAKE);
+  });
+
+  console.log('PIN');
+  await t('只存 scrypt 雜湊與 salt；同一個 PIN 每次 salt 不同；前後空白不影響；錯的 PIN 不通過', () => {
+    const a = hashPin('246810');
+    const b = hashPin('246810');
+    eq(a.algo, 'scrypt');
+    eq(JSON.stringify(a).includes('246810'), false, '不含明文');
+    eq(a.salt === b.salt, false, 'salt 不同');
+    eq(verifyPinRecord(' 246810 ', a), true);
+    eq(verifyPinRecord('246811', a), false);
+  });
+  await t('PIN 格式：至少 4 個字元、中間不能有空白', () => {
+    eq(pinFormatError('123'), 'PIN 至少要 4 個字元（建議 6 位數字）');
+    eq(pinFormatError('12 34') !== null, true);
+    eq(pinFormatError('1234'), null);
+  });
+  await t('不是主控台時 set-pin 不在這裡讀 PIN（PIN 不經過命令列）', () => {
+    eq(typeof setPin, 'function');
+    eq(HELP.includes('set-pin'), true);
   });
 
   console.log('名冊');
@@ -1290,6 +1611,12 @@ async function selfTest() {
     const pct = launcherBat(paths('C:\\a%b'), 'stop', 'C:\\n%x\\node.exe');
     eq(pct.includes('"C:\\a%%b\\runtime\\ctl.mjs" stop --home "C:\\a%%b"'), true, '% 跳脫');
     eq(pct.includes('set "CC_NODE=C:\\n%%x\\node.exe"'), true, 'node 路徑 % 跳脫');
+  });
+
+  await t('設定 PIN、解除鎖定的 .bat 也會產生，指令一樣經過 ctl.mjs', () => {
+    const p = paths('C:\\Users\\someone\\.channelcollab');
+    eq(launcherBat(p, 'set-pin', 'C:\\node.exe').includes(`"${p.ctl}" set-pin --home "${p.home}"`), true);
+    eq(Object.keys(LAUNCHER_NAMES), ['start', 'stop', 'set-pin', 'unlock']);
   });
 
   console.log('Node 版本');

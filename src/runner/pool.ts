@@ -7,8 +7,8 @@
 import { loadConfig, type ResolvedChannel } from '../config.js';
 import { log } from '../log.js';
 import { isPending } from '../router/queue.js';
-import { getThread, saveState } from '../store/state.js';
-import { LiveSession } from './session.js';
+import { findSession, getConversation, saveState } from '../store/state.js';
+import { LiveSession, type ConversationKind } from './session.js';
 
 const SWEEP_MS = 15 * 1000;
 
@@ -47,7 +47,7 @@ function retire(s: LiveSession, reason: string, force = false): Promise<void> {
  * The live session for a thread, starting (or resuming) one if needed.
  * Called by the thread's queued job, so only one caller per thread at a time.
  */
-export async function acquire(threadId: string, selfId: string, channel: ResolvedChannel, resume: string | undefined, costBase: number): Promise<LiveSession> {
+export async function acquire(threadId: string, selfId: string, channel: ResolvedChannel, resume: string | undefined, costBase: number, kind: ConversationKind = 'thread'): Promise<LiveSession> {
   if (stopping) throw new Error('bot is shutting down');
   const current = live.get(threadId);
   if (current?.usable) return current;
@@ -55,10 +55,11 @@ export async function acquire(threadId: string, selfId: string, channel: Resolve
   await closing.get(threadId);
   if (stopping) throw new Error('bot is shutting down');
 
-  const s = new LiveSession(threadId, selfId, channel, resume, costBase, getThread(threadId)?.alwaysAllow);
+  const s = new LiveSession(threadId, selfId, channel, resume, costBase, getConversation(threadId)?.alwaysAllow, kind);
   live.set(threadId, s);
   void s.done.then(() => {
-    const ts = getThread(threadId);
+    // The conversation may have moved on (!clear, !resume): update the entry that still has this session.
+    const ts = findSession(threadId, s.sessionId);
     if (ts && s.cleanExit) {
       ts.resumeCostBase = s.costTotal;
       saveState();
@@ -112,6 +113,12 @@ function sweep(): void {
       retire(s, 'idle');
     }
   }
+}
+
+/** End a conversation's live session gracefully (!clear, !resume); the next turn starts or resumes another. */
+export function release(threadId: string, reason: string): Promise<void> {
+  const s = live.get(threadId);
+  return s ? retire(s, reason) : (closing.get(threadId) ?? Promise.resolve());
 }
 
 /** Shutdown: refuse new sessions, kill running turns, close everything, wait for the process trees. */

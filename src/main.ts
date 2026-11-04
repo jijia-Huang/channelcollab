@@ -12,6 +12,7 @@ import { createBot } from './discord/bot.js';
 import { log } from './log.js';
 import { anyPending } from './router/queue.js';
 import { closeAll } from './runner/pool.js';
+import { pinGate } from './security/pin.js';
 import { loadState } from './store/state.js';
 
 /** After the sessions are closed, how long failed turns get to post their notice. */
@@ -25,7 +26,16 @@ log('start', `pid=${process.pid} home=${DATA_DIR} pipe=${STOP_PIPE} guild=${conf
 const stopServer = net.createServer((socket) => {
   socket.on('error', () => {});
   socket.once('data', (d) => {
-    if (d.toString().trim() !== 'stop') return void socket.end('unknown command\n');
+    const cmd = d.toString().trim();
+    // `unlock` from the control script: clear the lock after too many wrong PINs (only this HOME's bot).
+    if (cmd === 'unlock') {
+      const was = pinGate.locked;
+      pinGate.reset();
+      log('pin', was ? 'unlocked from the computer' : 'unlock requested (was not locked)');
+      return void socket.end(`${was ? 'unlocked' : 'not-locked'}\n`);
+    }
+    if (cmd === 'pin-state') return void socket.end(`${JSON.stringify(pinGate.state())}\n`);
+    if (cmd !== 'stop') return void socket.end('unknown command\n');
     socket.end(`stopping pid=${process.pid}\n`);
     void shutdown('stop command');
   });

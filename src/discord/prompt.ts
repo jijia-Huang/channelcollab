@@ -1,10 +1,12 @@
 /**
  * Builds the prompt for one turn (PLAN §6): speaker, location, recent thread
- * messages, and the triggering message.
+ * messages, and the triggering message. Direct messages: speaker, location and
+ * the message only.
  */
 import type { Message, ThreadChannel } from 'discord.js';
 import { loadRosterFile, roleName, rosterPeople, type Roster } from '../roster.js';
 import type { SavedAttachments } from './attachments.js';
+import { parseCommand } from './commands.js';
 
 /**
  * 「顯示名稱（username，標籤…）」. Bots in the roster show owner, role and ID;
@@ -50,6 +52,8 @@ async function recent(thread: ThreadChannel, trigger: Message, limit: number, af
   const me = trigger.client.user.id;
   return [...fetched.values()]
     .filter((m) => !m.system)
+    // `!` commands are for the bot, not part of the conversation.
+    .filter((m) => m.author.bot || !parseCommand(m.content))
     .filter((m) => !afterId || (BigInt(m.id) > BigInt(afterId) && m.author.id !== me))
     .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
 }
@@ -75,4 +79,9 @@ export async function buildPrompt(opts: {
   }
   parts.push('【本則訊息】', body(trigger, opts.attachments));
   return parts.join('\n');
+}
+
+/** A direct message from the owner: the session already holds the conversation, so no history. */
+export function buildDmPrompt(trigger: Message, attachments?: SavedAttachments, roster: Roster = loadRosterFile()): string {
+  return [`【發話者】${speaker(trigger, roster)}（你的主人）`, '【位置】Discord 私訊（你和主人一對一）', '【本則訊息】', body(trigger, attachments)].join('\n');
 }

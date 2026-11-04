@@ -16,12 +16,15 @@ import {
   type SDKMessage,
   type SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
+import type { PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
-import { INBOX_DIR, loadConfig, type ResolvedChannel } from '../config.js';
+import { DATA_DIR, INBOX_DIR, loadConfig, type ResolvedChannel } from '../config.js';
 import { brief, log } from '../log.js';
 import { botOwner, rosterPrompt } from '../roster.js';
+import { forbiddenPath, forbiddenUse, zoneDenyMessage, type Zones } from '../security/zones.js';
 import { killTree, launcherOptions, type Spawned } from './launcher.js';
 import { blockedByClassifier, decideTool, inside, retryKey } from './policy.js';
+import { contextFromUsage, recordRateLimit, type RateInfo } from './usage.js';
 
 const OWN_PREFIX = 'mcp__channelcollab__';
 export const REPLY_TOOL = `${OWN_PREFIX}reply`;
@@ -34,24 +37,40 @@ const CLOSE_GRACE_MS = 15 * 1000;
 /** Files Claude can attach to one reply (Discord's limit per message). */
 const MAX_REPLY_FILES = 10;
 
-function guidelines(selfId: string, auto: boolean): string {
+export type ConversationKind = 'thread' | 'dm';
+
+export function guidelines(selfId: string, auto: boolean, kind: ConversationKind = 'thread'): string {
   let configured: string | undefined;
   try {
     configured = loadConfig().discord.owner_id;
   } catch {}
+  const dm = kind === 'dm';
+  const where = dm ? '私訊' : '討論串';
   return [
-    '你正在一個 Discord 討論串裡和人協作，討論串裡可能還有其他人的 Bot。每則使用者訊息會標示發話者、位置和最近的對話。',
+    dm
+      ? '你正在 Discord 私訊裡和你的主人一對一對話（主人可能在手機上，遠端請你在這台電腦上做事）。每則使用者訊息會標示發話者與位置。'
+      : '你正在一個 Discord 討論串裡和人協作，討論串裡可能還有其他人的 Bot。每則使用者訊息會標示發話者、位置和最近的對話。',
     `- 你的一般文字輸出沒有人看得到；要讓人看到的內容，一律呼叫 ${REPLY_TOOL} 工具。`,
-    '- 回覆要簡短，只講結論；做了修改就說明改了什麼。',
+    dm ? '- 回覆要簡短，只講結論（主人多半在手機上看）；做了修改就說明改了什麼。' : '- 回覆要簡短，只講結論；做了修改就說明改了什麼。',
     auto
-      ? '- 這個頻道用自動模式：動作由 Claude Code 自動判斷；被自動模式擋下的動作會改在 Discord 上請 Bot 的主人決定，等待期間不必另外說明。之後若被告知可以重試這個呼叫，代表主人已經回覆：請用完全相同的參數重試一次（不要改指令）；若結果是主人拒絕，照拒絕理由調整做法，不要再試。'
+      ? `- 這個${dm ? '私訊' : '頻道'}用自動模式：動作由 Claude Code 自動判斷；被自動模式擋下的動作會改在 Discord 上請 Bot 的主人決定，等待期間不必另外說明。之後若被告知可以重試這個呼叫，代表主人已經回覆：請用完全相同的參數重試一次（不要改指令）；若結果是主人拒絕，照拒絕理由調整做法，不要再試。`
       : '- 需要權限的工具會在 Discord 上請 Bot 的主人核准，等待期間不必另外說明。被拒絕時照拒絕理由調整做法，不要原樣重試。',
+    '- 權限請求的結果若是「主人暫時不在…已排入待核准清單」：不要重試同一個動作；改用不需要權限的方式把能做的做完，做不到的部分在 reply 裡整理成「待主人核准」（要做什麼、為什麼），然後結束這一輪。主人核准後會再告訴你，到時用相同參數執行。',
+    '- 被「禁區」擋下的動作（channelcollab 的資料夾、.ssh、.env、Claude 的登入資料）任何情況都不能做，不要再試，也不要換方法繞過。',
     '- 需要使用者做選擇時，可以用 AskUserQuestion 工具，選項會以按鈕或選單呈現在 Discord 上。',
-    '- 需要主人好好思考的決策（例如方向、取捨、影響範圍大的改動），在 reply 裡 @ 主人，請主人決定，不要自己決定。',
+    dm
+      ? '- 需要主人好好思考的決策（例如方向、取捨、影響範圍大的改動），直接在 reply 裡問主人，不要自己決定。'
+      : '- 需要主人好好思考的決策（例如方向、取捨、影響範圍大的改動），在 reply 裡 @ 主人，請主人決定，不要自己決定。',
     '- 使用者附的檔案會下載到本機，路徑寫在訊息的【附件】裡，用 Read 讀取。',
-    `- 要把檔案傳到討論串，呼叫 ${REPLY_TOOL} 時在 files 帶本機路徑（只能是工作目錄或附件資料夾底下的檔案）。`,
-    rosterPrompt(selfId, botOwner(configured, selfId)),
+    `- 要把檔案傳到${where}，呼叫 ${REPLY_TOOL} 時在 files 帶本機路徑（只能是工作目錄或附件資料夾底下的檔案）。`,
+    rosterPrompt(selfId, botOwner(configured, selfId), undefined, { dm }),
   ].join('\n');
+}
+
+/** The deny reason Claude sees for a call refused by the current permission mode. */
+export function modeDenyMessage(mode: PermissionMode, toolName: string): string {
+  if (mode === 'plan') return `目前是計畫模式（主人打了 !plan）：只討論、不動手，不能執行 ${toolName}。請用 reply 把你的計畫說明給主人，等主人再打一次 !plan 切回後再動手。`;
+  return `這個頻道的權限模式（${mode}）不允許執行 ${toolName}。`;
 }
 
 export type ToolUse = { name: string; input: string };
@@ -67,7 +86,8 @@ export type PermissionRequest = {
 };
 
 /** `always`: allow, and stop asking for this tool for the rest of the session. */
-export type PermissionAnswer = { behavior: 'allow' | 'always' } | { behavior: 'deny'; message: string };
+/** `deferred`: nobody answered in time; the call went on the approve-later list (runner/approvals.ts). */
+export type PermissionAnswer = { behavior: 'allow' | 'always' } | { behavior: 'deny'; message: string; deferred?: boolean };
 
 export type Question = { question: string; header: string; multiSelect: boolean; options: { label: string; description: string }[] };
 
@@ -76,6 +96,8 @@ export type TurnCallbacks = {
   askPermission: (req: PermissionRequest) => Promise<PermissionAnswer>;
   /** Answers keyed by question text (multi-select joined with ", "), or undefined when nobody answered. */
   askQuestion: (questions: Question[], signal: AbortSignal) => Promise<Record<string, string> | undefined>;
+  /** A short notice for the people in the conversation (e.g. plan usage reminders). */
+  notice?: (text: string) => Promise<void>;
 };
 
 export type TurnResult = {
@@ -94,9 +116,12 @@ export type TurnResult = {
   /** Who pressed 🛑, when the turn was stopped. */
   stoppedBy?: string;
   error?: string;
+  /** SDKAssistantMessageError from the last assistant message that carried one (e.g. authentication_failed). */
+  apiError?: string;
 };
 
 type Turn = TurnCallbacks & {
+  apiError?: string;
   n: number;
   started: number;
   acted: boolean;
@@ -154,14 +179,16 @@ export function childEnv(source: NodeJS.ProcessEnv = process.env): Record<string
 }
 
 /** Check files Claude asked to attach: they must exist and resolve (symlinks included) inside `roots`. */
-function checkFiles(files: string[], roots: string[]): { ok: string[]; rejected: string[] } {
+function checkFiles(files: string[], roots: string[], zones: Zones): { ok: string[]; rejected: string[] } {
   const ok: string[] = [];
   const rejected: string[] = [];
   const realRoots = roots.filter((r) => existsSync(r)).map((r) => realpathSync(r));
   for (const f of files) {
     try {
       const real = realpathSync(path.resolve(roots[0], f));
-      if (!inside(real, realRoots)) rejected.push(`${f}: not under the working directory or the attachment folder`);
+      const zone = forbiddenPath(real, roots[0], zones);
+      if (zone) rejected.push(`${f}: no-go zone (${zone})`);
+      else if (!inside(real, realRoots)) rejected.push(`${f}: not under the working directory or the attachment folder`);
       else if (!statSync(real).isFile()) rejected.push(`${f}: not a file`);
       else ok.push(real);
     } catch {
@@ -200,6 +227,15 @@ export class LiveSession {
   private clean = false;
   private child?: Spawned;
   private readonly stderrTail: string[] = [];
+  /** Usage of the last main-thread API call, and the context window from the last result (fallback for contextUsage). */
+  private lastUsage?: Parameters<typeof contextFromUsage>[0];
+  private contextWindow?: number;
+
+  /** Permission mode in effect now (!plan switches it); the hooks read this. */
+  mode: PermissionMode;
+  /** When this process was started (for !status). */
+  readonly startedAt = Date.now();
+  readonly cwd: string;
 
   /**
    * `costBase` is the cumulative total a resumed CLI starts counting from: what
@@ -214,13 +250,18 @@ export class LiveSession {
     resume: string | undefined,
     costBase: number,
     alwaysAllowed: Iterable<string> = [],
+    readonly kind: ConversationKind = 'thread',
   ) {
     this.tag = `live ${threadId}`;
     this.sessionId = resume;
     this.cost = costBase;
     this.alwaysAllowed = new Set(alwaysAllowed);
+    this.mode = channel.permissionMode;
+    this.cwd = channel.cwd;
     // The session reads freely, and in acceptEdits edits, inside its cwd and its thread's attachment folder.
     const roots = [channel.cwd, path.join(INBOX_DIR, threadId)];
+    // No-go zones: every channelcollab HOME except this conversation's own attachment folder.
+    const zones: Zones = { homes: [DATA_DIR], allow: [roots[1]] };
 
     // Created once per session, so the tool and the permission callbacks act on whichever turn is current.
     const server = createSdkMcpServer({
@@ -230,14 +271,14 @@ export class LiveSession {
       tools: [
         tool(
           'reply',
-          'Send a message to the people in the current Discord thread. This is the only way anyone sees what you say. Optionally attach local files (under the working directory or the attachment folder).',
+          `Send a message to ${kind === 'dm' ? 'your owner in the current Discord direct message' : 'the people in the current Discord thread'}. This is the only way anyone sees what you say. Optionally attach local files (under the working directory or the attachment folder).`,
           {
             text: z.string().describe('Message text (Markdown)'),
             files: z.array(z.string()).optional().describe('Local file paths to upload with the message'),
           },
           async ({ text, files }) => {
             const t = this.turn;
-            const checked = checkFiles(files ?? [], roots);
+            const checked = checkFiles(files ?? [], roots, zones);
             log('reply', `${threadId} ${brief(text, 300)}${files?.length ? ` files=${JSON.stringify(checked.ok)} rejected=${JSON.stringify(checked.rejected)}` : ''}`);
             if (!t) return { content: [{ type: 'text', text: 'Not delivered: no active turn.' }], isError: true };
             try {
@@ -260,16 +301,23 @@ export class LiveSession {
       if (hookInput.hook_event_name !== 'PreToolUse') return {};
       const name = hookInput.tool_name;
       const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
+      // No-go zones come first: no mode, "always allow" or owner's answer opens them.
+      const zone = forbiddenUse(name, toolInput, channel.cwd, zones, OWN_PREFIX);
+      if (zone) {
+        this.turn?.denials.push(name);
+        log('permission', `${threadId} deny ${name} (no-go zone: ${zone}) id=${toolUseId ?? '-'}`);
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: zoneDenyMessage(zone) } };
+      }
       // auto mode: Claude retrying a call the classifier blocked and the owner has answered.
       const retry = this.turn?.retries.get(retryKey(name, toolInput));
       if (retry) {
         this.turn?.retries.delete(retryKey(name, toolInput));
-        log('permission', `${threadId} retry ${'deny' in retry ? 'deny' : 'allow'} ${name} (owner answered a classifier block) id=${toolUseId ?? '-'}`);
+        log('permission', `${threadId} retry ${'deny' in retry ? 'deny' : 'allow'} ${name} (owner answered: classifier block or approve-later) id=${toolUseId ?? '-'}`);
         return 'deny' in retry
           ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: retry.deny } }
           : { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'approved by the owner after an auto mode block' } };
       }
-      const d = decideTool(name, toolInput, { mode: channel.permissionMode, roots, alwaysAllowed: this.alwaysAllowed, ownPrefix: OWN_PREFIX });
+      const d = decideTool(name, toolInput, { mode: this.mode, roots, alwaysAllowed: this.alwaysAllowed, ownPrefix: OWN_PREFIX });
       if (d.kind === 'cli') return {};
       if (d.kind === 'allow') {
         if (!name.startsWith(OWN_PREFIX)) log('permission', `${threadId} auto-allow ${name} (${d.why}) id=${toolUseId ?? '-'}`);
@@ -278,7 +326,7 @@ export class LiveSession {
       if (d.kind === 'deny') {
         this.turn?.denials.push(name);
         log('permission', `${threadId} deny ${name} (${d.why}) id=${toolUseId ?? '-'}`);
-        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: `這個頻道的權限模式（${channel.permissionMode}）不允許執行 ${name}。` } };
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: modeDenyMessage(this.mode, name) } };
       }
       const answer = await this.ask(name, toolInput, toolUseId ?? '', signal);
       return answer.behavior === 'deny'
@@ -294,7 +342,7 @@ export class LiveSession {
     const permissionDenied: HookCallback = async (hookInput, toolUseId, { signal }) => {
       if (hookInput.hook_event_name !== 'PermissionDenied') return {};
       const t = this.turn;
-      if (!t || blockedByClassifier(channel.permissionMode) !== 'ask') return {};
+      if (!t || blockedByClassifier(this.mode) !== 'ask') return {};
       const name = hookInput.tool_name;
       const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
       log('permission', `${threadId} classifier blocked ${name} (${brief(hookInput.reason, 200)}) id=${toolUseId ?? hookInput.tool_use_id}`);
@@ -307,6 +355,8 @@ export class LiveSession {
 
     // Reached by AskUserQuestion (the hook leaves it alone) and by anything Claude Code itself still wants to ask about.
     const canUseTool: CanUseTool = async (toolName, input, { signal, toolUseID }) => {
+      // Plan mode sends even our own reply tool here (a hook allow does not cover it; spike/v015-live.ts).
+      if (toolName.startsWith(OWN_PREFIX)) return { behavior: 'allow', updatedInput: input };
       if (toolName !== 'AskUserQuestion') {
         const answer = await this.ask(toolName, input, toolUseID, signal);
         return answer.behavior === 'deny' ? { behavior: 'deny', message: answer.message } : { behavior: 'allow', updatedInput: input };
@@ -334,7 +384,7 @@ export class LiveSession {
     };
 
     const hookTimeout = Math.ceil(channel.permissionTimeoutMs / 1000) + 60;
-    log(this.tag, `start cwd=${channel.cwd} model=${channel.model ?? '-'} mode=${channel.permissionMode} launcher=${channel.launcher || 'builtin'} resume=${resume ?? '-'} always=${JSON.stringify([...this.alwaysAllowed])}`);
+    log(this.tag, `start kind=${kind} cwd=${channel.cwd} model=${channel.model ?? '-'} mode=${channel.permissionMode} launcher=${channel.launcher || 'builtin'} resume=${resume ?? '-'} always=${JSON.stringify([...this.alwaysAllowed])}`);
     this.q = query({
       prompt: this.input(),
       options: {
@@ -346,13 +396,14 @@ export class LiveSession {
         settingSources: ['user', 'project'],
         // Always explicit: omitted, the user's own default (e.g. auto) applies and canUseTool is skipped.
         permissionMode: channel.permissionMode,
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: guidelines(selfId, channel.permissionMode === 'auto') },
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: guidelines(selfId, (channel.basePermissionMode ?? channel.permissionMode) === 'auto', kind) },
         allowedTools: [REPLY_TOOL],
         mcpServers: { channelcollab: server },
         // The hooks await the owner's answer in-process, so their timeout (seconds) must outlast the prompt's.
+        // PermissionDenied is always registered: !plan can switch an auto session out of auto and back.
         hooks: {
           PreToolUse: [{ hooks: [preToolUse], timeout: hookTimeout }],
-          ...(blockedByClassifier(channel.permissionMode) === 'ask' ? { PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }] } : {}),
+          PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }],
         },
         canUseTool,
         maxTurns: MAX_TURNS,
@@ -378,6 +429,36 @@ export class LiveSession {
     return this.child?.pid;
   }
 
+  /** Switch the model for the following responses (!model); the session keeps running. */
+  async setModel(model: string): Promise<void> {
+    await this.q.setModel(model);
+    log(this.tag, `model set to ${model}`);
+  }
+
+  /** Switch the permission mode (!plan); the hooks follow it right away. */
+  async setMode(mode: PermissionMode): Promise<void> {
+    await this.q.setPermissionMode(mode);
+    this.mode = mode;
+    log(this.tag, `permission mode set to ${mode}`);
+  }
+
+  /**
+   * How full the context window is after the last turn: Claude Code's own
+   * figure (getContextUsage, the /context numbers), else the last API call's
+   * tokens over the model's context window.
+   */
+  async contextUsage(): Promise<{ pct: number; tokens?: number; max?: number } | undefined> {
+    if (this.usable) {
+      try {
+        const u = await Promise.race([this.q.getContextUsage({ detail: 'summary' }), sleep(5000).then(() => undefined)]);
+        if (u && Number.isFinite(u.percentage)) return { pct: Math.round(u.percentage), tokens: u.totalTokens, max: u.maxTokens };
+      } catch (e) {
+        log(this.tag, `getContextUsage failed: ${(e as Error).message}`);
+      }
+    }
+    return contextFromUsage(this.lastUsage, this.contextWindow);
+  }
+
   /** Cumulative total_cost_usd as of the last result. */
   get costTotal(): number {
     return this.cost;
@@ -389,7 +470,7 @@ export class LiveSession {
   }
 
   /** Run one turn. Never rejects: failures come back as `ok: false`. One turn at a time. */
-  run(prompt: string, callbacks: TurnCallbacks): Promise<TurnResult> {
+  run(prompt: string, callbacks: TurnCallbacks, opts: { preapproved?: string[] } = {}): Promise<TurnResult> {
     if (this.turn) throw new Error(`${this.tag}: a turn is already running`);
     const n = ++this.turns;
     return new Promise<TurnResult>((resolve) => {
@@ -409,6 +490,8 @@ export class LiveSession {
         retries: new Map(),
         resolve,
       };
+      // Calls the owner approved later (retryKey): allowed in this turn when repeated with the same input.
+      for (const k of opts.preapproved ?? []) t.retries.set(k, { allow: true });
       this.turn = t;
       this.startClock(t);
       if (!this.usable) {
@@ -561,7 +644,16 @@ export class LiveSession {
       }
       this.sessionId = msg.session_id;
       this.model = msg.model;
+    } else if (msg.type === 'rate_limit_event') {
+      const info = msg.rate_limit_info as RateInfo;
+      log(this.tag, `rate limit ${brief(info, 400)}`);
+      for (const text of recordRateLimit(info)) {
+        if (t?.notice) t.notice(text).catch((e) => log(this.tag, `rate limit notice failed: ${(e as Error).message}`));
+        else log(this.tag, `rate limit notice (no turn to post it): ${text}`);
+      }
     } else if (msg.type === 'assistant' && t) {
+      if (msg.error) t.apiError = msg.error;
+      if (msg.parent_tool_use_id === null && msg.message.usage) this.lastUsage = msg.message.usage;
       for (const block of msg.message.content) {
         if (block.type === 'tool_use') {
           if (!t.acted) {
@@ -597,6 +689,12 @@ export class LiveSession {
     const turnCost = costTotal >= this.cost ? costTotal - this.cost : costTotal;
     this.cost = costTotal;
     if (result?.session_id) this.sessionId = result.session_id;
+    const windowOf = result?.modelUsage && this.model ? result.modelUsage[this.model]?.contextWindow : undefined;
+    if (windowOf) this.contextWindow = windowOf;
+    // A failed result says why in `result` (subtype success with is_error, e.g. not logged in) or in `errors`.
+    if (result?.is_error && !error) {
+      error = result.subtype === 'success' ? result.result : result.errors?.join('\n');
+    }
 
     const out: TurnResult = {
       ok: !!result && result.subtype === 'success' && !result.is_error,
@@ -614,6 +712,7 @@ export class LiveSession {
       denials: t.denials,
       stoppedBy: t.stoppedBy,
       error,
+      apiError: t.apiError,
     };
     log('result', `${this.threadId} turn=${t.n} pid=${this.pid ?? '-'} ok=${out.ok} subtype=${out.subtype} session=${out.sessionId} turns=${out.numTurns} replies=${out.replies} tools=${out.tools.length} denials=${JSON.stringify(out.denials)}${out.stoppedBy ? ` stopped_by=${out.stoppedBy}` : ''} turn_cost_usd=${turnCost.toFixed(4)} total_cost_usd=${costTotal.toFixed(4)} duration_ms=${out.durationMs}`);
     t.resolve(out);

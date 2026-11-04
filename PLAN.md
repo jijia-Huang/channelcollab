@@ -1,6 +1,6 @@
 # channelcollab — 多人 × 多 Bot 的 Discord 協作 實作計畫
 
-> 狀態：Phase 1、Phase 2 與 Phase 3 的大部分已完成並在 Discord 實測（見第 15 節）
+> 狀態：Phase 1、Phase 2 與 Phase 3 的大部分已完成並在 Discord 實測（見第 15 節）；0.1.5 加了私訊、`!` 指令、上下文與額度提醒、PIN、白名單、禁區、稍後核准（第 18 節）
 > 本資料夾之後會成為 plugin marketplace 的 repo。
 > 外部工具（例如決策類工具）不在本工具內，只透過 `channelcollab resume` 指令接回（見第 9 節）。
 
@@ -100,8 +100,12 @@
     "idle_close_minutes": 120,
     "max_live_sessions": 4,
     "permission_mode": "default",
-    "permission_timeout_minutes": 10
+    "permission_timeout_minutes": 10,
+    "owner_wait_minutes": 2
   },
+  "dm": { "cwd": "D:\\work\\repo-a", "permission_mode": "auto" },
+  "security": { "pin_unlock_minutes": 30 },
+  "access": { "roster_only": true },
   "channels": {
     "1234567890": {
       "cwd": "D:\\work\\repo-a",
@@ -148,6 +152,10 @@
 | `channels.<頻道 ID>.permission_mode` | 覆寫 `defaults.permission_mode` |
 | `channels.<頻道 ID>.tools` | 真正限縮可用的工具集；省略表示全部 |
 | `channels.<頻道 ID>.external` | 簡易模式：外部指令，只做文字往來（見第 9 節）。設定這個欄位時不使用 `launcher` |
+| `defaults.owner_wait_minutes` | 權限請求等主人多久（預設 2，和 `permission_timeout_minutes` 取短的），之後改成稍後核准（第 18 節） |
+| `dm` | 私訊設定（0.1.5），欄位同頻道綁定（`cwd`、`model`、`permission_mode`、`launcher`）；沒有就是關閉。`bind --dm` 設定 |
+| `security.pin_unlock_minutes` | PIN 正確後多久內免輸入（預設 30） |
+| `access.roster_only` | 白名單（預設 true）：只有主人、名冊成員、名冊 Bot 的主人、名冊上的 Bot 能觸發 |
 | `unbound` | 沒綁定的頻道怎麼處理；`ignore` 表示不回應 |
 | `on.task_completed` | 任務標記完成時執行的指令（stdin 傳 JSON），空字串表示不接 |
 
@@ -357,12 +365,12 @@
 |---|---|
 | 計畫審核（ExitPlanMode） | 顯示計畫＋「核准／修改」按鈕 |
 | 待辦清單（Todo） | 一則持續更新的清單訊息 |
-| `/model`、`/mode` | 切換此討論串的模型或權限模式 |
-| `/new`、`/resume` | 開新 session；接續舊 session（自動完成） |
+| `/model`、`/mode` | 切換此討論串的模型或權限模式（0.1.5 以 `!model`、`!plan` 實作，見第 18 節） |
+| `/new`、`/resume` | 開新 session；接續舊 session（0.1.5 以私訊的 `!clear`、`!resume` 實作） |
 | `/btw` | 把目前上下文分出一個新討論串，問旁支問題，不打擾主線 |
 | `/terminal` | 給一行 `claude --resume <ID>`，在終端機接手（Discord 這邊會暫停） |
 | `/diff` | 顯示目前 worktree 的變更（附檔或摘要） |
-| `/usage` | 顯示用量 |
+| `/usage` | 顯示用量（0.1.5：`!status` 與自動的上下文、額度提醒） |
 | skills 變成斜線指令 | `/skill` 加自動完成 |
 
 **Discord 先天限制**：單則訊息上限 2000 字（`reply` 會自動切段或改附檔）；表情與編輯有頻率限制，狀態更新要合併處理。
@@ -381,6 +389,8 @@
 | 標記完成 | 提出需求的人或主人 |
 
 其他人按了沒有權限的按鈕，只會看到一則僅自己可見的提示：權限請求是「只有 Bot 擁有者可以核准。」；問題和 🛑 是「只有 @提出需求的人 或 @主人 可以回答／停止這一輪。」。由其他 Bot 觸發的一輪，「提出需求的人」是空的（Bot 不會按按鈕，提示裡也不 @ Bot，避免觸發它），只有主人能操作。判斷邏輯在 `src/runner/policy.ts` 的 `canAct`，由 `spike/authz-check.ts` 驗證。
+
+0.1.5 起還有：PIN（核准前要輸入，連錯 3 次整隻 Bot 鎖定）、白名單（誰能觸發）、禁區（任何模式都不能碰的路徑）、稍後核准（主人 2 分鐘沒按）。見第 18 節。
 
 ### 誰是主人
 
@@ -658,6 +668,7 @@ spike 程式與輸出在 `spike/`（`sdk-hello.ts`、`launcher-test.ts`、`outpu
 | 0 驗證假設 | 0-3、0-4、0-5、0-8 與串流／resume ✅；0-1、0-2（單一 exe）延後；0-6、0-7、0-9 未驗證 |
 | 1 單人跑通 | ✅ 已完成並在 Discord 實測；另外做了常駐 session（一個討論串一個持續運作的 `query()`，不必每輪重啟 CLI） |
 | 2 互動功能 | ✅ 權限按鈕、選擇題、🛑 停止、附檔、長輸出切段、排隊，都已在 Discord 實測 |
+| 0.1.5 | 私訊、`!` 指令、上下文與額度提醒、PIN、白名單、禁區、稍後核准、bot role 觸發、錯誤訊息白話化（第 18 節）。單元測試與 SDK spike 通過；Discord 上尚未實測 |
 | 3 多人化 | 大部分 ✅：多 Bot、名冊、觸發規則、轉手上限、多人權限、協作守則、setup／bind／start／stop／status／roster（0.1.4 前叫 update-roster）、create-bot、marketplace 打包。未做：`post`／`resume` 指令、`on.task_completed`。開機自動啟動改成桌面 `.bat` 與斜線指令 |
 | 4 進階體驗 | 未開始 |
 
@@ -718,6 +729,75 @@ spike 程式與輸出在 `spike/`（`sdk-hello.ts`、`launcher-test.ts`、`outpu
 5. **一般頻道被 @ 時**：一律開討論串，還是短問答直接回覆？
 6. 協作守則中「小事」的定義與範例。
 7. **常駐程式的本機 IPC**（頂替模式、`post`、`reply` 共用）：用 named pipe 還是 localhost HTTP？
+
+---
+
+## 18. 0.1.5：私訊、指令、用量提醒、資安
+
+### 私訊（DM）
+
+- 只有主人能用（`discord.owner_id`，沒有就用名冊推出的主人）。別人私訊回「這隻 Bot 只接受主人私訊」，同一人 10 分鐘內只回一次。沒設 `dm` 時回「私訊未開啟」（同樣節流）。**沒設 PIN 時私訊一律不開放**（回「請先設定 PIN」）；`dm` 可以先寫好，設了 PIN 才生效。
+- discord.js：加 `DirectMessages` intent（非特權）與 `Partials.Channel`。私訊不用 @，每則訊息都觸發。
+- 一條對話 = 一個常駐 session（key `dm`），沿用討論串的全部機制：閒置回收與 resume、權限按鈕、auto 擋下送按鈕、選擇題、狀態表情、附檔（`<HOME>\inbox\dm\`）、長訊息切段、忙時排隊。程式上討論串與私訊共用 `src/discord/conversation.ts` 的 `runTurn`（`room` 是討論串或 DMChannel）。
+- 提示詞：系統提示說明這是和主人的一對一私訊、照常用 reply；名冊仍提供（身分、團隊有誰），但不附 `<@ID>`、不套用交棒守則，並要求不要 @ 任何人（`rosterPrompt(..., { dm: true })`）。reply 在私訊不解析 mention。
+- 狀態：`state.json` 的 `dm`（目前的私訊對話）與 `dmHistory`（最多 30 段，`!resume` 用），每段記 `first`／`last` 摘要、`lastAt`、`cwd`、`source`。
+- 超過 PIN 免輸入時間時，私訊先擋下：回一個「🔓 解鎖」按鈕 → Modal 輸 PIN → 解鎖後被擋下的訊息（最多 20 則）依序接著處理。
+
+### `!` 指令
+
+訊息只有指令時才算（大小寫不分，前面的 @ 會略過；只有 `!model` 可帶一個參數）。在 `enqueue` 之前攔下，所以 `!stop` 不會排隊。討論串裡限主人或提出需求的人（`canAct('stop')`：目前這一輪的觸發者，沒有在跑時用討論串起始訊息的作者）；主頻道打指令只回「指令請在討論串裡使用」，不開討論串。指令訊息不會進到之後的【最近訊息】。
+
+| 指令 | 實作 |
+|---|---|
+| `!help` | 列出指令 |
+| `!clear`（私訊） | Claude 在跑或有排隊時拒絕（要先 `!stop`）；否則正常關閉 session（`pool.release`），目前的對話移進 `dmHistory`，下一則開新的 |
+| `!resume`（私訊） | 下拉選單列出 `dmHistory` 與這隻 Bot 有 session 的討論串，依最後一輪時間排序取 10 筆（選單 label：時間＋來源；description：最後一句或第一句）。私訊的直接接回；討論串的用 `forkSession(id, { dir: 討論串的 cwd })` 複製一份再 resume，討論串自己的 session 不受影響（spike：fork 後原 session 的 lastModified 不變）。**接回討論串的分支時，私訊改用那個討論串的工作目錄**（對話內容指的是那裡的檔案），`!status` 會顯示目前的工作目錄與來源；這一點偏離「私訊工作目錄固定」，`!clear` 後回到 `dm.cwd` |
+| `!stop` | `query.interrupt()`，同 🛑 |
+| `!status` | 工作目錄、模型（設定與實際）、權限模式、session 開了多久、這段對話累計花費、上下文使用率、額度、PIN 狀態 |
+| `!model` | 按鈕 haiku／sonnet／opus，或 `!model sonnet`；`Query.setModel()`，不重開 session（spike：之後的 init 與 assistant 訊息都換成新模型）。選擇記在 state，resume 後沿用 |
+| `!plan` | `Query.setPermissionMode('plan')`，再打一次切回綁定的模式；hook 改讀 session 目前的模式，計畫模式下非唯讀工具一律拒絕，拒絕理由請 Claude 用 reply 說明計畫。開關記在 state，resume 時直接以 plan 啟動（spike：以 plan 啟動後可切到 auto；auto→plan→auto 也可） |
+| `!compact` | 把 `/compact` 當使用者訊息送進 session（spike：出現 `status: compacting` → `compact_boundary`（manual，pre/post tokens）→ 一般的 `result`（success、空文字），壓縮後仍記得先前內容）。完成後回「🗜️ 已壓縮上下文：X% → Y%」 |
+| `!retry` | 把上一則 prompt（`state.lastPrompt`）原樣再送一次 |
+
+### 上下文與額度提醒
+
+- **上下文**：每輪結束後呼叫 `Query.getContextUsage({ detail: 'summary' })`，取 `percentage`、`totalTokens`、`maxTokens`（與 `/context` 相同的數字；`maxTokens` 是自動壓縮的視窗，1M 模型可能是 200K 邊界）。拿不到時退回「最後一次主執行緒 assistant 訊息的 usage（input＋cache read＋cache creation＋output）÷ `result.modelUsage[model].contextWindow`」。`result.usage` 是整輪累加，不能直接當上下文大小。
+- 提醒：70% 與 95% 各發一則一次性提醒；**85% 起每則 reply 最後附一行**「🧠 上下文 87%，可打 !compact」（長訊息切段時只附在最後一段，切段會預留空間）；85% 不另發訊息。門檻記在 state 的 `ctxNotified`，使用率掉回門檻以下（compact／clear 後）就重新計算。
+- **額度**：`rate_limit_event` 的 `rate_limit_info`。實際收到的欄位（spike）：`status`（allowed／allowed_warning／rejected）、`resetsAt`（**unix 秒**）、`rateLimitType`、`overageStatus`、`overageDisabledReason`、`isUsingOverage`，以及型別裡沒有、CLI 標為 internal 的 `unifiedWindows`（`five_hour`、`seven_day` 各有 `utilization`、`resetsAt`、`status`、`surpassedThreshold`）。`utilization` 是 **0～1 的比例**（CLI 的 schema 說明：可能超過 1）。有 `unifiedWindows` 就逐視窗判斷，沒有就用最上層欄位。
+- 額度提醒：每個視窗在 80%、95%、被拒絕時各提醒一次（例如「⚠️ 5 小時額度已用 85%，約 14:30 重置」），重置時間換了（新視窗）就重新計算；只有 `allowed_warning` 沒有數字時寫「接近上限」。最新一筆事件全 Bot 共用；Bot 啟動後還沒收到事件時 `!status` 寫「未知」。沒有用 `usage_EXPERIMENTAL…` API。
+
+### 兩個修正
+
+- @ Bot 的同名身分組也觸發：訊息提到的身分組若 `role.tags.botId === 自己` 或是 `guild.members.me.roles.botRole`，視同 @ 了 Bot；一般身分組、@everyone 不算。另外（擴充）提到**其他** Bot 的 managed role 視同 @ 了那個 Bot（`mentionsOtherBot`），讓觸發規則一致。
+- 錯誤訊息：result 的 `is_error` 為 true 但 subtype 是 success 時，取 `result.result`（error 類 subtype 取 `errors`），加上 assistant 訊息的 `error`（例如 `authentication_failed`），顯示前 3 行並給白話建議（沒登入、額度、服務忙碌、模型、上下文太長、步驟太多、逾時）。輸出前遮掉 token 樣式的字串（Discord token、`sk-ant-…`、Bearer、JWT 樣式、40 字以上的不透明字串）。
+
+### PIN（G1）
+
+- `set-pin`／`clear-pin`／`unlock`：不是在主控台執行時（例如 Claude Code），另開主控台視窗（`cmd /c start /wait`）由本人輸入，不回顯，輸入兩次。PIN 不經過命令列、shell 歷史或 Claude 的對話。`<HOME>\pin.json` 存 scrypt（N=16384、r=8、p=1、32 bytes）雜湊與 16 bytes salt；Bot 每次驗證都重讀檔案，驗證用 `timingSafeEqual`。
+- 按「允許／一律允許」：先檢查是不是主人（`canAct`），**之後**才開 PIN Modal，所以非主人看不到 Modal，也不會累計錯誤次數（`approvalStep`）。PIN 正確才放行，結果 ephemeral，頻道只留「✅ 已允許」。「拒絕」、🛑、選擇題不需要 PIN。
+- 正確後 `security.pin_unlock_minutes`（預設 30）內免輸入，只存在記憶體（重啟失效）。連錯 3 次鎖定：**整隻 Bot 暫停**，所有觸發都不理（log `[ignore] … locked`），在發生的頻道或私訊發一則提醒；只能 `unlock`（經 named pipe 的 `unlock` 指令）或重啟解除。每個 HOME 各自計算。log 記每次失敗，不記輸入內容。
+- 沒設 PIN：頻道的核准照舊，status 警告「建議設定 PIN」；私訊不開放。
+- 桌面捷徑多了「設定 channelcollab PIN.bat」「解除 channelcollab 鎖定.bat」。
+
+### 白名單（G2）
+
+`access.roster_only`（預設 true）：能觸發 Bot（@、身分組 @、討論串裡的指令與一般訊息）的只有主人、名冊成員、名冊上 Bot 的主人、名冊上的 Bot。其他人只記 `[ignore] … not-allowed`，不回覆。私訊另有「只限主人」的規則。
+
+### 禁區（G3）
+
+PreToolUse hook 最前面判斷（比 retry 放行、always allow、auto 分類器都早），任何模式都 deny，理由寫明「不要再試、不要繞過」：channelcollab 的 HOME（自己的與任何 `.channelcollab*`；這個對話自己的附件資料夾除外）、`.ssh`、`.env`／`.env.*`、`.credentials.json`，以及在指令裡執行 `channelcollab.mjs`／`create-bot.mjs`／`ctl.mjs`。檔案工具比對 `path.resolve` 後的路徑（大小寫、斜線正規化）；Bash、PowerShell、其他 MCP 工具只比對文字，盡力而為。reply 的附檔也檢查。
+
+### 稍後核准（H）
+
+- 權限按鈕等 `min(owner_wait_minutes, permission_timeout_minutes)`（預設 2 分鐘）。逾時不再單純拒絕，而是回 `DEFER_MESSAGE`（主人暫時不在、已排入待核准清單、先做能做的、做不到的在 reply 整理成「待主人核准」、不要重試）。系統提示也寫了這種情況的收尾方式。
+- 這一輪結束時，延後的動作（工具名稱＋輸入，`retryKey` 比對）成為一個 batch，存在 `state.json` 的 `approvals`（24 小時有效，Bot 重啟後按鈕仍有效）。卡片私訊給主人（不需要開 `dm`），內容是哪個討論串、誰提的需求、每個動作的摘要，按鈕「全部允許／逐項選擇／全部拒絕」（都過 `canAct`，允許要過 PIN）。私訊送不出去時卡片改發在討論串。討論串只發一則短通知「⏳ 有 N 個動作等 @主人 核准（已私訊主人）」。
+- 允許後：對那個對話排入一輪「主人已核准：…請用相同參數執行…並用 reply 回報」，這一輪預先把核准的 `retryKey` 放進 retries（沿用 0.1.3 auto 核准的機制：PreToolUse 比對到就 allow，跳過分類器）；只限這一輪、只限清單上的動作，參數不同照一般流程。全部拒絕：通知改「🚫 主人拒絕了…」，下一則訊息前面附上「主人拒絕了這些動作，不要做」。過期：按鈕失效，通知改「⌛ 已過期」。
+
+### 驗證
+
+- SDK spike（`spike/v015-check*.ts`，SDK 0.3.314，haiku／sonnet）：`/compact`、`getContextUsage`、`setModel`、`setPermissionMode`（default↔plan、auto↔plan、以 plan 啟動再切 auto）、`forkSession` 後在同一 cwd 與**不同 cwd** resume 都能接回、`rate_limit_event` 的欄位。
+- 單元測試 `src/features.test.ts`（36 項）：指令解析、私訊權限、resume 清單、門檻只提醒一次與附註切段、額度提醒、bot role 觸發、錯誤訊息與遮罩、PIN（非主人不開 Modal、不累計；鎖定；免輸入時間）、白名單、禁區、稍後核准（2 分鐘延後、私訊卡片、私訊失敗退回討論串、retryKey 放行與參數不符、拒絕、過期）。總控 self-test 加了私訊設定、白名單、PIN 雜湊。
+- 尚未在 Discord 實測。
 
 ---
 

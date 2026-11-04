@@ -1,6 +1,6 @@
 ---
 name: bind
-description: 新增、修改、移除或列出 channelcollab 的頻道綁定（哪個 Discord 頻道對應哪個工作資料夾、用什麼模型、權限模式、啟動器）。使用者說「綁定頻道」「把這個頻道綁到某資料夾」「改頻道的模型」「Bot 在某頻道不回應」「列出綁定」「解除綁定」時使用。
+description: 新增、修改、移除或列出 channelcollab 的頻道綁定（哪個 Discord 頻道對應哪個工作資料夾、用什麼模型、權限模式、啟動器），開關私訊（主人私訊 Bot），設定核准用 PIN、白名單。使用者說「綁定頻道」「把這個頻道綁到某資料夾」「改頻道的模型」「Bot 在某頻道不回應」「列出綁定」「解除綁定」「開私訊」「關私訊」「設定 PIN」「解除鎖定」時使用。
 argument-hint: "[頻道ID] [工作資料夾]"
 allowed-tools: Bash(node:*), PowerShell(node:*)
 ---
@@ -57,6 +57,32 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind --channel <頻道ID>
 ```
 node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind --remove --channel <頻道ID>
 ```
+
+## 私訊（DM）
+
+主人可以直接私訊自己的 Bot（不用 @、不用開討論串）。預設關閉，設定存在 config 的 `dm`，欄位和頻道綁定相同，只是沒有頻道 ID：
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind --dm --cwd "<工作資料夾>" [--permission-mode <模式>] [--launcher "<啟動器>"] [--model <模型>]
+node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind --dm --remove
+```
+
+- 工作資料夾沒指定時，建議用第一個綁定頻道的資料夾（先 `bind --list` 看）。
+- 只有主人能私訊；**沒設 PIN 時私訊不開放**。`bind --list` 會提醒；還沒設就請使用者執行下方的 set-pin。
+- 一樣不允許 `bypassPermissions`。
+- 告訴使用者：私訊等於在遠端操作自己的電腦，Discord 帳號務必開兩步驟驗證。
+
+## PIN（核准權限與私訊用）
+
+```
+node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" set-pin
+```
+
+會另開一個主控台視窗，**由使用者自己在那個視窗輸入兩次 PIN**（不回顯）。**不要叫使用者把 PIN 打在對話裡，也不要把 PIN 放進任何指令參數。** 指令會等視窗關閉，逾時請設 10 分鐘。移除用 `clear-pin`，PIN 輸錯 3 次被鎖定時用 `unlock`，同樣在跳出的視窗裡確認。
+
+## 白名單
+
+預設只有主人、名冊上的人和 Bot 能叫 Bot。要關掉（不建議）：`access --roster-only off`；看目前狀態：`access`。
 
 ## 生效時間
 
