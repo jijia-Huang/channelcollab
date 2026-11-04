@@ -422,6 +422,8 @@
   - 所以主人的決定在 Claude **重試同一個呼叫**時生效：Bot 記下這個呼叫（`retryKey`：工具名稱＋參數，不含 Claude 自己寫的 `description`），重試時 PreToolUse hook 回 `allow` —— 實測會跳過自動判斷，指令真的執行；主人拒絕或逾時則回 `deny`，理由就是主人的拒絕理由。記錄只在這一輪內有效。
   - 系統提示要求 Claude 在被告知可以重試時用相同參數重試一次。實測每次都會重試；如果 Claude 改了參數，等於新的呼叫，會再經過一次自動判斷（擋下就再問一次）。
   - 代價：每次擋下多一步（Claude 重試一次）。
+  - Discord 實測（0.1.3，測試頻道，cwd 是 sandbox，用啟動器加一條測試用 `hard_deny` 規則讓「對 `.invalid` 主機發 POST」穩定被擋）：(a) `echo … > 檔案` 自動放行，沒有按鈕；(b) `curl -X POST` 到不存在的主機被擋（`[Data Exfiltration]`），按鈕寫出原因，按「允許」後 Claude 用相同指令重試，log `retry allow`，curl 真的執行（結束代碼 6）；(c) 同樣被擋後按「拒絕」並填理由，Claude 重試時收到主人的理由（log `retry deny`），改成把內容寫進檔案，沒有連網。
+  - 沒有系統提示的 spike 裡有一次 Claude 沒有重試（直接回報被擋），這時主人的「允許」不會生效；Bot 的系統提示有要求重試，實測兩次都有重試。
 - 等待期間的取消：hook 和 `canUseTool` 收到的 `signal`，加上這一輪自己的 AbortController（🛑、強制關閉、逾時時觸發），任一個 abort 就把按鈕訊息標成「已取消」並回傳拒絕，hook 不會卡住。
 
 ---
