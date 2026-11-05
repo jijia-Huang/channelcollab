@@ -6,7 +6,7 @@
  */
 import { canAct } from '../runner/policy.js';
 
-export type CommandName = 'help' | 'clear' | 'resume' | 'stop' | 'status' | 'model' | 'plan' | 'compact' | 'retry' | 'skill';
+export type CommandName = 'help' | 'clear' | 'resume' | 'stop' | 'status' | 'model' | 'effort' | 'plan' | 'compact' | 'retry' | 'skill' | 'takeback';
 /** `rest`: what follows the skill name in `!skill <name> <args>`. */
 export type Command = { name: CommandName; arg?: string; rest?: string };
 
@@ -15,7 +15,8 @@ export type Command = { name: CommandName; arg?: string; rest?: string };
  * for the person who used it (a slash command answers ephemerally); the others
  * change the conversation and leave a short public note.
  */
-type Spec = { dmOnly: boolean; takesArg: boolean; private: boolean; desc: string; example?: string };
+/** ownerOnly: in a thread only the bot's owner may use it (not whoever asked). */
+type Spec = { dmOnly: boolean; takesArg: boolean; private: boolean; desc: string; example?: string; ownerOnly?: boolean };
 export const COMMANDS: Record<CommandName, Spec> = {
   help: { dmOnly: false, takesArg: false, private: true, desc: '列出指令' },
   clear: { dmOnly: true, takesArg: false, private: false, desc: '結束目前的對話，下一則訊息開新的' },
@@ -23,11 +24,30 @@ export const COMMANDS: Record<CommandName, Spec> = {
   stop: { dmOnly: false, takesArg: false, private: false, desc: '中斷 Claude 正在做的這一輪（同 🛑）' },
   status: { dmOnly: false, takesArg: false, private: true, desc: '工作目錄、模型、模式、花費、上下文和額度' },
   model: { dmOnly: false, takesArg: true, private: false, desc: '換模型（haiku／sonnet／opus）', example: 'sonnet' },
+  effort: { dmOnly: false, takesArg: true, private: false, desc: '調整努力程度（low／medium／high／xhigh／max，default 回到預設）', example: 'high' },
   plan: { dmOnly: false, takesArg: false, private: false, desc: '切到計畫模式（只討論不動手），再用一次切回' },
   compact: { dmOnly: false, takesArg: false, private: false, desc: '壓縮上下文，讓對話可以繼續' },
   retry: { dmOnly: false, takesArg: false, private: false, desc: '把上一則訊息原樣重送一次' },
   skill: { dmOnly: false, takesArg: true, private: false, desc: '執行 Claude Code 的 skill 或自訂指令', example: '<名稱> [參數]' },
+  takeback: { dmOnly: false, takesArg: false, private: false, ownerOnly: true, desc: '強制接回主人在電腦上接手中的對話（電腦上的請先關掉）' },
 };
+
+/** Effort levels (SDK EffortLevel), with what they mean for the person picking one. */
+export const EFFORT_CHOICES = [
+  { level: 'low', label: 'low', note: '最快、最省' },
+  { level: 'medium', label: 'medium', note: '較快' },
+  { level: 'high', label: 'high', note: '仔細' },
+  { level: 'xhigh', label: 'xhigh', note: '很仔細' },
+  { level: 'max', label: 'max', note: '最仔細、最慢' },
+] as const;
+
+/** An effort level given to !effort / /effort: one of the levels, or default / none to go back to the default (null). */
+export function normalizeEffort(arg: string): string | null | undefined {
+  const a = arg.trim().toLowerCase();
+  if (EFFORT_CHOICES.some((c) => c.level === a)) return a;
+  if (a === 'default' || a === 'none' || a === '預設') return null;
+  return undefined;
+}
 
 export const MODEL_CHOICES = [
   { alias: 'haiku', label: 'Haiku', note: '最快、最便宜' },
@@ -110,6 +130,9 @@ export function slashDefinitions(): SlashDefinition[] {
     if (name === 'model') {
       def.options = [{ type: STRING, name: 'name', description: '要換成的模型（不選就顯示按鈕）', required: false, choices: MODEL_CHOICES.map((m) => ({ name: `${m.label}（${m.note}）`, value: m.alias })) }];
     }
+    if (name === 'effort') {
+      def.options = [{ type: STRING, name: 'level', description: '努力程度（不選就顯示按鈕）', required: false, choices: [...EFFORT_CHOICES.map((e) => ({ name: `${e.label}（${e.note}）`, value: e.level })), { name: 'default（回到預設）', value: 'default' }] }];
+    }
     if (name === 'skill') {
       def.options = [
         { type: STRING, name: 'name', description: 'skill 或自訂指令的名稱（從清單選）', required: true, autocomplete: true, max_length: 100 },
@@ -125,6 +148,7 @@ export function commandFromSlash(name: string, options: Record<string, string | 
   if (!(name in COMMANDS)) return undefined;
   const n = name as CommandName;
   if (n === 'model') return options.name ? { name: n, arg: options.name } : { name: n };
+  if (n === 'effort') return options.level ? { name: n, arg: options.level } : { name: n };
   if (n === 'skill') return { name: n, ...(options.name ? { arg: options.name } : {}), ...(options.args?.trim() ? { rest: options.args.trim() } : {}) };
   return { name: n };
 }
@@ -140,6 +164,7 @@ export type GateRefusal =
   | 'not-thread'
   | 'dm-only'
   | 'not-actor'
+  | 'owner-only'
   | 'dm-not-owner'
   | 'dm-disabled'
   | 'dm-no-pin'
@@ -179,6 +204,7 @@ export function commandGate(f: GateFacts): GateRefusal | undefined {
   if (f.notAllowed) return 'not-allowed';
   if (f.where !== 'thread') return 'not-thread';
   if (COMMANDS[f.cmd].dmOnly) return 'dm-only';
+  if (COMMANDS[f.cmd].ownerOnly && (!f.ownerId || f.actorId !== f.ownerId)) return 'owner-only';
   // Like 🛑: the owner, or whoever asked for the running turn (else the thread's starter).
   if (!canAct('stop', f.actorId, { ownerId: f.ownerId, requesterId: f.requesterId })) return 'not-actor';
   return undefined;
@@ -202,6 +228,8 @@ export function gateText(r: GateRefusal, f: { cmd: CommandName; ownerId?: string
       const names = [f.requesterId, f.ownerId].filter((v, i, a) => v && a.indexOf(v) === i).map((u) => `<@${u}>`);
       return `只有 ${names.join(' 或 ') || 'Bot 的主人'} 可以在這個討論串用指令。`;
     }
+    case 'owner-only':
+      return `\`${c}\` 只有 Bot 的主人${f.ownerId ? `（<@${f.ownerId}>）` : ''}可以用。`;
     case 'dm-not-owner':
       return '這隻 Bot 只接受主人私訊。';
     case 'dm-disabled':

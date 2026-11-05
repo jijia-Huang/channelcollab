@@ -20,7 +20,6 @@ PIN 和鎖定的提示會指向**實際存在的捷徑檔**（檔名帶 Bot 名�
 
 | 狀況 | 建議 |
 |---|---|
-
 | Bot 沒有在執行 | `/channelcollab:start` |
 | token 未設定 | `/channelcollab:setup` 匯入交付檔 |
 | 主人 Discord ID 未設定 | `node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" set-owner <自己的 Discord 使用者 ID>`，否則沒人能按權限按鈕 |
@@ -36,6 +35,8 @@ PIN 和鎖定的提示會指向**實際存在的捷徑檔**（檔名帶 Bot 名�
 | 在跑，但在 Discord @ 它沒反應 | 確認是在綁定的頻道（或其底下的討論串）裡 @；檢查「最近的錯誤」；仍不行就 stop 再 start |
 | 私訊 Bot 沒反應 | 和 Bot 要有共同的伺服器；只接受主人（主人 ID 要是自己）；🔒 時要按「解鎖」輸入 PIN |
 | 打 `/` 沒看到 Bot 的指令 | 斜線指令在 Bot 啟動時註冊，剛註冊可能要幾分鐘才出現，重開 Discord 可以刷新；bot.log 有 `[commands] registered … global slash commands` 表示註冊成功（`registration failed` 則看後面的原因）。同一個伺服器有好幾隻 Bot 時，選單依 Bot 分組，要選自己這隻 |
+| 想看某段對話的努力程度、單輪上限、是不是在電腦上接手中 | 在 Discord 那段對話裡打 `/status`；總控 `status` 只顯示綁定的設定（努力程度、單輪工作與步數上限） |
+| 對話一直回「主人在電腦上接手中」 | 那段對話被 `/channelcollab:takeover` 接到電腦上了：在接手的視窗用 `/channelcollab:release` 交還，或 `node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" sessions` 找到標 🖥️ 的那段再 `release <編號>`；也可以在 Discord 打 `/takeback`（先關掉電腦上的視窗） |
 | 「最近的錯誤」 | 已過濾掉 SDK 對 reply 工具的提醒（`CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`，reply 一律放行是刻意的設計），剩下的才是真的錯誤 |
 
 完整 log 在 `<HOME>\bot.log`、`<HOME>\bot.err.log`（上一次執行的在 `bot.prev.log`）。log 不含 token，需要時可以讀最後幾十行來判斷問題；**不要讀 `config.json`**（裡面有 token）。

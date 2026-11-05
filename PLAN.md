@@ -1,6 +1,6 @@
 # channelcollab — 多人 × 多 Bot 的 Discord 協作 實作計畫
 
-> 狀態：Phase 1、Phase 2 與 Phase 3 的大部分已完成並在 Discord 實測（見第 15 節）；0.1.5 加了私訊、`!` 指令、上下文與額度提醒、PIN、白名單、禁區、稍後核准（第 18 節）
+> 狀態：Phase 1、Phase 2 與 Phase 3 的大部分已完成並在 Discord 實測（見第 15 節）；0.1.5 加了私訊、`!` 指令、上下文與額度提醒、PIN、白名單、禁區、稍後核准（第 18 節）；0.1.7 拿掉單輪上限（第 20 節）；0.1.8 加了回報到群組、在電腦上接手與交棒、努力程度（第 21 節）
 > 本資料夾之後會成為 plugin marketplace 的 repo。
 > 外部工具（例如決策類工具）不在本工具內，只透過 `channelcollab resume` 指令接回（見第 9 節）。
 
@@ -608,10 +608,11 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 ├─ src/                               Bot 本體（TypeScript）
 │   ├─ main.ts                        進入點（npm start）
 │   ├─ stop.ts                        npm run stop
-│   ├─ config.ts、log.ts、roster.ts、roster.test.ts、features.test.ts、slash.test.ts
-│   ├─ discord/                       收發、按鈕、選單、表情、詳細；conversation（討論串與私訊共用的一輪）、commands／command-run（! 與 / 指令共用的解析、gate、執行）、slash（斜線指令註冊與互動）、approvals-ui（稍後核准）、pin-ui
+│   ├─ config.ts、log.ts、roster.ts、roster.test.ts、features.test.ts、slash.test.ts、bridge.test.ts
+│   ├─ discord/                       收發、按鈕、選單、表情、詳細；conversation（討論串與私訊共用的一輪）、commands／command-run（! 與 / 指令共用的解析、gate、執行）、slash（斜線指令註冊與互動）、approvals-ui（稍後核准）、pin-ui、post（回報到群組）、takeover（接手、交還、交棒）、control（控制通道的指令）
 │   ├─ router/                        觸發判斷、轉手計數、排隊
-│   ├─ runner/                        Agent SDK 驅動、啟動器、session 池；usage（上下文與額度提醒）、failure（錯誤訊息）、approvals（稍後核准）、skills（/skill 清單）
+│   ├─ runner/                        Agent SDK 驅動、啟動器、session 池；usage（上下文與額度提醒）、failure（錯誤訊息）、approvals（稍後核准）、skills（/skill 清單）、turn-clock（選用的單輪上限）
+│   ├─ ipc/                           control（named pipe 控制通道：一行一個指令）
 │   ├─ security/                      pin（核准用 PIN）、zones（禁區）、access（白名單）
 │   └─ store/                         本機狀態（state.json）
 ├─ plugin/                            plugin 根目錄
@@ -619,12 +620,13 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 │   ├─ README.md
 │   ├─ roster.example.json            名冊格式範例（假資料）
 │   ├─ runtime/                       建置產物（進 repo）：bot.mjs、stop.mjs、package.json、package-lock.json、version.json
-│   ├─ scripts/channelcollab.mjs      總控：check、install-runtime、set-owner、bind、roster、start、stop、status、shortcut
+│   ├─ scripts/channelcollab.mjs      總控：check、install-runtime、set-owner、bind、roster、start、stop、status、shortcut、homes、targets、post、sessions、takeover、release、handoff
 │   └─ skills/
 │       ├─ setup/                     /channelcollab:setup
 │       ├─ bind/                      /channelcollab:bind
 │       ├─ start/、stop/、status/     /channelcollab:start、stop、status
 │       ├─ roster/                    /channelcollab:roster（管理自己的名冊）
+│       ├─ report/、takeover/、release/、handoff/   /channelcollab:report 等（0.1.8，第 21 節）
 │       ├─ guidelines/                協作守則（給人看；與 src 的提示詞一致）
 │       └─ create-bot/                管理員用：建 Bot、交付檔、名冊
 ├─ docs/
@@ -641,7 +643,7 @@ channelcollab/                        （repo 根目錄 = marketplace 根目錄�
 └─ runtime/                           bot.mjs、stop.mjs、ctl.mjs、node_modules、version.json
 ```
 
-預定但尚未實作：`skills/takeover/`、`skills/handback/`（頂替模式，Phase 4）、`src/ipc/`、`src/external/`。
+預定但尚未實作：`skills/handback/`（第 10 節的頂替模式，Phase 4；0.1.8 的 `takeover` 是另一件事，見第 21 節）、`src/external/`。
 
 ---
 
@@ -881,6 +883,69 @@ PreToolUse hook 最前面判斷（比 retry 放行、always allow、auto 分類�
 
 - 單元測試：`src/features.test.ts` 加 7 項（預設不限、defaults／頻道／私訊覆寫、0 代表不限、等待時間不計入、stop 後不觸發、快到時提醒、逾時與步數上限的訊息與 @、錯誤提示）；總控 self-test 加 3 項（`--turn-timeout`、`--max-turns` 的寫入與驗證、錯誤行只看標籤）。
 - 實測（`spike/v017-timeout.ts`，haiku，sandbox）：上限設 20 秒、要求執行 `sleep 40`：這一輪以 `subtype=timeout` 結束、沒有任何 reply 送出、session 仍可用；下一輪「繼續」接在同一個 session ID，Claude 正常 reply；最後正常關閉 `clean=true`。計時包含啟動時間（這次 30 秒的啟動就用完了 20 秒的上限）。
+
+---
+
+## 21. 0.1.8：回報到群組、在電腦上接手與交棒、努力程度
+
+### 回報到群組（A）
+
+- **Discord 上（`post_to_channel`）**：Bot 的程序內 MCP 多一個工具 `post_to_channel(channel, text, files?, thread?, new_thread?, thread_title?)`。`channel` 可以是頻道 ID、名稱、`#名稱`、`<#ID>`；**只能是這隻 Bot 綁定的頻道**（`config.channels`，有 `guild_id` 時還要在那個伺服器），或這些頻道底下的討論串（`parentId` 比對）。名稱有重複時要求改用 ID。論壇頻道一定要開新討論串或指定討論串。
+  - 系統提示詞與工具說明列出可以貼的頻道（`#名稱（ID …）`，名稱取 discord.js 的 cache，不另打 API；每次啟動 session 時產生）。協作守則只**加**一條 post_to_channel 的說明，其餘不變。
+  - 貼出的訊息第一行標明來源：私訊「📣 由 <@主人> 的私訊工作回報」、討論串「📣 由討論串 <#ID> 的工作回報（<@主人> 的 Bot）」、電腦「📣 由 <@主人> 在電腦上的工作回報」。`allowedMentions` 只放文字裡 @ 到的人，主人在標示裡只顯示名字、不通知。
+  - **權限**（`policy.ts` 的 `decidePost`）：reply 一律放行，post_to_channel 不是。理由：reply 只回到觸發者正在看的那個對話；post 會把內容送到其他人看得到的團隊頻道，屬於對外動作，和執行指令一樣要由主人決定。所以「主人自己要求」（私訊；或討論串裡觸發這一輪的是主人）時，要求本身就是核准，直接放行；其他人或其他 Bot 觸發時，走一般的權限按鈕（含 PIN、稍後核准）。plan 模式一律拒絕（只討論不動手）；dontAsk 不問就拒絕。這個判斷在 PreToolUse hook 裡、比 `decideTool` 早，auto 模式也不交給分類器；`canUseTool` 也照同樣規則（plan 模式下 SDK 會把自己的工具送到那裡）。
+  - 附檔照 reply 的規則（工作資料夾或附件資料夾、禁區、最多 10 個）。
+  - **開了新討論串**：討論串由 Bot 開（owner 是 Bot），之後的觸發規則和 Bot 自己開的討論串一樣。state 記 `forkFrom: {sessionId, cwd}` 和 `lastSeenMessageId`（回報本身之後才算歷史）；這個討論串**第一次被觸發時**才 `forkSession`，之後用分支的 session 接續。用分支而不共用同一個 session ID：兩個對話共用一個 session 會變成兩個程序同時寫入（見下方實測，後寫的一邊會蓋掉另一邊）；延到第一次觸發才分支，是因為發文當下那一輪還沒結束，transcript 還不完整。和 0.1.5 `!resume` 接討論串的做法一致。
+- **電腦上（`/channelcollab:report` 與總控 `post`）**：`post --home … --channel … [--thread ID] [--new-thread 標題] [--file …]… [--text-file 檔案]`，文字也可以從 stdin。腳本**不讀 token**，經執行中 Bot 的 named pipe 請 Bot 發文；Bot 沒在執行就提示先啟動，Bot 是舊版（不認得 JSON 指令）就提示重啟。附檔不能是禁區（Bot 的 HOME 含 token）。印出討論串連結。skill 先 `homes`（列出各 HOME 的 Bot 名稱，多隻時讓使用者選）、`targets`（可以貼的頻道），整理摘要**給使用者確認**才送出（對外發文），文字用暫存檔傳。帶 `--session ${CLAUDE_SESSION_ID}` 時，新討論串一樣記 `forkFrom`，之後在那裡 @ Bot 會從電腦這段對話的分支接著做（資料夾以 session 紀錄為準）。
+
+### 控制通道（named pipe）
+
+- 0.1.7 以前每個連線只讀第一個 chunk（`socket.once('data')`），只有 `stop`／`unlock`／`pin-state` 這種短指令。改成 `src/ipc/control.ts`：讀到換行為止（上限 1 MB）、socket 用 `setEncoding('utf8')` 解碼（實測：長的中文內容分段到達時，切在多位元組字元中間會變亂碼；總控端也一樣改）。
+- 一行一個請求：舊的純文字指令照舊；新的是一行 JSON `{"cmd": …}`，回一行 JSON（都有 `ok`）。新指令：`info`、`post`、`sessions`、`takeover`、`release`、`handoff`（`src/discord/control.ts`）。
+- 安全：pipe 只有這個 Windows 使用者的程序連得上（和原本的 stop、unlock 同一個信任範圍）；發文仍只能到綁定的頻道。
+
+### Session 接管與交棒（B）
+
+**實測結論**（Claude Code 2.1.318、SDK 0.3.314、Windows 11；`spike/v017-*.mjs`、`spike/v018-*.mjs`，都在 sandbox 測試資料夾、haiku）：
+
+1. **session 檔的位置**：Bot 的 session 和一般 Claude Code 一樣在 `%USERPROFILE%\.claude\projects\<cwd 編碼>\<session ID>.jsonl`（`<cwd 編碼>` 是 cwd 的非英數字元換成 `-`）。逐一檢查兩隻 Bot `state.json` 裡的 session，都在這個資料夾。Bot 環境沒有 `CLAUDE_CONFIG_DIR`；Bot 用的啟動器只加 `--settings`、`--mcp-config`、`--append-system-prompt-file`、`--add-dir` 等參數，不改設定資料夾。（如果使用者自己設了 `CLAUDE_CONFIG_DIR`，Bot 會繼承，電腦上的 Claude Code 也要用同一個值才找得到。）
+2. **resume 的指令**：在 session 自己的工作資料夾，用**同一個啟動器**加 `--resume <ID>`（沒有啟動器就是 `claude --resume <ID>`），這樣 profile（設定、skills、MCP）和 Bot 一樣。另外要加 `--system-prompt-snapshot off`：Claude Code 預設把第一次的系統提示詞錄下來、resume 時原樣沿用（`claude --help`）。實測 SDK resume 一段 CLI 建的 session 時，看不到 SDK 附加的提示詞；加了 `off` 才看得到（`spike/v017-snapshot.ts`）。所以：電腦接手 Bot 的 session 時關掉（否則電腦上的 Claude 仍以為「只能用 reply 說話」）；Bot resume 時也一律帶 `extraArgs: {'system-prompt-snapshot': 'off'}`（接手電腦交來的 session 時才有 Bot 的守則；也讓名冊的更新在 resume 後生效）。啟動器若自己會在 resume 時加這個旗標，看到已經有就不重複。
+3. **session ID 會不會變**：不會。CLI `-p --resume`、SDK 建立的 session 用 CLI resume，回來的 `session_id` 都和原本相同（`claude --help`：`--fork-session` 才會換新 ID）。互動模式沒有實際打開視窗驗證，依 `--fork-session` 的說明推論相同。保險起見，交還時 skill 仍把電腦那邊的 `${CLAUDE_SESSION_ID}` 傳給 Bot（`release --session`），不同就換掉。
+4. **同時寫入**：兩個程序同時 `--resume` 同一個 session，兩邊都成功回覆；transcript 兩邊都 append，兩則使用者訊息的 `parentUuid` 指向同一則，變成分叉。之後再 resume 只沿著最後寫入的那條分支，問它「A、B 兩邊各說了什麼」只看得到 B，A 的內容在對話裡消失了（檔案裡還在）。所以接手期間 Bot **絕對不能**開那個 session：state 的 `takeover` 標記（重啟後仍有效）＋ pool 的 `hold`，`acquire` 看到就丟錯；`runTurn` 一開始就攔下。
+5. **開新視窗**：有 Windows Terminal 就 `wt -w new --title … -d <cwd> cmd.exe /k <resume.cmd>`，沒有（或路徑含 wt 的分隔字元 `;`）就 `cmd /c start "<標題>" /d "<cwd>" cmd.exe /k "<resume.cmd>"`。中文、空白路徑兩種都實測可以。
+   - `resume.cmd` **內容只有 ASCII**，資料夾、啟動器、session ID、說明文字都放在環境變數（`CC_RESUME_*`）。實測：.cmd 裡寫中文路徑時，即使先 `chcp 65001`，cmd 讀下一行的位置會算錯、把 `claude --resume …` 從中間切斷；環境變數是 UTF-16，經 wt 和 start 都會傳到新視窗。
+   - 啟動器那行不用 `call`（`call` 會再展開一次 `%`，路徑有 `%` 時會壞；那行是最後一行，不需要回來）。實測啟動器路徑含中文、空白、`%x%`、`&`、`()` 都能正確 resume。
+   - 新視窗拿掉 Claude Code session 的環境標記（`CLAUDECODE`、`CLAUDE_CODE_SESSION_ID` 等，同 Bot 的子程序），不然從 Claude Code 裡執行 takeover 時，新的 claude 會以為自己在別的 session 裡。
+
+**接管（Discord → 電腦）**：總控 `sessions`（這隻 Bot 有 session 的討論串與目前的私訊，依時間排序：時間、來源、摘要、session ID、cwd、啟動器、是否接手中或工作中）與 `takeover <編號|dm|討論串 ID>`；skill `/channelcollab:takeover`。
+
+- Bot 收到 `takeover`：正在工作或有排隊時拒絕（先 🛑）；先寫 `takeover` 標記（之後到的觸發不會開 session）、`hold`，再正常關閉常駐程序，**程序結束後才回應**，總控拿到回應才開視窗。討論串發「🖥️ <@主人> 在電腦上接手了這段對話…」。
+- 接手中被觸發：回「🖥️ 主人在電腦上接手中，結束後會接回…」、掛 🖥️，一般訊息記進 `takeover.queued`（最多 20 則）；`/compact`、`/retry`、`/skill`、核准後的接續請他交還後再做；`/clear`、`/resume` 拒絕；`/status` 顯示接手中。
+- **交還**：總控 `release [<對話>] [--session <ID>]`、skill `/channelcollab:release`（在接手的視窗裡用自己的 `${CLAUDE_SESSION_ID}` 找到對話；給了 `--session` 卻不在這隻 Bot 時報錯，不會改交還別段）。Bot 清掉標記、發「✅ 已交還給 Bot」、下一輪前面附一句「主人剛才在電腦上接手過…現在回到 Discord，照常只用 reply」，然後依序處理記下的訊息。resume 的是同一個 session，所以包含電腦上的內容。
+- **強制接回**：`/takeback`、`!takeback`，只有主人（`commandGate` 的 `owner-only`）。訊息提醒「⚠️ 電腦上的對話請先關閉，避免兩邊同時寫入同一段對話」。
+- 這和第 10 節原本規劃的「頂替模式」（互動式 session 經 listen 頂替 Bot）不同：0.1.8 的 takeover 是把同一個 session 搬到電腦上，Discord 那邊暫停。第 10 節的頂替模式仍未實作，名稱改用時以本節為準。
+
+**交棒（電腦 → Discord）**：skill `/channelcollab:handoff`、總控 `handoff [--session <ID>] [--cwd …] [--channel … --title …] [--summary-file …]`。
+
+- 目前 session 的 ID：skill 內容的 `${CLAUDE_SESSION_ID}` 會換成這個對話的 ID（實測），Bash 工具的環境也有 `CLAUDE_CODE_SESSION_ID`（總控沒給 `--session` 時用它）。
+- Bot 用 `getSessionInfo` 確認 session 存在，資料夾以 session 紀錄為準（不存在的資料夾不採用，退回電腦送來的 `--cwd`）。
+- 私訊（預設）：私訊忙碌或接手中時拒絕；關掉目前的私訊程序、目前的對話移進 `dmHistory`（可以 `/resume` 接回），新的私訊對話是這個 session，`cwd` 是 session 的資料夾、`source` 是「從電腦交棒」。和私訊平常的資料夾不同時說明，這次照 session 的資料夾跑，`/clear` 後回到 `dm.cwd`。PIN 規則不變。
+- 頻道：在綁定的頻道開新討論串，討論串直接對應這個 session（是交棒不是分支，電腦那邊應該停下來），`cwd` 一樣照 session。
+- Bot 貼出摘要、工作資料夾、「之後在這裡傳訊息就接著這段對話」與「⚠️ 電腦上的那個對話請關掉」；第一輪前面附一句「這段對話是從電腦交過來的，從這裡開始要用 reply」。
+- 啟動器與 profile：一律用私訊或那個頻道設定的啟動器。電腦上用的 profile 和 Bot 不同時，對話內容（transcript）照樣接得上，但 Bot 那邊只有它自己的工具、skills、MCP；transcript 裡用過、Bot 那邊沒有的工具，Claude 會看到工具不存在而改用別的方法，不會壞。系統提示詞因為 `--system-prompt-snapshot off` 會換成 Bot 的。
+
+### 努力程度（C）
+
+- SDK 的機制：`query()` 的 `effort` 選項（`EffortLevel`：low／medium／high／xhigh／max），中途用 `Query.applyFlagSettings({ effortLevel })` 切換（`null` 回到預設）。實測（`spike/v017-sdk.ts`，sonnet）：以 low 啟動，PreToolUse hook 輸入的 `effort.level` 是 low；`applyFlagSettings({effortLevel:'high'})` 後下一輪變 high，不用重開。init 訊息沒有 effort 欄位。
+- 設定：`dm.effort`、`channels.<ID>.effort`（總控 `bind … --effort <等級>|none`）；不設就是 Claude Code 對那個模型的預設。不合法的值當作沒設。
+- 指令：`/effort level:<choices>`、`!effort high`（`default` 回到預設；不給就跳按鈕），私訊和討論串都能用，權限和 `/model` 一樣。選擇記在 state 的 `effort`，resume 後沿用；常駐中直接 `applyFlagSettings`，切換失敗時（例如舊的 CLI）閒置的話結束常駐程序，告訴使用者「下一則訊息開始生效」。
+- `/status` 顯示設定值，以及 hook 回報的實際值（`effort.level`，模型不支援時 Claude Code 會自動降級）。
+
+### 驗證
+
+- `src/bridge.test.ts`（29 項，假的 Discord 物件，真的 named pipe）：post 只能貼到綁定頻道（ID、名稱、`#`、`<#>`、重名、沒綁定、別的頻道底下的討論串）、來源標示與通知對象、權限矩陣、新討論串記下分支來源；pipe 的舊指令與 JSON 指令、長中文內容分段到達；總控 post（含禁區附檔被拒、記下電腦的 session）、targets、sessions；takeover（工作中拒絕、標記、Bot 不能開 session、討論串說明）、接手中被觸發（回覆、記下、不開 session、retry 不排）、release（交還、處理記下的訊息、session 不變）、takeback（只有主人、提醒）、resume.cmd 只有 ASCII 與環境變數、選對話的規則；handoff 到私訊（資料夾說明、/clear 後回到私訊的資料夾）與頻道新討論串、找不到的 session；Bot 沒在執行；effort 解析、設定、state、/status。總控 self-test 加 `bind --effort`。
+- 實測：上面「實測結論」各項；開視窗兩種方式；產生的 resume.cmd 實際 resume 了 sandbox 的 session（內建 claude 與含特殊字元路徑的啟動器）。
+- Discord 實測：只在測試頻道用 `post --new-thread` 發一則測試訊息（見交回報告）。takeover／release／handoff／`post_to_channel` 在 Discord 上的實際操作尚未實測（避免動到使用者真實的討論串）。
 
 ---
 

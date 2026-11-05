@@ -137,8 +137,8 @@ await t('上線時記錄「只用私訊」模式，並以整批覆寫註冊斜�
   });
   has(out, '[mode] direct messages only (no channel bound)');
   has(out, 'dm configured');
-  has(out, '[commands] registered 10 global slash commands: /help /clear /resume /stop /status /model /plan /compact /retry /skill');
-  eq((registered[0] as { name: string }[]).length, 10);
+  has(out, '[commands] registered 12 global slash commands: /help /clear /resume /stop /status /model /effort /plan /compact /retry /skill /takeback');
+  eq((registered[0] as { name: string }[]).length, 12);
 });
 
 console.log('只用私訊：處理私訊');
@@ -254,9 +254,9 @@ await t('同一套規則（commandGate）：鎖定、白名單、討論串、私
 });
 
 console.log('註冊的指令清單');
-await t('10 個指令；/clear、/resume 只在私訊；其他在伺服器（含討論串）和私訊；只裝到伺服器', () => {
+await t('12 個指令；/clear、/resume 只在私訊；其他在伺服器（含討論串）和私訊；只裝到伺服器', () => {
   const defs = commands.slashDefinitions();
-  eq(defs.map((d) => d.name), ['help', 'clear', 'resume', 'stop', 'status', 'model', 'plan', 'compact', 'retry', 'skill']);
+  eq(defs.map((d) => d.name), ['help', 'clear', 'resume', 'stop', 'status', 'model', 'effort', 'plan', 'compact', 'retry', 'skill', 'takeback']);
   for (const d of defs) {
     eq(d.type, 1, d.name);
     eq(d.contexts, ['clear', 'resume'].includes(d.name) ? [1] : [0, 1], d.name);
@@ -266,6 +266,10 @@ await t('10 個指令；/clear、/resume 只在私訊；其他在伺服器（含
   const model = defs.find((d) => d.name === 'model')!;
   eq(model.options?.[0]?.choices?.map((c) => c.value), ['haiku', 'sonnet', 'opus']);
   eq(model.options?.[0]?.required, false);
+  const effort = defs.find((d) => d.name === 'effort')!;
+  eq(effort.options?.[0]?.name, 'level');
+  eq(effort.options?.[0]?.choices?.map((c) => c.value), ['low', 'medium', 'high', 'xhigh', 'max', 'default']);
+  eq(effort.options?.[0]?.required, false);
   const skill = defs.find((d) => d.name === 'skill')!;
   eq(skill.options?.map((o) => [o.name, !!o.required, !!o.autocomplete]), [['name', true, true], ['args', false, false]]);
 });

@@ -5,8 +5,9 @@
  * prompts, 🛑, a details button, and the context / plan usage reminders.
  */
 import path from 'node:path';
+import { forkSession } from '@anthropic-ai/claude-agent-sdk';
 import type { AnyThreadChannel, Client, Message } from 'discord.js';
-import { loadConfig, resolveChannel, resolveDm, type ResolvedChannel } from '../config.js';
+import { isEffort, loadConfig, resolveChannel, resolveDm, type ResolvedChannel } from '../config.js';
 import { brief, log } from '../log.js';
 import { deferItem, type DeferredItem } from '../runner/approvals.js';
 import { explainFailure } from '../runner/failure.js';
@@ -17,6 +18,8 @@ import { contextAlert, contextFooter, contextNotice } from '../runner/usage.js';
 import { botOwner } from '../roster.js';
 import { DM_KEY, getConversation, getDm, getThread, saveState, type DmState, type ThreadState } from '../store/state.js';
 import { sendApprovalBatch } from './approvals-ui.js';
+import { boundTargets, postReport, targetsLine } from './post.js';
+import { noteTakenOver } from './takeover.js';
 import { saveAttachments } from './attachments.js';
 import { splitReply } from './commands.js';
 import { attachDetails, rememberTurn } from './details.js';
@@ -44,10 +47,14 @@ export function convState(c: Conv): ThreadState {
   return c.kind === 'dm' ? getDm() : getConversation(c.key)!;
 }
 
-/** The binding with this conversation's own choices applied: !model, !plan, and a resumed thread's folder. */
+/**
+ * The binding with this conversation's own choices applied: !model, !plan, !effort, and the session's own
+ * folder when it differs (a resumed thread, a handoff from the computer, a report thread forked from a session).
+ */
 export function effective(c: Conv, ts: ThreadState = convState(c)): ResolvedChannel {
-  const cwd = c.kind === 'dm' ? ((ts as DmState).cwd ?? c.base.cwd) : c.base.cwd;
-  return { ...c.base, cwd, model: ts.model ?? c.base.model, permissionMode: ts.plan ? 'plan' : c.base.permissionMode, basePermissionMode: c.base.permissionMode };
+  const cwd = ts.cwd ?? c.base.cwd;
+  const effort = isEffort(ts.effort) ? ts.effort : c.base.effort;
+  return { ...c.base, cwd, model: ts.model ?? c.base.model, ...(effort ? { effort } : {}), permissionMode: ts.plan ? 'plan' : c.base.permissionMode, basePermissionMode: c.base.permissionMode };
 }
 
 /** Who triggered the turn running in each conversation (thread commands follow the 🛑 rule). */
@@ -94,11 +101,23 @@ async function checkContext(c: Conv, session: LiveSession, ts: ThreadState): Pro
 export async function runTurn(c: Conv, trigger: Message, status: StatusReactions, who: Who, input: { prompt?: string; kind?: TurnKind; preapproved?: string[] } = {}): Promise<void> {
   const kind = input.kind ?? 'normal';
   const room = c.room;
+  // Taken over on the computer: never open the session here (PLAN §21); keep the message for later.
+  if (convState(c).takeover) return noteTakenOver(c, trigger, status, kind);
   let progress: ReturnType<typeof stopControl> | undefined;
   running.set(c.key, who);
   try {
     await status.set('running');
     const ts = convState(c);
+    // A thread opened by a report continues from a copy of the session that wrote it (taken now, after that turn ended).
+    if (!ts.sessionId && ts.forkFrom) {
+      const from = ts.forkFrom;
+      const fork = await forkSession(from.sessionId, { dir: from.cwd });
+      ts.sessionId = fork.sessionId;
+      ts.cwd = from.cwd;
+      ts.forkFrom = undefined;
+      saveState();
+      log('thread', `${c.key} forked report session ${from.sessionId} -> ${fork.sessionId} cwd=${from.cwd}`);
+    }
     const channel = effective(c, ts);
     let prompt = input.prompt;
     if (prompt === undefined) {
@@ -134,7 +153,12 @@ export async function runTurn(c: Conv, trigger: Message, status: StatusReactions
         if (--waits === 0) await status.set('running');
       }
     };
-    const session = await acquire(c.key, c.selfId, channel, ts.sessionId, ts.resumeCostBase ?? ts.lastCostTotal, c.kind);
+    const client = trigger.client as Client<true>;
+    let targets = '';
+    try {
+      targets = targetsLine(boundTargets(client, loadConfig()));
+    } catch {}
+    const session = await acquire(c.key, c.selfId, channel, ts.sessionId, ts.resumeCostBase ?? ts.lastCostTotal, c.kind, targets);
     progress = stopControl(room, who, STOP_BUTTON_DELAY_MS, (by) => void session.interrupt(by));
     const turn = await session.run(prompt, {
       sendReply: async (text, files) => {
@@ -172,7 +196,20 @@ export async function runTurn(c: Conv, trigger: Message, status: StatusReactions
       notice: async (text) => {
         await room.send({ content: text, allowedMentions: { parse: [] } });
       },
-    }, { preapproved: input.preapproved });
+      postToChannel: async (a) => {
+        const r = await postReport(client, {
+          channel: a.channel,
+          text: a.text,
+          files: a.files,
+          thread: a.thread,
+          newThread: a.newThread,
+          source: c.kind === 'dm' ? { kind: 'dm' } : { kind: 'thread', threadId: c.key },
+          // A new report thread continues from this conversation's session (forked on its first trigger).
+          ...(session.sessionId ? { forkFrom: { sessionId: session.sessionId, cwd: channel.cwd } } : {}),
+        });
+        return r.ok ? { ok: true, url: r.url, where: r.where } : r;
+      },
+    }, { preapproved: input.preapproved, ownerTriggered: c.kind === 'dm' || (!!who.ownerId && who.requesterId === who.ownerId) });
     const progressMessage = await progress.end();
     // Calls nobody approved in time: a card for the owner to approve them later.
     if (deferred.length && who.ownerId) {

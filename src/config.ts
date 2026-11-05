@@ -28,7 +28,14 @@ export type ChannelConfig = {
   turn_timeout_minutes?: number;
   /** Steps (API round trips) per turn before it is stopped; 0 = no limit. Overrides defaults.max_turns. */
   max_turns?: number;
+  /** Reasoning effort (low … max); unset = Claude Code's default for the model. */
+  effort?: string;
 };
+
+/** Effort levels the SDK accepts (Options.effort, applyFlagSettings effortLevel). */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type Effort = (typeof EFFORT_LEVELS)[number];
+export const isEffort = (v: unknown): v is Effort => typeof v === 'string' && (EFFORT_LEVELS as readonly string[]).includes(v);
 
 export type Defaults = {
   history: number;
@@ -82,6 +89,8 @@ export type ResolvedChannel = {
   turnTimeoutMs: number;
   /** Steps per turn before it is stopped; 0 = no limit. */
   maxTurns: number;
+  /** Reasoning effort; undefined = Claude Code's default. */
+  effort?: Effort;
 };
 
 const BUILTIN_DEFAULTS: Defaults = {
@@ -154,6 +163,7 @@ function resolve(config: Config, channelId: string, ch: ChannelConfig, what: str
     ownerWaitMs: Math.min(config.defaults.owner_wait_minutes, config.defaults.permission_timeout_minutes) * 60 * 1000,
     turnTimeoutMs: minutesOrZero(ch.turn_timeout_minutes ?? config.defaults.turn_timeout_minutes) * 60 * 1000,
     maxTurns: Math.floor(minutesOrZero(ch.max_turns ?? config.defaults.max_turns)),
+    ...(isEffort(ch.effort) ? { effort: ch.effort } : {}),
   };
 }
 

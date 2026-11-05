@@ -16,6 +16,21 @@ const live = new Map<string, LiveSession>();
 /** Sessions on their way out; a new one for the same thread waits for these to finish. */
 const closing = new Map<string, Promise<void>>();
 let stopping = false;
+/** Conversations taken over on the computer: no session may be started for them (PLAN §21). */
+const held = new Set<string>();
+
+/** While the owner works on this conversation on the computer, refuse to start its session here. */
+export function hold(key: string): void {
+  held.add(key);
+}
+
+export function unhold(key: string): void {
+  held.delete(key);
+}
+
+export function isHeld(key: string): boolean {
+  return held.has(key);
+}
 let sweeper: NodeJS.Timeout | undefined;
 
 /** The thread's live session, if one is up (e.g. for 🛑). */
@@ -47,15 +62,18 @@ function retire(s: LiveSession, reason: string, force = false): Promise<void> {
  * The live session for a thread, starting (or resuming) one if needed.
  * Called by the thread's queued job, so only one caller per thread at a time.
  */
-export async function acquire(threadId: string, selfId: string, channel: ResolvedChannel, resume: string | undefined, costBase: number, kind: ConversationKind = 'thread'): Promise<LiveSession> {
+export async function acquire(threadId: string, selfId: string, channel: ResolvedChannel, resume: string | undefined, costBase: number, kind: ConversationKind = 'thread', targets = ''): Promise<LiveSession> {
   if (stopping) throw new Error('bot is shutting down');
+  // Two processes on one session fork its transcript and one side's turns are lost (spike/v017-cli.mjs).
+  if (held.has(threadId) || getConversation(threadId)?.takeover) throw new Error('this conversation is taken over on the computer');
   const current = live.get(threadId);
   if (current?.usable) return current;
   if (current) retire(current, 'ended');
   await closing.get(threadId);
   if (stopping) throw new Error('bot is shutting down');
 
-  const s = new LiveSession(threadId, selfId, channel, resume, costBase, getConversation(threadId)?.alwaysAllow, kind);
+  if (held.has(threadId) || getConversation(threadId)?.takeover) throw new Error('this conversation is taken over on the computer');
+  const s = new LiveSession(threadId, selfId, channel, resume, costBase, getConversation(threadId)?.alwaysAllow, kind, targets);
   live.set(threadId, s);
   void s.done.then(() => {
     // The conversation may have moved on (!clear, !resume): update the entry that still has this session.

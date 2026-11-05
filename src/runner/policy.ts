@@ -67,6 +67,22 @@ export function decideTool(name: string, input: Record<string, unknown>, ctx: To
 }
 
 /**
+ * post_to_channel (0.1.8): unlike reply, which only answers where the person
+ * who asked is reading, a post puts text in a team channel other people read.
+ * So it is not a free "own tool": when the owner asked for the turn (a direct
+ * message, or the owner in a thread) the request itself is the approval;
+ * anyone else (another person, another bot) needs the owner's button, as for
+ * any outward action. plan mode only discusses, so it never posts; dontAsk
+ * never asks, so it refuses what would need asking.
+ */
+export function decidePost(mode: PermissionMode, ownerTriggered: boolean): ToolDecision {
+  if (mode === 'plan') return { kind: 'deny', why: 'plan mode' };
+  if (ownerTriggered) return { kind: 'allow', why: 'the owner asked for this turn' };
+  if (mode === 'dontAsk') return { kind: 'deny', why: 'dontAsk mode' };
+  return { kind: 'ask', why: 'post requested by someone other than the owner' };
+}
+
+/**
  * auto mode: the classifier blocked a call (PermissionDenied hook). Only the
  * classifier fires that hook (deny rules do not, spike/auto-check.ts), so in
  * auto mode the block goes to the owner; in any other mode it stands.

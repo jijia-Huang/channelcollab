@@ -23,7 +23,7 @@ import { brief, log } from '../log.js';
 import { botOwner, rosterPrompt } from '../roster.js';
 import { forbiddenPath, forbiddenUse, zoneDenyMessage, type Zones } from '../security/zones.js';
 import { killTree, launcherOptions, type Spawned } from './launcher.js';
-import { blockedByClassifier, decideTool, inside, retryKey } from './policy.js';
+import { blockedByClassifier, decidePost, decideTool, inside, retryKey } from './policy.js';
 import { contextFromUsage, recordRateLimit, type RateInfo } from './usage.js';
 import { skillCatalog, type OfferedCommand } from './skills.js';
 import { limitLabel, TIMEOUT_TOOL_MESSAGE, timeoutWarning, TurnClock } from './turn-clock.js';
@@ -31,6 +31,8 @@ import { rememberSkills } from '../store/state.js';
 
 const OWN_PREFIX = 'mcp__channelcollab__';
 export const REPLY_TOOL = `${OWN_PREFIX}reply`;
+/** Posting to a bound team channel (0.1.8): goes through the permission check, unlike reply. */
+export const POST_TOOL = `${OWN_PREFIX}post_to_channel`;
 /** A graceful close of a session that is still working waits this long for the turn (then kills). */
 const BUSY_CLOSE_WAIT_MS = 10 * 60 * 1000;
 /** After the turn time limit: how long the interrupted turn gets to end before the session is killed. */
@@ -42,7 +44,7 @@ const MAX_REPLY_FILES = 10;
 
 export type ConversationKind = 'thread' | 'dm';
 
-export function guidelines(selfId: string, auto: boolean, kind: ConversationKind = 'thread'): string {
+export function guidelines(selfId: string, auto: boolean, kind: ConversationKind = 'thread', targets = ''): string {
   let configured: string | undefined;
   try {
     configured = loadConfig().discord.owner_id;
@@ -66,7 +68,21 @@ export function guidelines(selfId: string, auto: boolean, kind: ConversationKind
       : '- 需要主人好好思考的決策（例如方向、取捨、影響範圍大的改動），在 reply 裡 @ 主人，請主人決定，不要自己決定。',
     '- 使用者附的檔案會下載到本機，路徑寫在訊息的【附件】裡，用 Read 讀取。',
     `- 要把檔案傳到${where}，呼叫 ${REPLY_TOOL} 時在 files 帶本機路徑（只能是工作目錄或附件資料夾底下的檔案）。`,
+    postGuideline(targets),
     rosterPrompt(selfId, botOwner(configured, selfId), undefined, { dm }),
+  ].join('\n');
+}
+
+/**
+ * The line about post_to_channel (0.1.8), with the channels it can post to.
+ * Only added to the guidelines; the rest of them is unchanged.
+ */
+export function postGuideline(targets: string): string {
+  if (!targets.trim()) return `- ${POST_TOOL} 可以把結果貼到這隻 Bot 綁定的團隊頻道，但目前沒有綁定任何頻道，所以不能用。`;
+  return [
+    `- 使用者要你「回報到群組」「貼到頻道」時，用 ${POST_TOOL}（不是 reply）：channel 填下面的頻道 ID 或名稱；要開新討論串就 new_thread: true 並給 thread_title；也可以用 thread 指定那個頻道底下既有的討論串。只能貼到下面這些頻道（或它們底下的討論串）。貼出去前先整理成給團隊看的摘要；Bot 會自己標明是誰的工作回報。`,
+    `  不是主人本人要求的時候，這個工具要主人按按鈕核准。貼完再用 reply 簡短告訴這裡的人貼到哪裡（附上連結）。`,
+    `  可以貼的頻道：${targets}`,
   ].join('\n');
 }
 
@@ -94,8 +110,14 @@ export type PermissionAnswer = { behavior: 'allow' | 'always' } | { behavior: 'd
 
 export type Question = { question: string; header: string; multiSelect: boolean; options: { label: string; description: string }[] };
 
+/** What post_to_channel asks for (files already checked against the session's folders). */
+export type PostArgs = { channel: string; text: string; files: string[]; thread?: string; newThread?: string };
+export type PostOutcome = { ok: true; url: string; where: string } | { ok: false; error: string };
+
 export type TurnCallbacks = {
   sendReply: (text: string, files: string[]) => Promise<void>;
+  /** post_to_channel: post to a bound channel (or a thread under one). */
+  postToChannel?: (args: PostArgs) => Promise<PostOutcome>;
   askPermission: (req: PermissionRequest) => Promise<PermissionAnswer>;
   /** Answers keyed by question text (multi-select joined with ", "), or undefined when nobody answered. */
   askQuestion: (questions: Question[], signal: AbortSignal) => Promise<Record<string, string> | undefined>;
@@ -140,6 +162,8 @@ type Turn = TurnCallbacks & {
   timedOut?: boolean;
   /** Kills the session when the interrupted turn does not end in time. */
   killTimer?: NodeJS.Timeout;
+  /** The owner asked for this turn themselves (direct message, or the owner in a thread): post_to_channel needs no approval. */
+  ownerTriggered: boolean;
   waits: number;
   /** Cancels prompts still waiting when the turn is stopped or the session ends. */
   abort: AbortController;
@@ -245,6 +269,8 @@ export class LiveSession {
   readonly cwd: string;
   /** Working time per turn before it is stopped; 0 = no limit. */
   readonly turnTimeoutMs: number;
+  /** Effort the CLI reports for the current turn (PreToolUse hook input), for !status. */
+  effortActual?: string;
 
   /**
    * `costBase` is the cumulative total a resumed CLI starts counting from: what
@@ -260,6 +286,8 @@ export class LiveSession {
     costBase: number,
     alwaysAllowed: Iterable<string> = [],
     readonly kind: ConversationKind = 'thread',
+    /** The channels post_to_channel may use, as one line for the prompt. */
+    targets = '',
   ) {
     this.tag = `live ${threadId}`;
     this.sessionId = resume;
@@ -304,6 +332,31 @@ export class LiveSession {
             return { content: [{ type: 'text', text: `Delivered${checked.ok.length ? ` with ${checked.ok.length} file(s)` : ''}.${note}` }] };
           },
         ),
+        tool(
+          'post_to_channel',
+          `Post a report to one of the team channels this bot is bound to (or a thread under one), e.g. when asked to "report to the group". Not for answering here: use reply for that. Needs the owner's approval unless the owner asked for this turn. Channels: ${targets || '(none bound)'}`,
+          {
+            channel: z.string().describe('Bound channel: its ID or its name (#name)'),
+            text: z.string().describe('Message text (Markdown); the bot adds who the report is from'),
+            files: z.array(z.string()).optional().describe('Local file paths to attach (under the working directory or the attachment folder)'),
+            thread: z.string().optional().describe('An existing thread under that channel (thread ID) to post in instead'),
+            new_thread: z.boolean().optional().describe('Open a new thread in the channel for this report'),
+            thread_title: z.string().optional().describe('Title of the new thread (with new_thread)'),
+          },
+          async ({ channel: target, text, files, thread, new_thread, thread_title }) => {
+            const t = this.turn;
+            if (!t) return { content: [{ type: 'text', text: 'Not posted: no active turn.' }], isError: true };
+            if (t.timedOut) return { content: [{ type: 'text', text: `Not posted. ${TIMEOUT_TOOL_MESSAGE}` }], isError: true };
+            if (!t.postToChannel) return { content: [{ type: 'text', text: 'Not posted: posting to channels is not available here.' }], isError: true };
+            const checked = checkFiles(files ?? [], roots, zones);
+            const newThread = new_thread ? (thread_title?.trim() || text.split('\n')[0].replace(/[#*_`>]/g, '').trim() || 'Claude 回報').slice(0, 100) : undefined;
+            log('post', `${threadId} -> ${target}${thread ? ` thread=${thread}` : ''}${newThread ? ` new thread "${newThread}"` : ''} ${brief(text, 200)}${files?.length ? ` files=${JSON.stringify(checked.ok)} rejected=${JSON.stringify(checked.rejected)}` : ''}`);
+            const r = await t.postToChannel({ channel: target, text, files: checked.ok, thread, newThread }).catch((e: Error) => ({ ok: false as const, error: e.message }));
+            if (!r.ok) return { content: [{ type: 'text', text: `Not posted: ${r.error}` }], isError: true };
+            const note = checked.rejected.length ? ` Not attached: ${checked.rejected.join('; ')}` : '';
+            return { content: [{ type: 'text', text: `Posted to ${r.where}: ${r.url}.${note}` }] };
+          },
+        ),
       ],
     });
 
@@ -313,6 +366,8 @@ export class LiveSession {
       if (hookInput.hook_event_name !== 'PreToolUse') return {};
       const name = hookInput.tool_name;
       const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
+      const effort = (hookInput as { effort?: { level?: string } }).effort?.level;
+      if (effort) this.effortActual = effort;
       // Past the turn's time limit nothing more runs (and the refusal must not read like a permission block).
       if (this.turn?.timedOut) {
         log('permission', `${threadId} deny ${name} (turn timeout) id=${toolUseId ?? '-'}`);
@@ -333,6 +388,20 @@ export class LiveSession {
         return 'deny' in retry
           ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: retry.deny } }
           : { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'approved by the owner after an auto mode block' } };
+      }
+      // Posting to a team channel puts text where other people read it: unlike reply, it is checked (PLAN §21).
+      if (name === POST_TOOL) {
+        const p = decidePost(this.mode, !!this.turn?.ownerTriggered);
+        log('permission', `${threadId} ${p.kind} ${name} (${p.why}) id=${toolUseId ?? '-'}`);
+        if (p.kind === 'allow') return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: p.why } };
+        if (p.kind === 'deny') {
+          this.turn?.denials.push(name);
+          return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: modeDenyMessage(this.mode, name) } };
+        }
+        const answer = await this.ask(name, toolInput, toolUseId ?? '', signal);
+        return answer.behavior === 'deny'
+          ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: answer.message } }
+          : { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: 'approved by the owner' } };
       }
       const d = decideTool(name, toolInput, { mode: this.mode, roots, alwaysAllowed: this.alwaysAllowed, ownPrefix: OWN_PREFIX });
       if (d.kind === 'cli') return {};
@@ -373,6 +442,12 @@ export class LiveSession {
     // Reached by AskUserQuestion (the hook leaves it alone) and by anything Claude Code itself still wants to ask about.
     const canUseTool: CanUseTool = async (toolName, input, { signal, toolUseID }) => {
       // Plan mode sends even our own reply tool here (a hook allow does not cover it; spike/v015-live.ts).
+      // post_to_channel is decided by the PreToolUse hook; reaching here without the owner asking means it still needs them.
+      if (toolName === POST_TOOL && !this.turn?.ownerTriggered) {
+        if (this.mode === 'plan' || this.mode === 'dontAsk') return { behavior: 'deny', message: modeDenyMessage(this.mode, toolName) };
+        const answer = await this.ask(toolName, input, toolUseID, signal);
+        return answer.behavior === 'deny' ? { behavior: 'deny', message: answer.message } : { behavior: 'allow', updatedInput: input };
+      }
       if (toolName.startsWith(OWN_PREFIX)) return { behavior: 'allow', updatedInput: input };
       if (toolName !== 'AskUserQuestion') {
         const answer = await this.ask(toolName, input, toolUseID, signal);
@@ -413,7 +488,8 @@ export class LiveSession {
         settingSources: ['user', 'project'],
         // Always explicit: omitted, the user's own default (e.g. auto) applies and canUseTool is skipped.
         permissionMode: channel.permissionMode,
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: guidelines(selfId, (channel.basePermissionMode ?? channel.permissionMode) === 'auto', kind) },
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: guidelines(selfId, (channel.basePermissionMode ?? channel.permissionMode) === 'auto', kind, targets) },
+        ...(channel.effort ? { effort: channel.effort } : {}),
         allowedTools: [REPLY_TOOL],
         mcpServers: { channelcollab: server },
         // The hooks await the owner's answer in-process, so their timeout (seconds) must outlast the prompt's.
@@ -428,6 +504,10 @@ export class LiveSession {
         abortController: this.abort,
         stderr: onStderr,
         ...(resume ? { resume } : {}),
+        // A resumed CLI reuses the system prompt it recorded first (--system-prompt-snapshot on). A session
+        // handed over from the computer recorded the computer's prompt, without these guidelines; rendering
+        // it fresh keeps the bot's rules (and roster changes) in effect (spike/v017-snapshot.ts).
+        ...(resume ? { extraArgs: { 'system-prompt-snapshot': 'off' } } : {}),
       },
     });
     this.done = this.read();
@@ -454,6 +534,13 @@ export class LiveSession {
   }
 
   /** Switch the permission mode (!plan); the hooks follow it right away. */
+  /** Switch the effort level (!effort) for the following turns; null goes back to the model's default. */
+  async setEffort(level: string | null): Promise<void> {
+    await this.q.applyFlagSettings({ effortLevel: level as never });
+    if (!level) this.effortActual = undefined;
+    log(this.tag, `effort set to ${level ?? 'default'}`);
+  }
+
   async setMode(mode: PermissionMode): Promise<void> {
     await this.q.setPermissionMode(mode);
     this.mode = mode;
@@ -488,7 +575,7 @@ export class LiveSession {
   }
 
   /** Run one turn. Never rejects: failures come back as `ok: false`. One turn at a time. */
-  run(prompt: string, callbacks: TurnCallbacks, opts: { preapproved?: string[] } = {}): Promise<TurnResult> {
+  run(prompt: string, callbacks: TurnCallbacks, opts: { preapproved?: string[]; ownerTriggered?: boolean } = {}): Promise<TurnResult> {
     if (this.turn) throw new Error(`${this.tag}: a turn is already running`);
     const n = ++this.turns;
     return new Promise<TurnResult>((resolve) => {
@@ -502,6 +589,7 @@ export class LiveSession {
         replies: 0,
         lastText: '',
         clock: undefined as unknown as TurnClock,
+        ownerTriggered: !!opts.ownerTriggered,
         waits: 0,
         abort: new AbortController(),
         retries: new Map(),

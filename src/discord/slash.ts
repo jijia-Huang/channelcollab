@@ -132,7 +132,7 @@ export async function handleSlashCommand(i: ChatInputCommandInteraction): Promis
   if (i.applicationId !== i.client.application.id) return;
   // Within Discord's 3 seconds; the answer comes later through editReply / followUp.
   await i.deferReply({ flags: MessageFlags.Ephemeral });
-  const cmd = commandFromSlash(i.commandName, { name: i.options.getString('name') ?? undefined, args: i.options.getString('args') ?? undefined });
+  const cmd = commandFromSlash(i.commandName, { name: i.options.getString('name') ?? undefined, args: i.options.getString('args') ?? undefined, level: i.options.getString('level') ?? undefined });
   if (!cmd) return void (await i.editReply({ content: '這隻 Bot 不認得這個指令。' }));
   let config: Config;
   try {

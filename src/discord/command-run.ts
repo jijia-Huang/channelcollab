@@ -26,10 +26,11 @@ import { limitLabel } from '../runner/turn-clock.js';
 import { latestRateLimit, rateSummary } from '../runner/usage.js';
 import { pinGate } from '../security/pin.js';
 import { allThreads, DM_KEY, dmHistory, getThread, saveState, skillsFor, switchDm, type DmState } from '../store/state.js';
-import { duration, helpText, MODEL_CHOICES, normalizeModel, resumeList, resumeOption, shortTime, type Command, type ResumeCandidate } from './commands.js';
+import { duration, EFFORT_CHOICES, helpText, MODEL_CHOICES, normalizeEffort, normalizeModel, resumeList, resumeOption, shortTime, type Command, type ResumeCandidate } from './commands.js';
 import { convState, effective, runTurn, type Conv } from './conversation.js';
 import type { Who } from './prompts.js';
 import { StatusReactions } from './status.js';
+import { giveBack } from './takeover.js';
 
 type PermissionModeName = string;
 const MODE_NAMES: Record<string, string> = {
@@ -71,6 +72,31 @@ async function applyModel(c: Conv, model: string): Promise<string> {
   return `🔁 模型已切換為 **${model}**，接下來的回應就用它。`;
 }
 
+/**
+ * !effort: remembered for the conversation (a resume keeps it) and switched in the live session right
+ * away (applyFlagSettings, spike/v017-sdk.ts). If the switch fails, the process is closed when idle so
+ * the next message resumes with the new level.
+ */
+async function applyEffort(c: Conv, level: string | null): Promise<string> {
+  const ts = convState(c);
+  ts.effort = level ?? undefined;
+  saveState();
+  const shown = level ?? `預設${effective(c, ts).effort ? `（綁定的 ${effective(c, ts).effort}）` : ''}`;
+  const s = liveSession(c.key);
+  if (s?.usable) {
+    try {
+      // Back to the default: the binding's level if it has one, else the model's.
+      await s.setEffort(level ?? effective(c, ts).effort ?? null);
+    } catch (e) {
+      log('command', `${c.key} setEffort ${level} failed: ${(e as Error).message}`);
+      if (!s.busy && !isPending(c.key)) await release(c.key, 'effort');
+      return `⚠️ 已記下努力程度 **${shown}**，但目前的 session 沒辦法直接切換，下一則訊息開始生效。`;
+    }
+  }
+  log('command', `${c.key} effort -> ${level ?? 'default'}${s?.usable ? ' (live)' : ''}`);
+  return `🧠 努力程度已設為 **${shown}**，接下來的回應就用它。`;
+}
+
 async function statusText(c: Conv): Promise<string> {
   const ts = convState(c);
   const ch = effective(c, ts);
@@ -80,9 +106,11 @@ async function statusText(c: Conv): Promise<string> {
     `📊 **狀態**（${c.kind === 'dm' ? '私訊' : '這個討論串'}）`,
     `・工作目錄：\`${s?.cwd ?? ch.cwd}\``,
     `・模型：${ts.model ?? ch.model ?? 'Claude Code 預設'}${s?.model ? `（實際：${s.model}）` : ''}`,
+    `・努力程度：${ts.effort ?? ch.effort ?? 'Claude Code 預設'}${s?.effortActual ? `（實際：${s.effortActual}）` : ''}`,
     `・權限模式：${modeName(s?.mode ?? ch.permissionMode)}${ts.plan ? '，用 !plan 可切回' : ''}`,
     `・對話：${s?.usable ? `session 已開 ${duration(Date.now() - s.startedAt)}${s.busy ? '，正在工作' : '，閒置中'}` : ts.sessionId ? '已暫停（下一則訊息會接回）' : '還沒有對話'}`,
-    ...(c.kind === 'dm' && (ts as DmState).source ? [`・來源：${(ts as DmState).source}`] : []),
+    ...((ts as DmState).source ? [`・來源：${(ts as DmState).source}`] : []),
+    ...(ts.takeover ? [`・🖥️ 主人在電腦上接手中（${shortTime(ts.takeover.at)} 起，記下 ${ts.takeover.queued.length} 則訊息）；電腦上用 /channelcollab:release 交還，或在這裡用 /takeback 強制接回`] : []),
     `・單輪工作上限：${ch.turnTimeoutMs ? `${limitLabel(ch.turnTimeoutMs)}（等人按按鈕的時間不算）` : '不限（要停止請按 🛑 或用 /stop）'}`,
     `・單輪步數上限：${ch.maxTurns ? `${ch.maxTurns} 步` : '不限'}`,
     `・本段對話花費：約 $${ts.lastCostTotal.toFixed(2)}`,
@@ -139,7 +167,7 @@ function resumeCandidates(): ResumeCandidate[] {
     out.push({ kind: 'dm', id: d.sessionId, sessionId: d.sessionId, cwd: d.cwd ?? dmCwd, at: d.lastAt ?? d.createdAt, source: d.source ?? '私訊', summary: d.last ?? d.first ?? d.source ?? '' });
   }
   for (const [id, t] of allThreads()) {
-    const cwd = config.channels[t.channelId]?.cwd;
+    const cwd = config.channels[t.channelId] ? (t.cwd ?? config.channels[t.channelId].cwd) : undefined;
     if (!t.sessionId || !cwd) continue;
     out.push({ kind: 'thread', id, sessionId: t.sessionId, cwd, at: t.lastAt ?? t.createdAt, source: t.name ?? `討論串 ${id}`, summary: t.last ?? t.first ?? t.name ?? '' });
   }
@@ -178,6 +206,32 @@ export async function runCommand(cmd: Command, c: Conv, io: CommandIO, who: Who)
           ...MODEL_CHOICES.map((m) => new ButtonBuilder().setCustomId(`ccmd:model:${id}:${m.alias}`).setLabel(`${m.label}（${m.note}）`).setStyle(m.alias === current ? ButtonStyle.Primary : ButtonStyle.Secondary)),
         ),
       ]);
+      return;
+    }
+    case 'effort': {
+      if (cmd.arg) {
+        const level = normalizeEffort(cmd.arg);
+        if (level !== undefined) await io.note(await applyEffort(c, level));
+        else await io.tell(`不認得「${cmd.arg}」。可以用 ${EFFORT_CHOICES.map((e) => e.level).join('、')}，或 default 回到預設。`);
+        return;
+      }
+      const id = remember(c, who, io.slash);
+      const current = ts.effort ?? effective(c, ts).effort;
+      const rows = [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          ...EFFORT_CHOICES.map((e) => new ButtonBuilder().setCustomId(`ccmd:effort:${id}:${e.level}`).setLabel(`${e.label}（${e.note}）`).setStyle(e.level === current ? ButtonStyle.Primary : ButtonStyle.Secondary)),
+        ),
+        new ActionRowBuilder<ButtonBuilder>().addComponents(new ButtonBuilder().setCustomId(`ccmd:effort:${id}:default`).setLabel('回到預設').setStyle(current ? ButtonStyle.Secondary : ButtonStyle.Primary)),
+      ];
+      await io.tell(`目前的努力程度：**${current ?? 'Claude Code 預設'}**。要換成哪一個？`, rows);
+      return;
+    }
+    case 'takeback': {
+      if (!ts.takeover) return void (await io.tell('這段對話沒有在電腦上接手中，不需要接回。'));
+      const r = await giveBack(io.client as Client<true>, c.key, { forced: true, by: io.actor.name });
+      if (!r.ok) await io.tell(`❌ 接回失敗：${r.error}`);
+      // giveBack posts the public note itself (with the reminder to close the computer's conversation).
+      else if (io.slash) await io.tell('✅ 已接回。');
       return;
     }
     case 'plan': {
@@ -221,6 +275,7 @@ export async function runCommand(cmd: Command, c: Conv, io: CommandIO, who: Who)
       return;
     }
     case 'clear': {
+      if (ts.takeover) return void (await io.tell(`🖥️ 這段對話正在電腦上接手中。先在電腦上交還（/channelcollab:release），或用 ${p}takeback 接回，再用 ${p}clear。`));
       if (liveSession(c.key)?.busy || isPending(c.key)) return void (await io.tell(`Claude 還在處理，先用 ${p}stop 停下來，再用 ${p}clear。`));
       await release(c.key, 'clear');
       switchDm();
@@ -228,6 +283,7 @@ export async function runCommand(cmd: Command, c: Conv, io: CommandIO, who: Who)
       return;
     }
     case 'resume': {
+      if (ts.takeover) return void (await io.tell(`🖥️ 目前的私訊對話正在電腦上接手中。先交還或用 ${p}takeback 接回，再接回別的對話。`));
       const list = resumeCandidates();
       if (!list.length) return void (await io.tell('還沒有可以接回的對話。'));
       // Old threads saved before 0.1.5 have no name yet: ask Discord.
@@ -295,6 +351,13 @@ export async function handleCommandInteraction(i: Interaction): Promise<void> {
   if (what === 'model' && i.isButton()) {
     menus.delete(id);
     const text = await applyModel(m.conv, arg);
+    await i.update({ content: text, components: [] });
+    if (m.slash) await publicNote(m.conv, `${text}（${i.user.displayName || i.user.username}）`);
+    return;
+  }
+  if (what === 'effort' && i.isButton()) {
+    menus.delete(id);
+    const text = await applyEffort(m.conv, normalizeEffort(arg) ?? null);
     await i.update({ content: text, components: [] });
     if (m.slash) await publicNote(m.conv, `${text}（${i.user.displayName || i.user.username}）`);
     return;

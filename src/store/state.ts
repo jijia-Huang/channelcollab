@@ -49,10 +49,34 @@ export type ThreadState = {
   ctxNotified?: number[];
   /** Told to Claude in front of the next message (e.g. the owner denied pending approvals). */
   pendingNote?: string;
+  /** Effort level chosen with !effort; overrides the binding's effort. */
+  effort?: string;
+  /**
+   * The session's own folder when it differs from the binding's: a direct message that continues a
+   * thread's session (!resume), or a conversation handed over from the computer (handoff) or forked
+   * from a report (post_to_channel). A session can only be resumed from its own folder.
+   */
+  cwd?: string;
+  /** Where the conversation came from, for !status (e.g. 從電腦交棒). */
+  source?: string;
+  /** A thread opened by a report: on its first trigger, fork this session (then it is its own). */
+  forkFrom?: { sessionId: string; cwd: string };
+  /** The owner took the conversation over on the computer: the bot must not open its session meanwhile. */
+  takeover?: Takeover;
+};
+
+/** A conversation being continued on the computer (see PLAN §21). */
+export type Takeover = {
+  at: string;
+  /** The session the computer resumed. */
+  sessionId: string;
+  cwd: string;
+  /** Discord messages that came in meanwhile (message IDs, oldest first), handled after the release. */
+  queued: string[];
 };
 
 /** A direct-message conversation. `cwd` is set when it continues a thread's session (that thread's folder). */
-export type DmState = ThreadState & { cwd?: string; source?: string };
+export type DmState = ThreadState;
 
 /** The /skill list last reported by a session, per working folder. */
 type SkillList = { at: string; items: SkillItem[] };

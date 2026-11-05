@@ -71,6 +71,11 @@ function clipLines(s: string, maxLines: number, maxChars: number): string {
 /** A short, readable picture of what the tool is about to do. */
 export function summarizeTool(name: string, input: Record<string, unknown>): string {
   const str = (k: string) => (typeof input[k] === 'string' ? (input[k] as string) : '');
+  if (name.endsWith('__post_to_channel')) {
+    const where = `${str('channel')}${str('thread') ? ` 的討論串 ${str('thread')}` : ''}${input.new_thread ? ` 的新討論串「${clip(str('thread_title') || '（沒有標題）', 80)}」` : ''}`;
+    const files = Array.isArray(input.files) && input.files.length ? `\n附檔：${(input.files as string[]).map((f) => `\`${f}\``).join('、')}` : '';
+    return `要貼到團隊頻道 **${clip(where, 200)}**：\n${fence(clipLines(str('text'), 15, 900))}${files}`;
+  }
   if (name === 'Bash' || name === 'PowerShell') {
     const desc = str('description');
     return `${desc ? `${clip(desc, 200)}\n` : ''}${fence(clipLines(str('command'), 20, 900), name === 'Bash' ? 'sh' : 'powershell')}`;

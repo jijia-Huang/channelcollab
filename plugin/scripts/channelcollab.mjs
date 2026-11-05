@@ -10,6 +10,10 @@
 //   access --roster-only on|off    白名單：只有主人和名冊上的人／Bot 能叫 Bot（預設開）
 //   roster list|add|remove|import  管理自己的名冊 <HOME>\roster.json（Bot 和成員；add 只要 Discord ID）
 //   start | stop | status      啟動（背景執行）、停止、查看狀態
+//   homes | targets            這台電腦上的 Bot（各 HOME）；這隻 Bot 可以貼文的頻道
+//   post --channel ...         請執行中的 Bot 把回報貼到綁定的頻道（經 named pipe，腳本不讀 token）
+//   sessions | takeover | release   列出 Bot 的對話；在電腦上接手（開新視窗 resume）；交還給 Bot
+//   handoff ...                把電腦上的 session 交給 Bot（私訊或綁定頻道的新討論串）
 //   shortcut [--dir <資料夾>] [--name <名稱>]   產生雙擊用的「啟動／停止 <Bot 名稱>.bat」等（預設放桌面）
 //   --self-test                不需要 token 的自我測試
 //
@@ -145,6 +149,7 @@ export function configSummary(file) {
 /** 單輪工作上限（分鐘）：正數才算，其他（沒設、0、負數）都是 0 = 不限。和 src/config.ts 的 minutesOrZero 相同。 */
 const minutesOrZero = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
 const turnLimitField = (b) => ({
+  ...(typeof b?.effort === 'string' ? { effort: b.effort } : {}),
   ...(typeof b?.turn_timeout_minutes === 'number' ? { turn_timeout_minutes: b.turn_timeout_minutes } : {}),
   ...(typeof b?.max_turns === 'number' ? { max_turns: b.max_turns } : {}),
 });
@@ -159,12 +164,12 @@ export function setOwner(file, ownerId) {
 }
 
 /** 新增或修改一個頻道綁定；只動 channels.<id>，其他欄位原樣保留。 */
-export function bindChannel(file, { channel, cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns }) {
+export function bindChannel(file, { channel, cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns, effort }) {
   if (!SNOWFLAKE.test(String(channel ?? ''))) throw new CliError(`頻道 ID 格式不對（應為 17–20 位數字）：${channel}`);
   const c = readConfig(file);
   const prev = c.channels?.[channel];
   if (!prev && !cwd) throw new CliError('新增綁定時一定要給 --cwd（這個頻道的工作資料夾）');
-  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns });
+  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns, effort });
   c.channels = { ...(c.channels ?? {}), [channel]: next };
   c.defaults = { permission_mode: 'default', ...(c.defaults ?? {}) };
   writeJson(file, c);
@@ -172,11 +177,11 @@ export function bindChannel(file, { channel, cwd, model, permissionMode, launche
 }
 
 /** 私訊設定（config 的 dm 區塊，欄位和頻道綁定相同）；只動 dm，其他欄位原樣保留。 */
-export function bindDm(file, { cwd, model, permissionMode, launcher, turnTimeout, maxTurns }) {
+export function bindDm(file, { cwd, model, permissionMode, launcher, turnTimeout, maxTurns, effort }) {
   const c = readConfig(file);
   const prev = c.dm && typeof c.dm === 'object' ? c.dm : undefined;
   if (!prev && !cwd) throw new CliError('開啟私訊時一定要給 --cwd（私訊用的工作資料夾）');
-  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, turnTimeout, maxTurns });
+  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, turnTimeout, maxTurns, effort });
   c.dm = next;
   c.defaults = { permission_mode: 'default', ...(c.defaults ?? {}) };
   writeJson(file, c);
@@ -198,7 +203,10 @@ export function setRosterOnly(file, on) {
   writeJson(file, c);
 }
 
-function applyBinding(prev, { cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns }) {
+/** 努力程度（SDK 的 effort）；none 移除，回到 Claude Code 的預設。 */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+function applyBinding(prev, { cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns, effort }) {
   const next = { ...(prev ?? {}) };
   if (cwd) {
     const abs = path.resolve(cwd);
@@ -226,6 +234,11 @@ function applyBinding(prev, { cwd, model, permissionMode, launcher, tools, turnT
       if (!/^\d+(\.\d+)?$/.test(String(turnTimeout).trim()) || !Number.isFinite(n) || n < 0) throw new CliError(`--turn-timeout 要是 0 以上的分鐘數（0 代表不限，none 表示沿用預設）；收到：${turnTimeout}`);
       next.turn_timeout_minutes = n;
     }
+  }
+  if (effort !== undefined) {
+    if (effort === '' || effort === 'none' || effort === 'default') delete next.effort;
+    else if (!EFFORT_LEVELS.includes(String(effort))) throw new CliError(`--effort 只能是 ${EFFORT_LEVELS.join(' / ')}，或 none 回到預設（收到：${effort}）`);
+    else next.effort = String(effort);
   }
   if (maxTurns !== undefined) {
     // 預設不限步數；none 移除這個欄位（回到 defaults.max_turns）。
@@ -391,7 +404,9 @@ export function pipeRequest(pipe, text, timeoutMs = 3000) {
       resolve(null);
     }, timeoutMs);
     sock.on('connect', () => sock.write(`${text}\n`));
-    sock.on('data', (d) => (out += d.toString()));
+    // 分段到達的多位元組字元（中文）要整段解碼，不能一段一段 toString。
+    sock.setEncoding('utf8');
+    sock.on('data', (d) => (out += d));
     sock.on('end', () => {
       clearTimeout(timer);
       resolve(out.trim());
@@ -1176,7 +1191,7 @@ export function makeLaunchers(p, dir, { name, skipRuntimeCheck = false } = {}) {
 // ---------------------------------------------------------------------------
 function printDm(dm, pinSet) {
   if (!dm) return console.log('私訊：未開啟（要用的話：bind --dm --cwd <資料夾>，並先設定 PIN）');
-  console.log(`私訊：開啟 → ${dm.cwd}（模型 ${dm.model ?? '預設'}，權限模式 ${dm.permission_mode ?? '沿用預設'}${dm.launcher ? `，啟動器 ${dm.launcher}` : ''}${'turn_timeout_minutes' in dm ? `，單輪上限 ${turnLimitText(dm.turn_timeout_minutes)}` : ''}${'max_turns' in dm ? `，步數上限 ${stepLimitText(dm.max_turns)}` : ''}）${pinSet ? '' : '　⚠️ 還沒設定 PIN，私訊暫不開放'}`);
+  console.log(`私訊：開啟 → ${dm.cwd}（模型 ${dm.model ?? '預設'}，權限模式 ${dm.permission_mode ?? '沿用預設'}${dm.launcher ? `，啟動器 ${dm.launcher}` : ''}${'turn_timeout_minutes' in dm ? `，單輪上限 ${turnLimitText(dm.turn_timeout_minutes)}` : ''}${'max_turns' in dm ? `，步數上限 ${stepLimitText(dm.max_turns)}` : ''}${dm.effort ? `，努力程度 ${dm.effort}` : ''}）${pinSet ? '' : '　⚠️ 還沒設定 PIN，私訊暫不開放'}`);
 }
 
 /** 模式、頻道、私訊（start 和 status 共用）。 */
@@ -1198,7 +1213,7 @@ function printChannels(channels) {
   if (!ids.length) return console.log('  （還沒有綁定任何頻道）');
   for (const id of ids) {
     const c = channels[id];
-    console.log(`  - 頻道 ${id} → ${c.cwd}（模型 ${c.model ?? '預設'}，權限模式 ${c.permission_mode ?? '沿用預設'}${c.launcher ? `，啟動器 ${c.launcher}` : ''}${'turn_timeout_minutes' in c ? `，單輪上限 ${turnLimitText(c.turn_timeout_minutes)}` : ''}${'max_turns' in c ? `，步數上限 ${stepLimitText(c.max_turns)}` : ''}）`);
+    console.log(`  - 頻道 ${id} → ${c.cwd}（模型 ${c.model ?? '預設'}，權限模式 ${c.permission_mode ?? '沿用預設'}${c.launcher ? `，啟動器 ${c.launcher}` : ''}${'turn_timeout_minutes' in c ? `，單輪上限 ${turnLimitText(c.turn_timeout_minutes)}` : ''}${'max_turns' in c ? `，步數上限 ${stepLimitText(c.max_turns)}` : ''}${c.effort ? `，努力程度 ${c.effort}` : ''}）`);
   }
 }
 
@@ -1239,17 +1254,270 @@ function printStatus(s) {
 }
 
 // ---------------------------------------------------------------------------
+// 0.1.8：回報到群組、在電腦上接手、交給手機（經執行中 Bot 的 named pipe；腳本本身不讀 token）
+// ---------------------------------------------------------------------------
+/** 經 pipe 送一個 JSON 指令、收一行 JSON 回應；Bot 沒在執行時回傳 null。 */
+export async function pipeJson(pipe, request, timeoutMs = 60000) {
+  const r = await pipeRequest(pipe, JSON.stringify(request), timeoutMs);
+  if (r === null) return null;
+  try {
+    return JSON.parse(r);
+  } catch {
+    // 0.1.7 以前的 Bot 不認得 JSON 指令，會回 unknown command。
+    return { ok: false, error: r === 'unknown command' ? '執行中的 Bot 是舊版，不認得這個指令；請先 stop 再 start 換成新版' : r };
+  }
+}
+
+/** 對 Bot 送指令；Bot 沒在跑就停下來，請使用者先啟動（腳本不會自己拿 token 去連 Discord）。 */
+async function askBot(p, request, timeoutMs) {
+  const r = await pipeJson(stopPipe(p.home), request, timeoutMs);
+  if (r === null) throw new CliError(`Bot 沒有在執行（${p.home}）。請先啟動 Bot：/channelcollab:start，或 start --home "${p.home}"`);
+  return r;
+}
+
+/** 這台電腦上的 channelcollab HOME（%USERPROFILE% 底下 .channelcollab 開頭、有 config.json 的資料夾）。 */
+export function listHomes(base = os.homedir()) {
+  let names = [];
+  try {
+    names = fs.readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory() && /^\.channelcollab/i.test(d.name)).map((d) => d.name);
+  } catch {}
+  return names
+    .map((n) => paths(path.join(base, n)))
+    .filter((p) => fs.existsSync(p.config))
+    .map((p) => ({ home: p.home, name: botLabel(p, { defaultHome: path.join(base, '.channelcollab') }) ?? path.basename(p.home) }));
+}
+
+/** 文字來源：--text-file（建議，避免命令列跳脫），否則 stdin。 */
+function readText(opts) {
+  const f = opt(opts['text-file']) ?? opt(opts['summary-file']);
+  if (f) {
+    if (!fs.existsSync(f)) throw new CliError(`找不到文字檔：${f}`);
+    return fs.readFileSync(f, 'utf-8').replace(/^﻿/, '');
+  }
+  if (process.stdin.isTTY) return '';
+  try {
+    return fs.readFileSync(0, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 「要接手哪一段對話」：清單的編號（1 開始）、dm／私訊、討論串 ID，或 --session 的 session ID。
+ * rows 是 Bot 回的 sessions。
+ */
+export function pickConversation(rows, which, sessionId) {
+  if (sessionId) {
+    const bySession = rows.filter((r) => r.sessionId === sessionId);
+    if (bySession.length) return bySession.find((r) => r.takenOver) ?? bySession[0];
+  }
+  if (which === undefined || which === true) return null;
+  const w = String(which).trim();
+  if (/^(dm|私訊)$/i.test(w)) return rows.find((r) => r.kind === 'dm') ?? { key: 'dm', kind: 'dm' };
+  if (/^\d{1,3}$/.test(w)) return rows[Number(w) - 1] ?? null;
+  if (SNOWFLAKE.test(w)) return rows.find((r) => r.key === w) ?? { key: w, kind: 'thread' };
+  return null;
+}
+
+/** 從 Claude Code 啟動的子程序會帶著這些標記；開新視窗接手時要拿掉，不然新的 claude 會以為自己在別的 session 裡。 */
+const SESSION_ENV = ['CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_SESSION_KIND', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_REMOTE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_AGENT_SDK_VERSION'];
+
+export function cleanEnv(env = process.env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) if (!SESSION_ENV.includes(k.toUpperCase())) out[k] = v;
+  return out;
+}
+
+/** 在電腦上接回 Bot 的 session 要用的指令（綁定的啟動器 + --resume，在 session 自己的資料夾執行）。 */
+export function resumeCommand({ launcher, sessionId }) {
+  if (!/^[0-9a-f-]{36}$/i.test(String(sessionId))) throw new CliError(`session ID 格式不對：${sessionId}`);
+  const l = String(launcher ?? '').trim();
+  // --system-prompt-snapshot off：Bot 的 session 錄下的是 Bot 的系統提示詞（只能用 reply 發言）；在電腦上要換成一般的。
+  const args = `--resume ${sessionId} --system-prompt-snapshot off`;
+  if (!l || l.toLowerCase() === 'claude') return `claude ${args}`;
+  return `"${l}" ${args}`;
+}
+
+/**
+ * 新視窗執行的 .cmd。**內容只有 ASCII**：資料夾、啟動器、session ID、說明文字都放在環境變數（CC_RESUME_*）。
+ * 實測：.cmd 裡有中文時，即使先 chcp 65001，cmd 讀下一行的位置也會算錯、把指令從中間切斷
+ * （spike/v018-resume-script.mjs）；環境變數是 UTF-16，經 wt 和 start 都會傳到新視窗（spike/v018-wt-env.mjs）。
+ */
+export const RESUME_SCRIPT = [
+  '@echo off',
+  'title %CC_RESUME_TITLE%',
+  ...SESSION_ENV.map((k) => `set "${k}="`),
+  'cd /d "%CC_RESUME_CWD%"',
+  'echo %CC_RESUME_NOTE%',
+  'echo.',
+  // --system-prompt-snapshot off: the bot's session recorded the bot's system prompt (speak only through reply).
+  'if not defined CC_RESUME_LAUNCHER goto plain',
+  '"%CC_RESUME_LAUNCHER%" --resume %CC_RESUME_SID% --system-prompt-snapshot off',
+  'goto :eof',
+  ':plain',
+  'claude --resume %CC_RESUME_SID% --system-prompt-snapshot off',
+  '',
+].join('\r\n');
+
+/** 給 RESUME_SCRIPT 的環境變數（沒有啟動器或啟動器是 claude 時，直接用 claude）。 */
+export function resumeEnv({ cwd, launcher, sessionId, title }, base = process.env) {
+  resumeCommand({ launcher, sessionId }); // 檢查 session ID 格式
+  const l = String(launcher ?? '').trim();
+  const env = { ...cleanEnv(base), CC_RESUME_CWD: cwd, CC_RESUME_SID: sessionId, CC_RESUME_TITLE: title ?? 'channelcollab', CC_RESUME_NOTE: 'channelcollab：在電腦上接手 Discord 的對話。做完後在這裡打 /channelcollab:release（或 /exit 後執行 release），把對話交還給 Bot。' };
+  if (l && l.toLowerCase() !== 'claude') env.CC_RESUME_LAUNCHER = l;
+  else delete env.CC_RESUME_LAUNCHER;
+  return env;
+}
+
+function whereExe(name) {
+  try {
+    const r = spawnSync('where.exe', [name], { encoding: 'utf8', windowsHide: true });
+    return r.status === 0 ? r.stdout.split(/\r?\n/).find(Boolean)?.trim() ?? null : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 開一個新的終端機視窗執行 .cmd（中文與空白路徑都可以）：有 Windows Terminal 就 `wt -w new -d <cwd> cmd /k <檔案>`，
+ * 沒有（或路徑含 wt 的分隔字元 ;）就 `cmd /c start "" /d <cwd> cmd /k <檔案>`。
+ */
+export function openTerminal(file, cwd, { title = 'channelcollab', keep = true, wt = whereExe('wt.exe'), env = cleanEnv() } = {}) {
+  const mode = keep ? '/k' : '/c';
+  if (wt && !/;/.test(`${file}${cwd}`)) {
+    const child = spawn(wt, ['-w', 'new', '--title', title, '-d', cwd, 'cmd.exe', mode, file], { detached: true, stdio: 'ignore', env, windowsHide: false });
+    child.unref();
+    return 'wt';
+  }
+  const q = (s) => `"${String(s).replace(/"/g, '')}"`;
+  const child = spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', `start ${q(title)} /d ${q(cwd)} cmd.exe ${mode} ${q(file)}`], { detached: true, stdio: 'ignore', env, windowsVerbatimArguments: true, windowsHide: true });
+  child.unref();
+  return 'cmd';
+}
+
+function printSessions(rows) {
+  if (!rows.length) return console.log('（這隻 Bot 還沒有可以接手的對話）');
+  rows.forEach((r, i) => {
+    const flags = [r.takenOver ? '🖥️ 電腦上接手中' : '', r.busy ? '⚙️ 正在工作' : ''].filter(Boolean).join('，');
+    console.log(`${String(i + 1).padStart(2)}. ${shortStamp(r.at)}　${r.kind === 'dm' ? '私訊' : `討論串「${r.name}」（${r.key}）`}${flags ? `　${flags}` : ''}`);
+    console.log(`    ${r.summary ? r.summary.replace(/\s+/g, ' ').slice(0, 80) : '（沒有摘要）'}`);
+    console.log(`    session ${r.sessionId}　cwd ${r.cwd}${r.launcher ? `　啟動器 ${r.launcher}` : ''}`);
+  });
+}
+
+const shortStamp = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '時間不明' : `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+export const bridgeCommands = {
+  async homes(_p, opts) {
+    const list = listHomes();
+    const rows = await Promise.all(list.map(async (h) => ({ ...h, running: await pipeAlive(stopPipe(h.home)) })));
+    if (opts.json) return console.log('RESULT ' + JSON.stringify(rows));
+    if (!rows.length) return console.log('這台電腦上沒有 channelcollab 的 Bot（找不到 %USERPROFILE%\\.channelcollab* 的設定）。');
+    rows.forEach((r, i) => console.log(`${i + 1}. ${r.name}　${r.running ? '✅ 執行中' : '⏹ 沒有執行'}　--home "${r.home}"`));
+  },
+  async targets(p, opts) {
+    const r = await askBot(p, { cmd: 'info' }, 10000);
+    if (opts.json) return console.log('RESULT ' + JSON.stringify(r));
+    if (!r.ok) throw new CliError(r.error);
+    console.log(`Bot：${r.bot.tag}（ID ${r.bot.id}）　私訊：${r.dm ? '開啟' : '未開啟'}`);
+    if (!r.channels.length) return console.log('可以貼的頻道：無（這隻 Bot 沒有綁定頻道）');
+    console.log('可以貼的頻道：');
+    for (const c of r.channels) console.log(`  - ${c.name ? `#${c.name}` : '（名稱未知）'}　ID ${c.id}`);
+  },
+  async post(p, opts) {
+    const channel = opt(opts.channel);
+    if (!channel) throw new CliError('用法：post --channel <頻道 ID 或名稱> [--thread <討論串 ID>] [--new-thread <標題>] [--file <檔案>]... [--text-file <檔案>]（或從 stdin 傳文字）');
+    const text = readText(opts);
+    const files = [].concat(opts.file ?? []).filter((f) => f && f !== true).map((f) => path.resolve(String(f)));
+    if (!text.trim() && !files.length) throw new CliError('沒有要貼的內容：用 --text-file <檔案> 或從 stdin 傳文字');
+    const r = await askBot(p, { cmd: 'post', channel, text, files, thread: opt(opts.thread), newThread: opt(opts['new-thread']), sessionId: opt(opts.session) ?? process.env.CLAUDE_CODE_SESSION_ID, cwd: opt(opts.cwd) ?? process.cwd() }, 60000);
+    if (opts.json) return console.log('RESULT ' + JSON.stringify(r));
+    if (!r.ok) throw new CliError(`沒有貼出去：${r.error}`);
+    console.log(`✅ 已貼到 ${r.where}`);
+    console.log(`連結：${r.url}`);
+    for (const x of r.rejected ?? []) console.log(`⚠️  沒附上：${x}`);
+    if (r.threadId) console.log('之後在那個討論串 @ Bot，就會接著這段對話（從這裡的對話複製一份）。');
+  },
+  async sessions(p, opts) {
+    const r = await askBot(p, { cmd: 'sessions' }, 15000);
+    if (opts.json) return console.log('RESULT ' + JSON.stringify(r));
+    if (!r.ok) throw new CliError(r.error);
+    printSessions(r.sessions);
+  },
+  async takeover(p, opts) {
+    const list = await askBot(p, { cmd: 'sessions' }, 15000);
+    if (!list.ok) throw new CliError(list.error);
+    const pick = pickConversation(list.sessions, opts._[1] ?? opts.key);
+    if (!pick) {
+      printSessions(list.sessions);
+      throw new CliError('要指定接手哪一段對話：takeover <編號｜dm｜討論串 ID>');
+    }
+    const r = await askBot(p, { cmd: 'takeover', key: pick.key }, 90000);
+    if (!r.ok) throw new CliError(`沒有接手：${r.error}`);
+    const title = `接手：${String(r.name).slice(0, 40)}`;
+    const dir = path.join(p.home, 'takeover');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'resume.cmd');
+    fs.writeFileSync(file, RESUME_SCRIPT, 'ascii');
+    const how = opts['no-window'] ? null : openTerminal(file, r.cwd, { title, env: resumeEnv({ cwd: r.cwd, launcher: r.launcher, sessionId: r.sessionId, title }) });
+    if (opts.json) return console.log('RESULT ' + JSON.stringify({ ...r, script: file, window: how }));
+    console.log(`✅ Bot 已放開${r.name}，標記成「主人在電腦上接手中」。`);
+    console.log(`   session ${r.sessionId}　cwd ${r.cwd}`);
+    console.log(how ? `   已開新視窗（${how === 'wt' ? 'Windows Terminal' : '命令提示字元'}）接著這段對話。` : `   沒有開視窗；要自己接的話，在 ${r.cwd} 執行：${resumeCommand(r)}`);
+    if (r.url) console.log(`   討論串：${r.url}`);
+    console.log(`   做完後交還：release ${r.key} --home "${p.home}"（或在接手的視窗裡用 /channelcollab:release）。`);
+  },
+  async release(p, opts) {
+    const list = await askBot(p, { cmd: 'sessions' }, 15000);
+    if (!list.ok) throw new CliError(list.error);
+    const sessionId = opt(opts.session);
+    const which = opts._[1] ?? opts.key;
+    const takenOver = list.sessions.filter((r) => r.takenOver);
+    // 給了 --session 就只認那個 session（不在這隻 Bot 就是找錯 HOME，不能改交還別段對話）；都沒給時，只有一段接手中才自動選它。
+    const pick = sessionId && which === undefined ? (list.sessions.find((r) => r.sessionId === sessionId && r.takenOver) ?? null) : (pickConversation(list.sessions, which, sessionId) ?? (which === undefined && takenOver.length === 1 ? takenOver[0] : null));
+    if (!pick && sessionId && which === undefined) throw new CliError(`這隻 Bot（${p.home}）沒有接手中的 session ${sessionId}；可能是另一隻 Bot，請加 --home 指定`);
+    if (!pick) {
+      printSessions(list.sessions.filter((r) => r.takenOver));
+      throw new CliError('要指定交還哪一段對話：release <編號｜dm｜討論串 ID>（或 --session <session ID>）');
+    }
+    const r = await askBot(p, { cmd: 'release', key: pick.key, ...(sessionId ? { sessionId } : {}) }, 30000);
+    if (opts.json) return console.log('RESULT ' + JSON.stringify(r));
+    if (!r.ok) throw new CliError(`沒有交還：${r.error}`);
+    console.log(`✅ 已把${r.name}交還給 Bot${r.kept ? `，Bot 接著處理期間記下的 ${r.kept} 則訊息` : ''}。`);
+    console.log('   ⚠️ 電腦上的這個對話請關掉（/exit），不要再在這裡繼續，避免兩邊同時寫入同一段對話。');
+  },
+  async handoff(p, opts) {
+    const sessionId = opt(opts.session) ?? process.env.CLAUDE_CODE_SESSION_ID;
+    if (!sessionId) throw new CliError('用法：handoff --session <session ID> [--cwd <資料夾>] [--channel <頻道> --title <標題>] [--summary-file <檔案>]');
+    const summary = readText(opts);
+    const r = await askBot(p, { cmd: 'handoff', sessionId, cwd: opt(opts.cwd) ?? process.cwd(), target: opt(opts.channel) ?? 'dm', title: opt(opts.title), summary }, 60000);
+    if (opts.json) return console.log('RESULT ' + JSON.stringify(r));
+    if (!r.ok) throw new CliError(`沒有交棒：${r.error}`);
+    console.log(`✅ 已把這段對話交給 Bot 的${r.where}。之後在那裡傳訊息，就會接著這段對話（session ${sessionId}）。`);
+    if (r.url) console.log(`連結：${r.url}`);
+    if (r.cwdNote) console.log(`   ${r.cwdNote.replace(/`/g, '')}`);
+    console.log(`   Bot 用${r.launcher ? `啟動器 ${r.launcher}` : '一般的 claude'}接這段對話。`);
+    console.log('   ⚠️ 請關掉電腦上的這個對話（/exit），不要再在這裡繼續，避免兩邊同時寫入。');
+  },
+};
+
+// ---------------------------------------------------------------------------
 // 參數與子命令
 // ---------------------------------------------------------------------------
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const opts = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
-      if (eq > 0) opts[a.slice(2, eq)] = a.slice(eq + 1);
-      else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) opts[a.slice(2)] = argv[++i];
-      else opts[a.slice(2)] = true;
+      const key = eq > 0 ? a.slice(2, eq) : a.slice(2);
+      const value = eq > 0 ? a.slice(eq + 1) : i + 1 < argv.length && !argv[i + 1].startsWith('--') ? argv[++i] : true;
+      // --file 可以給好幾次（post 的附檔）。
+      if (key === 'file' && value !== true) opts.file = [...[].concat(opts.file ?? []), value];
+      else opts[key] = value;
     } else opts._.push(a);
   }
   return opts;
@@ -1290,6 +1558,7 @@ const commands = {
         launcher: opts.launcher === true ? undefined : opts.launcher,
         turnTimeout: opt(opts['turn-timeout']),
         maxTurns: opt(opts['max-turns']),
+        effort: opt(opts.effort),
       });
       console.log(`✅ ${r.action === 'added' ? '開啟' : '更新'}私訊設定：`);
       printDm(r.dm, fs.existsSync(p.pin));
@@ -1309,6 +1578,7 @@ const commands = {
       tools: opts.tools === true ? undefined : opts.tools,
       turnTimeout: opt(opts['turn-timeout']),
       maxTurns: opt(opts['max-turns']),
+      effort: opt(opts.effort),
     });
     console.log(`✅ ${r.action === 'added' ? '新增' : '更新'}綁定：`);
     printChannels({ [opts.channel]: r.channel });
@@ -1353,6 +1623,7 @@ const commands = {
     if (opts.json) return console.log('RESULT ' + JSON.stringify(s));
     printStatus(s);
   },
+  ...bridgeCommands,
   async shortcut(p, opts) {
     const { files, removed } = makeLaunchers(p, typeof opts.dir === 'string' ? opts.dir : undefined, { name: opt(opts.name) });
     console.log('✅ 已建立雙擊用的檔案：');
@@ -1453,7 +1724,7 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
   set-owner <Discord 使用者 ID>           設定 Bot 的主人（可以按權限按鈕的人）
   bind --channel <ID> --cwd <資料夾> [--model opus|sonnet|haiku] [--permission-mode default]
        [--launcher <路徑>] [--tools Read,Grep,...] [--turn-timeout <分鐘>|none]
-       [--max-turns <步數>|none]
+       [--max-turns <步數>|none] [--effort low|medium|high|xhigh|max|none]
                                           新增或修改頻道綁定（只給要改的欄位）
   bind --remove --channel <ID>            移除頻道綁定
   bind --dm --cwd <資料夾> [--model ...] [--permission-mode ...] [--launcher <路徑>] [--turn-timeout <分鐘>|none]
@@ -1474,6 +1745,15 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
   start [--wait <秒>] [--no-update]       在背景啟動 Bot，等它上線
   stop                                    停止 Bot，並確認沒有殘留程序
   status [--json]                         Bot 是否在跑、登入成誰、綁定、最近錯誤
+  homes [--json]                          列出這台電腦上的 Bot（各 HOME 與 Bot 名稱）
+  targets [--json]                        這隻 Bot 可以貼文的頻道（要 Bot 在執行）
+  post --channel <頻道 ID 或名稱> [--thread <討論串 ID>] [--new-thread <標題>] [--file <檔案>]...
+       [--text-file <檔案>] [--session <ID>]  請執行中的 Bot 貼文到綁定的頻道（文字也可以從 stdin 傳入）
+  sessions [--json]                       這隻 Bot 最近的對話（討論串、私訊）與 session ID、cwd
+  takeover <編號|dm|討論串 ID> [--no-window]  在電腦上接手一段對話：Bot 放開它，開新視窗 resume
+  release [<編號|dm|討論串 ID>] [--session <ID>]  把接手的對話交還給 Bot
+  handoff [--session <ID>] [--channel <頻道> --title <標題>] [--summary-file <檔案>]
+                                          把電腦上的這個 session 交給 Bot（預設私訊；--channel 開新討論串）
   shortcut [--dir <資料夾>] [--name <名稱>]  產生雙擊用的啟動／停止／PIN／解除鎖定 .bat，檔名帶 Bot 名稱（預設放桌面）
   --self-test                             自我測試
 
@@ -1867,6 +2147,22 @@ async function selfTest() {
     bindDm(f, { cwd: tmp, maxTurns: '0' });
     eq(configSummary(f).dm.max_turns, 0);
     eq([stepLimitText(0), stepLimitText(40)], ['不限', '40 步']);
+  });
+
+  console.log('努力程度');
+  await t('bind --effort：low…max 寫進綁定與私訊，none 移除；其他值拒絕；不設就是預設', () => {
+    const f = path.join(tmp, 'effort.json');
+    writeJson(f, { discord: { token: FAKE }, channels: {} });
+    bindChannel(f, { channel: CH, cwd: tmp });
+    eq('effort' in readJson(f, {}).channels[CH], false, '預設不寫');
+    bindChannel(f, { channel: CH, effort: 'xhigh' });
+    eq(configSummary(f).channels[CH].effort, 'xhigh');
+    bindChannel(f, { channel: CH, effort: 'none' });
+    eq('effort' in readJson(f, {}).channels[CH], false);
+    throws(() => bindChannel(f, { channel: CH, effort: 'turbo' }), /--effort/);
+    bindDm(f, { cwd: tmp, effort: 'max' });
+    eq(configSummary(f).dm.effort, 'max');
+    eq(readJson(f, {}).discord.token, FAKE, 'token 原樣保留');
   });
 
   console.log('雙擊用的 .bat');
