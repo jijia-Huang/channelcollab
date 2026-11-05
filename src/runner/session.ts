@@ -26,14 +26,15 @@ import { killTree, launcherOptions, type Spawned } from './launcher.js';
 import { blockedByClassifier, decideTool, inside, retryKey } from './policy.js';
 import { contextFromUsage, recordRateLimit, type RateInfo } from './usage.js';
 import { skillCatalog, type OfferedCommand } from './skills.js';
+import { limitLabel, TIMEOUT_TOOL_MESSAGE, timeoutWarning, TurnClock } from './turn-clock.js';
 import { rememberSkills } from '../store/state.js';
 
 const OWN_PREFIX = 'mcp__channelcollab__';
 export const REPLY_TOOL = `${OWN_PREFIX}reply`;
-/** Working time per turn; time spent waiting for someone to answer a prompt is not counted. */
-const TURN_TIMEOUT_MS = 10 * 60 * 1000;
-/** Counted per user message in streaming mode, not per session (spike/live-check.ts). */
-const MAX_TURNS = 40;
+/** A graceful close of a session that is still working waits this long for the turn (then kills). */
+const BUSY_CLOSE_WAIT_MS = 10 * 60 * 1000;
+/** After the turn time limit: how long the interrupted turn gets to end before the session is killed. */
+const INTERRUPT_GRACE_MS = 30 * 1000;
 /** After stdin EOF, how long the CLI gets to exit on its own before it is killed. */
 const CLOSE_GRACE_MS = 15 * 1000;
 /** Files Claude can attach to one reply (Discord's limit per message). */
@@ -117,6 +118,8 @@ export type TurnResult = {
   denials: string[];
   /** Who pressed 🛑, when the turn was stopped. */
   stoppedBy?: string;
+  /** The turn hit its working-time limit (turn_timeout_minutes) and was stopped by the bot. */
+  timedOut?: boolean;
   error?: string;
   /** SDKAssistantMessageError from the last assistant message that carried one (e.g. authentication_failed). */
   apiError?: string;
@@ -131,10 +134,12 @@ type Turn = TurnCallbacks & {
   denials: string[];
   replies: number;
   lastText: string;
-  timer?: NodeJS.Timeout;
-  /** Working time left before the turn times out; the clock stops while a prompt waits for someone. */
-  remainingMs: number;
-  timerStarted: number;
+  /** The optional working-time limit; it stops while a prompt waits for someone. */
+  clock: TurnClock;
+  /** The limit hit: replies and tools are refused from then on, the bot posts the notice itself. */
+  timedOut?: boolean;
+  /** Kills the session when the interrupted turn does not end in time. */
+  killTimer?: NodeJS.Timeout;
   waits: number;
   /** Cancels prompts still waiting when the turn is stopped or the session ends. */
   abort: AbortController;
@@ -238,6 +243,8 @@ export class LiveSession {
   /** When this process was started (for !status). */
   readonly startedAt = Date.now();
   readonly cwd: string;
+  /** Working time per turn before it is stopped; 0 = no limit. */
+  readonly turnTimeoutMs: number;
 
   /**
    * `costBase` is the cumulative total a resumed CLI starts counting from: what
@@ -260,6 +267,7 @@ export class LiveSession {
     this.alwaysAllowed = new Set(alwaysAllowed);
     this.mode = channel.permissionMode;
     this.cwd = channel.cwd;
+    this.turnTimeoutMs = channel.turnTimeoutMs;
     // The session reads freely, and in acceptEdits edits, inside its cwd and its thread's attachment folder.
     const roots = [channel.cwd, path.join(INBOX_DIR, threadId)];
     // No-go zones: every channelcollab HOME except this conversation's own attachment folder.
@@ -283,6 +291,8 @@ export class LiveSession {
             const checked = checkFiles(files ?? [], roots, zones);
             log('reply', `${threadId} ${brief(text, 300)}${files?.length ? ` files=${JSON.stringify(checked.ok)} rejected=${JSON.stringify(checked.rejected)}` : ''}`);
             if (!t) return { content: [{ type: 'text', text: 'Not delivered: no active turn.' }], isError: true };
+            // After the time limit the bot reports the stop itself; a last word from Claude could mislead.
+            if (t.timedOut) return { content: [{ type: 'text', text: `Not delivered. ${TIMEOUT_TOOL_MESSAGE}` }], isError: true };
             try {
               await t.sendReply(text, checked.ok);
             } catch (e) {
@@ -303,6 +313,11 @@ export class LiveSession {
       if (hookInput.hook_event_name !== 'PreToolUse') return {};
       const name = hookInput.tool_name;
       const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
+      // Past the turn's time limit nothing more runs (and the refusal must not read like a permission block).
+      if (this.turn?.timedOut) {
+        log('permission', `${threadId} deny ${name} (turn timeout) id=${toolUseId ?? '-'}`);
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: TIMEOUT_TOOL_MESSAGE } };
+      }
       // No-go zones come first: no mode, "always allow" or owner's answer opens them.
       const zone = forbiddenUse(name, toolInput, channel.cwd, zones, OWN_PREFIX);
       if (zone) {
@@ -386,7 +401,7 @@ export class LiveSession {
     };
 
     const hookTimeout = Math.ceil(channel.permissionTimeoutMs / 1000) + 60;
-    log(this.tag, `start kind=${kind} cwd=${channel.cwd} model=${channel.model ?? '-'} mode=${channel.permissionMode} launcher=${channel.launcher || 'builtin'} resume=${resume ?? '-'} always=${JSON.stringify([...this.alwaysAllowed])}`);
+    log(this.tag, `start kind=${kind} cwd=${channel.cwd} model=${channel.model ?? '-'} mode=${channel.permissionMode} launcher=${channel.launcher || 'builtin'} resume=${resume ?? '-'} turn_limit=${limitLabel(this.turnTimeoutMs)} max_turns=${channel.maxTurns || 'none'} always=${JSON.stringify([...this.alwaysAllowed])}`);
     this.q = query({
       prompt: this.input(),
       options: {
@@ -408,7 +423,8 @@ export class LiveSession {
           PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }],
         },
         canUseTool,
-        maxTurns: MAX_TURNS,
+        // max_turns (counted per user message in streaming mode, spike/live-check.ts): off by default, so not sent.
+        ...(channel.maxTurns > 0 ? { maxTurns: channel.maxTurns } : {}),
         abortController: this.abort,
         stderr: onStderr,
         ...(resume ? { resume } : {}),
@@ -485,17 +501,24 @@ export class LiveSession {
         denials: [],
         replies: 0,
         lastText: '',
-        remainingMs: TURN_TIMEOUT_MS,
-        timerStarted: 0,
+        clock: undefined as unknown as TurnClock,
         waits: 0,
         abort: new AbortController(),
         retries: new Map(),
         resolve,
       };
+      t.clock = new TurnClock(
+        this.turnTimeoutMs,
+        () => this.onTimeout(t),
+        () => {
+          log(this.tag, `turn ${n} close to the time limit (${limitLabel(this.turnTimeoutMs)})`);
+          t.notice?.(timeoutWarning(this.turnTimeoutMs, t.clock.left)).catch((e) => log(this.tag, `time limit warning failed: ${(e as Error).message}`));
+        },
+      );
       // Calls the owner approved later (retryKey): allowed in this turn when repeated with the same input.
       for (const k of opts.preapproved ?? []) t.retries.set(k, { allow: true });
       this.turn = t;
-      this.startClock(t);
+      t.clock.resume();
       if (!this.usable) {
         this.finishTurn(undefined, 'session is closed');
         return;
@@ -545,7 +568,7 @@ export class LiveSession {
       if (!force) log(this.tag, `close (${reason}) pid=${this.pid ?? '-'} busy=${this.busy}`);
       this.inputEnded = true;
       this.wake?.();
-      const limit = CLOSE_GRACE_MS + (this.busy ? TURN_TIMEOUT_MS : 0);
+      const limit = CLOSE_GRACE_MS + (this.busy ? BUSY_CLOSE_WAIT_MS : 0);
       const exited = await Promise.race([this.done.then(() => true), sleep(limit).then(() => false)]);
       if (!exited) {
         log(this.tag, `close (${reason}) still running after ${limit} ms, killing`);
@@ -580,28 +603,34 @@ export class LiveSession {
   /** Wait for a person with the turn clock paused (prompts may run in parallel). */
   private async waitFor<T>(wait: () => Promise<T>): Promise<T> {
     const t = this.turn;
-    if (t && t.waits++ === 0) this.stopClock(t);
+    if (t && t.waits++ === 0) t.clock.pause();
     try {
       return await wait();
     } finally {
-      if (t && --t.waits === 0 && this.turn === t) this.startClock(t);
+      if (t && --t.waits === 0 && this.turn === t) t.clock.resume();
     }
   }
 
-  private startClock(t: Turn): void {
-    t.timerStarted = Date.now();
-    t.timer = setTimeout(() => {
-      log(this.tag, `turn ${t.n} timeout after ${TURN_TIMEOUT_MS} ms of work, killing the session`);
+  /**
+   * The turn used up its working time (turn_timeout_minutes; off by default).
+   * Interrupt it like 🛑 so the session stays and "繼續" picks it up; from now
+   * on replies and tools are refused, and the bot posts the notice itself.
+   * Only if the turn does not end soon is the session killed.
+   */
+  private onTimeout(t: Turn): void {
+    if (this.turn !== t) return;
+    t.timedOut = true;
+    log(this.tag, `turn ${t.n} timeout: ${limitLabel(this.turnTimeoutMs)} of work used, interrupting the turn`);
+    t.abort.abort();
+    this.q.interrupt().catch((e) => log(this.tag, `turn ${t.n} timeout interrupt failed: ${(e as Error).message}`));
+    t.killTimer = setTimeout(() => {
+      if (this.turn !== t) return;
+      log(this.tag, `turn ${t.n} timeout: still running ${INTERRUPT_GRACE_MS} ms after the interrupt, killing the session`);
       this.failure = 'timeout';
       this.forced = true;
-      t.abort.abort();
       this.abort.abort();
-    }, t.remainingMs);
-  }
-
-  private stopClock(t: Turn): void {
-    clearTimeout(t.timer);
-    t.remainingMs = Math.max(0, t.remainingMs - (Date.now() - t.timerStarted));
+    }, INTERRUPT_GRACE_MS);
+    t.killTimer.unref?.();
   }
 
   /** Streaming input: yields queued user messages; returning closes stdin and ends the session. */
@@ -625,6 +654,8 @@ export class LiveSession {
       for await (const msg of this.q) this.onMessage(msg, started);
     } catch (e) {
       error = (e as Error).message;
+      // Killed by us after the time limit: say so instead of the SDK's "aborted by user".
+      if (this.failure === 'timeout') error = `timeout (killed after ${limitLabel(this.turnTimeoutMs)} of work; SDK: ${error})`;
       log(this.tag, `error ${error}`);
       if (this.stderrTail.length) log(this.tag, `stderr tail: ${this.stderrTail.join('').slice(-1500)}`);
     }
@@ -701,7 +732,8 @@ export class LiveSession {
       return;
     }
     this.turn = undefined;
-    clearTimeout(t.timer);
+    t.clock.stop();
+    clearTimeout(t.killTimer);
     t.abort.abort();
     this.lastActivity = Date.now();
 
@@ -720,9 +752,9 @@ export class LiveSession {
     }
 
     const out: TurnResult = {
-      ok: !!result && result.subtype === 'success' && !result.is_error,
+      ok: !t.timedOut && !!result && result.subtype === 'success' && !result.is_error,
       // An interrupted turn ends as error_during_execution; report it as what it was.
-      subtype: t.stoppedBy && result ? 'interrupted' : (result?.subtype ?? this.failure ?? 'error'),
+      subtype: t.timedOut ? 'timeout' : t.stoppedBy && result ? 'interrupted' : (result?.subtype ?? this.failure ?? 'error'),
       sessionId: this.sessionId,
       model: this.model,
       costTotal,
@@ -734,10 +766,11 @@ export class LiveSession {
       lastText: result?.subtype === 'success' && result.result.trim() ? result.result : t.lastText,
       denials: t.denials,
       stoppedBy: t.stoppedBy,
+      timedOut: t.timedOut,
       error,
       apiError: t.apiError,
     };
-    log('result', `${this.threadId} turn=${t.n} pid=${this.pid ?? '-'} ok=${out.ok} subtype=${out.subtype} session=${out.sessionId} turns=${out.numTurns} replies=${out.replies} tools=${out.tools.length} denials=${JSON.stringify(out.denials)}${out.stoppedBy ? ` stopped_by=${out.stoppedBy}` : ''} turn_cost_usd=${turnCost.toFixed(4)} total_cost_usd=${costTotal.toFixed(4)} duration_ms=${out.durationMs}`);
+    log('result', `${this.threadId} turn=${t.n} pid=${this.pid ?? '-'} ok=${out.ok} subtype=${out.subtype} session=${out.sessionId} turns=${out.numTurns} replies=${out.replies} tools=${out.tools.length} denials=${JSON.stringify(out.denials)}${out.stoppedBy ? ` stopped_by=${out.stoppedBy}` : ''}${out.timedOut ? ' timeout=true' : ''} turn_cost_usd=${turnCost.toFixed(4)} total_cost_usd=${costTotal.toFixed(4)} duration_ms=${out.durationMs}`);
     t.resolve(out);
   }
 }

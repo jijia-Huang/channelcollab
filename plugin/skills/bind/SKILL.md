@@ -37,6 +37,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" bind --channel <頻道ID>
 | `--permission-mode` | 預設 `default`，見下表。**不允許 `bypassPermissions`** |
 | `--launcher` | 進階：用自訂的 `.cmd` 啟動 Claude（例如先套用某些設定）。啟動器必須最後執行 `claude` 並原封不動轉交參數，自己不能輸出任何東西到 stdout。給 `claude` 表示用內建 |
 | `--tools` | 進階：限縮這個頻道可用的工具，逗號分隔。給 `all` 表示不限 |
+| `--turn-timeout` | 進階：一輪最多工作幾分鐘（等人按按鈕的時間不算）。**預設不限**，使用者沒有要求就不要設；`0` 代表不限，`none` 移除、回到預設。到了上限 Bot 會說明已停止，回覆「繼續」就接著做。私訊（`--dm`）也可以用 |
+| `--max-turns` | 進階：一輪最多幾步。**預設不限**，使用者沒有要求就不要設；`0` 代表不限，`none` 移除。私訊也可以用 |
 
 權限模式：
 

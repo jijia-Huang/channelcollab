@@ -122,9 +122,9 @@ export function configSummary(file) {
   const c = readConfig(file);
   const channels = {};
   for (const [id, ch] of Object.entries(c.channels ?? {})) {
-    channels[id] = { cwd: ch?.cwd, model: ch?.model ?? null, permission_mode: ch?.permission_mode ?? null, launcher: ch?.launcher ?? null };
+    channels[id] = { cwd: ch?.cwd, model: ch?.model ?? null, permission_mode: ch?.permission_mode ?? null, launcher: ch?.launcher ?? null, ...turnLimitField(ch) };
   }
-  const dm = c.dm && typeof c.dm === 'object' && c.dm.cwd ? { cwd: c.dm.cwd, model: c.dm.model ?? null, permission_mode: c.dm.permission_mode ?? null, launcher: c.dm.launcher ?? null } : null;
+  const dm = c.dm && typeof c.dm === 'object' && c.dm.cwd ? { cwd: c.dm.cwd, model: c.dm.model ?? null, permission_mode: c.dm.permission_mode ?? null, launcher: c.dm.launcher ?? null, ...turnLimitField(c.dm) } : null;
   return {
     exists: true,
     hasToken: typeof c.discord?.token === 'string' && c.discord.token.length > 0,
@@ -137,8 +137,19 @@ export function configSummary(file) {
     rosterOnly: c.access?.roster_only !== false,
     pinUnlockMinutes: typeof c.security?.pin_unlock_minutes === 'number' ? c.security.pin_unlock_minutes : 30,
     ownerWaitMinutes: typeof c.defaults?.owner_wait_minutes === 'number' ? c.defaults.owner_wait_minutes : 2,
+    turnTimeoutMinutes: minutesOrZero(c.defaults?.turn_timeout_minutes),
+    maxTurns: Math.floor(minutesOrZero(c.defaults?.max_turns)),
   };
 }
+
+/** 單輪工作上限（分鐘）：正數才算，其他（沒設、0、負數）都是 0 = 不限。和 src/config.ts 的 minutesOrZero 相同。 */
+const minutesOrZero = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+const turnLimitField = (b) => ({
+  ...(typeof b?.turn_timeout_minutes === 'number' ? { turn_timeout_minutes: b.turn_timeout_minutes } : {}),
+  ...(typeof b?.max_turns === 'number' ? { max_turns: b.max_turns } : {}),
+});
+export const stepLimitText = (n) => (n > 0 ? `${n} 步` : '不限');
+export const turnLimitText = (min) => (min > 0 ? `${min} 分鐘` : '不限');
 
 export function setOwner(file, ownerId) {
   if (!SNOWFLAKE.test(String(ownerId))) throw new CliError(`Discord 使用者 ID 格式不對（應為 17–20 位數字）：${ownerId}`);
@@ -148,12 +159,12 @@ export function setOwner(file, ownerId) {
 }
 
 /** 新增或修改一個頻道綁定；只動 channels.<id>，其他欄位原樣保留。 */
-export function bindChannel(file, { channel, cwd, model, permissionMode, launcher, tools }) {
+export function bindChannel(file, { channel, cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns }) {
   if (!SNOWFLAKE.test(String(channel ?? ''))) throw new CliError(`頻道 ID 格式不對（應為 17–20 位數字）：${channel}`);
   const c = readConfig(file);
   const prev = c.channels?.[channel];
   if (!prev && !cwd) throw new CliError('新增綁定時一定要給 --cwd（這個頻道的工作資料夾）');
-  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, tools });
+  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns });
   c.channels = { ...(c.channels ?? {}), [channel]: next };
   c.defaults = { permission_mode: 'default', ...(c.defaults ?? {}) };
   writeJson(file, c);
@@ -161,11 +172,11 @@ export function bindChannel(file, { channel, cwd, model, permissionMode, launche
 }
 
 /** 私訊設定（config 的 dm 區塊，欄位和頻道綁定相同）；只動 dm，其他欄位原樣保留。 */
-export function bindDm(file, { cwd, model, permissionMode, launcher }) {
+export function bindDm(file, { cwd, model, permissionMode, launcher, turnTimeout, maxTurns }) {
   const c = readConfig(file);
   const prev = c.dm && typeof c.dm === 'object' ? c.dm : undefined;
   if (!prev && !cwd) throw new CliError('開啟私訊時一定要給 --cwd（私訊用的工作資料夾）');
-  const next = applyBinding(prev, { cwd, model, permissionMode, launcher });
+  const next = applyBinding(prev, { cwd, model, permissionMode, launcher, turnTimeout, maxTurns });
   c.dm = next;
   c.defaults = { permission_mode: 'default', ...(c.defaults ?? {}) };
   writeJson(file, c);
@@ -187,7 +198,7 @@ export function setRosterOnly(file, on) {
   writeJson(file, c);
 }
 
-function applyBinding(prev, { cwd, model, permissionMode, launcher, tools }) {
+function applyBinding(prev, { cwd, model, permissionMode, launcher, tools, turnTimeout, maxTurns }) {
   const next = { ...(prev ?? {}) };
   if (cwd) {
     const abs = path.resolve(cwd);
@@ -206,6 +217,23 @@ function applyBinding(prev, { cwd, model, permissionMode, launcher, tools }) {
   if (launcher !== undefined) {
     if (launcher === '' || launcher === 'claude') delete next.launcher;
     else next.launcher = String(launcher);
+  }
+  if (turnTimeout !== undefined) {
+    // 預設不限時；只有使用者自己設定時才有上限。none 移除這個欄位（回到 defaults.turn_timeout_minutes）。
+    if (turnTimeout === '' || turnTimeout === 'none') delete next.turn_timeout_minutes;
+    else {
+      const n = Number(turnTimeout);
+      if (!/^\d+(\.\d+)?$/.test(String(turnTimeout).trim()) || !Number.isFinite(n) || n < 0) throw new CliError(`--turn-timeout 要是 0 以上的分鐘數（0 代表不限，none 表示沿用預設）；收到：${turnTimeout}`);
+      next.turn_timeout_minutes = n;
+    }
+  }
+  if (maxTurns !== undefined) {
+    // 預設不限步數；none 移除這個欄位（回到 defaults.max_turns）。
+    if (maxTurns === '' || maxTurns === 'none') delete next.max_turns;
+    else {
+      if (!/^\d+$/.test(String(maxTurns).trim())) throw new CliError(`--max-turns 要是 0 以上的整數（0 代表不限，none 表示沿用預設）；收到：${maxTurns}`);
+      next.max_turns = Number(maxTurns);
+    }
   }
   if (tools !== undefined) {
     if (tools === '' || tools === 'all') delete next.tools;
@@ -815,9 +843,26 @@ export function parseLog(lines) {
     if (/\[start\] pid=/.test(l)) start = l;
     const m = /\[ready\] logged in as (\S+) id=(\d+)/.exec(l);
     if (m) ready = { tag: m[1], id: m[2], line: l };
-    if (/\[(error|stop)\]|cannot |failed|❌/i.test(l) && !/\[stop\] (done|stop command|SIG)/.test(l)) errors.push(l);
+    if (isErrorLine(l)) errors.push(l);
   }
   return { start, ready, errors: errors.slice(-5) };
+}
+
+/**
+ * 是不是錯誤，只看 log 的分類標籤（`[時間] [標籤] 內容`），不看內容裡的字：
+ * 工具的輸入、Claude 的回覆、訊息原文都可能含有 failed、error、❌（例如分支名稱）。
+ */
+export function isErrorLine(l) {
+  const m = /^\[[\d:.]+\] \[([^\]]+)\] (.*)$/.exec(String(l));
+  if (!m) return false;
+  const [, tag, rest] = m;
+  if (tag === 'error' || tag === 'config') return true;
+  if (tag === 'stop') return /^error/i.test(rest);
+  if (tag === 'start') return /^cannot listen/.test(rest);
+  if (tag === 'commands') return /registration failed/.test(rest);
+  if (tag === 'pool') return /\bfailed\b/.test(rest);
+  if (tag.startsWith('live ')) return /^error /.test(rest);
+  return false;
 }
 
 /** 執行中的 Bot 的 PIN 狀態（鎖定與否）；0.1.5 以前的 Bot 不認得這個指令，回傳空物件。 */
@@ -1131,7 +1176,7 @@ export function makeLaunchers(p, dir, { name, skipRuntimeCheck = false } = {}) {
 // ---------------------------------------------------------------------------
 function printDm(dm, pinSet) {
   if (!dm) return console.log('私訊：未開啟（要用的話：bind --dm --cwd <資料夾>，並先設定 PIN）');
-  console.log(`私訊：開啟 → ${dm.cwd}（模型 ${dm.model ?? '預設'}，權限模式 ${dm.permission_mode ?? '沿用預設'}${dm.launcher ? `，啟動器 ${dm.launcher}` : ''}）${pinSet ? '' : '　⚠️ 還沒設定 PIN，私訊暫不開放'}`);
+  console.log(`私訊：開啟 → ${dm.cwd}（模型 ${dm.model ?? '預設'}，權限模式 ${dm.permission_mode ?? '沿用預設'}${dm.launcher ? `，啟動器 ${dm.launcher}` : ''}${'turn_timeout_minutes' in dm ? `，單輪上限 ${turnLimitText(dm.turn_timeout_minutes)}` : ''}${'max_turns' in dm ? `，步數上限 ${stepLimitText(dm.max_turns)}` : ''}）${pinSet ? '' : '　⚠️ 還沒設定 PIN，私訊暫不開放'}`);
 }
 
 /** 模式、頻道、私訊（start 和 status 共用）。 */
@@ -1144,6 +1189,8 @@ function printSetup(c, pinSet) {
     printChannels(c.channels);
   }
   printDm(c.dm, pinSet);
+  console.log(`單輪工作上限：${turnLimitText(c.turnTimeoutMinutes ?? 0)}${c.turnTimeoutMinutes ? '（等人按按鈕的時間不算；到了會停止這一輪，對話保存）' : '（要停止請在 Discord 按 🛑 或用 /stop）'}`);
+  console.log(`單輪步數上限：${stepLimitText(c.maxTurns ?? 0)}`);
 }
 
 function printChannels(channels) {
@@ -1151,7 +1198,7 @@ function printChannels(channels) {
   if (!ids.length) return console.log('  （還沒有綁定任何頻道）');
   for (const id of ids) {
     const c = channels[id];
-    console.log(`  - 頻道 ${id} → ${c.cwd}（模型 ${c.model ?? '預設'}，權限模式 ${c.permission_mode ?? '沿用預設'}${c.launcher ? `，啟動器 ${c.launcher}` : ''}）`);
+    console.log(`  - 頻道 ${id} → ${c.cwd}（模型 ${c.model ?? '預設'}，權限模式 ${c.permission_mode ?? '沿用預設'}${c.launcher ? `，啟動器 ${c.launcher}` : ''}${'turn_timeout_minutes' in c ? `，單輪上限 ${turnLimitText(c.turn_timeout_minutes)}` : ''}${'max_turns' in c ? `，步數上限 ${stepLimitText(c.max_turns)}` : ''}）`);
   }
 }
 
@@ -1241,6 +1288,8 @@ const commands = {
         model: opts.model === true ? undefined : opts.model,
         permissionMode: opts['permission-mode'] === true ? undefined : opts['permission-mode'],
         launcher: opts.launcher === true ? undefined : opts.launcher,
+        turnTimeout: opt(opts['turn-timeout']),
+        maxTurns: opt(opts['max-turns']),
       });
       console.log(`✅ ${r.action === 'added' ? '開啟' : '更新'}私訊設定：`);
       printDm(r.dm, fs.existsSync(p.pin));
@@ -1258,6 +1307,8 @@ const commands = {
       permissionMode: opts['permission-mode'] === true ? undefined : opts['permission-mode'],
       launcher: opts.launcher === true ? undefined : opts.launcher,
       tools: opts.tools === true ? undefined : opts.tools,
+      turnTimeout: opt(opts['turn-timeout']),
+      maxTurns: opt(opts['max-turns']),
     });
     console.log(`✅ ${r.action === 'added' ? '新增' : '更新'}綁定：`);
     printChannels({ [opts.channel]: r.channel });
@@ -1401,10 +1452,12 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
   install-runtime [--force]               安裝或更新 runtime 到 <HOME>\\runtime
   set-owner <Discord 使用者 ID>           設定 Bot 的主人（可以按權限按鈕的人）
   bind --channel <ID> --cwd <資料夾> [--model opus|sonnet|haiku] [--permission-mode default]
-       [--launcher <路徑>] [--tools Read,Grep,...]
+       [--launcher <路徑>] [--tools Read,Grep,...] [--turn-timeout <分鐘>|none]
+       [--max-turns <步數>|none]
                                           新增或修改頻道綁定（只給要改的欄位）
   bind --remove --channel <ID>            移除頻道綁定
-  bind --dm --cwd <資料夾> [--model ...] [--permission-mode ...] [--launcher <路徑>]
+  bind --dm --cwd <資料夾> [--model ...] [--permission-mode ...] [--launcher <路徑>] [--turn-timeout <分鐘>|none]
+       [--max-turns <步數>|none]
                                           開啟或修改私訊（只有主人能用，要先設定 PIN）
   bind --dm --remove                      關閉私訊
   bind --list                             列出頻道綁定與私訊設定
@@ -1755,6 +1808,65 @@ async function selfTest() {
     eq(s.ready.tag, 'test-bot#1234');
     eq(s.ready.id, '222222222222222222');
     eq(s.errors.length, 1);
+  });
+  await t('錯誤只看分類標籤：工具輸入、回覆內容裡的 failed／error／❌ 不算', () => {
+    const lines = [
+      '[02:17:44.762] [tool_use] 100 Bash {"command":"git checkout -q 259741_gamebot_reserve_failed_1028 && git status","description":"x"}',
+      '[02:17:45.000] [reply] 100 build failed ❌ 找到錯誤了，正在修',
+      '[02:17:46.000] [trigger] 100 text=為什麼 cannot load error',
+      '[02:17:47.000] [permission] 100 deny Bash (no-go zone: .env) id=x',
+      '[02:17:48.000] [live 100] ended pid=1 after 5 ms turns=1 clean=true cost_total=0.0100',
+      '[02:17:49.000] [stop] done',
+      '[02:17:50.000] [live 100] timeout: 60 分鐘 of work used, interrupting the turn',
+    ];
+    eq(parseLog(lines).errors, []);
+    const bad = [
+      '[03:00:00.000] [error] run 100: boom',
+      '[03:00:01.000] [config] cannot read X (SyntaxError)',
+      '[03:00:02.000] [live 100] error Claude Code process exited with code 1',
+      '[03:00:03.000] [commands] slash command registration failed: Missing Access',
+      '[03:00:04.000] [start] cannot listen on \\\\.\\pipe\\x (EADDRINUSE); is another bot running? exiting',
+      '[03:00:05.000] [stop] error boom',
+      '[03:00:06.000] [pool] close 100 failed: x',
+    ];
+    eq(parseLog([...lines, ...bad]).errors.length, 5, '最多列 5 筆');
+    eq(bad.every(isErrorLine), true, '每一行都算錯誤');
+    eq(isErrorLine('沒有標籤的一行 error'), false);
+  });
+
+  console.log('單輪工作上限');
+  await t('bind --turn-timeout：分鐘數寫進綁定，0 代表不限，none 移除；負數或非數字拒絕；status 顯示', () => {
+    const f = path.join(tmp, 'turn-timeout.json');
+    writeJson(f, { discord: { token: FAKE }, channels: {} });
+    eq(configSummary(f).turnTimeoutMinutes, 0, '預設不限');
+    bindChannel(f, { channel: CH, cwd: tmp, turnTimeout: '45' });
+    eq(readJson(f, {}).channels[CH].turn_timeout_minutes, 45);
+    eq(configSummary(f).channels[CH].turn_timeout_minutes, 45);
+    bindChannel(f, { channel: CH, turnTimeout: '0' });
+    eq(readJson(f, {}).channels[CH].turn_timeout_minutes, 0);
+    bindChannel(f, { channel: CH, turnTimeout: 'none' });
+    eq('turn_timeout_minutes' in readJson(f, {}).channels[CH], false);
+    throws(() => bindChannel(f, { channel: CH, turnTimeout: '-3' }), /turn-timeout/);
+    throws(() => bindChannel(f, { channel: CH, turnTimeout: 'abc' }), /turn-timeout/);
+    bindDm(f, { cwd: tmp, turnTimeout: '30' });
+    eq(configSummary(f).dm.turn_timeout_minutes, 30);
+    eq(turnLimitText(0), '不限');
+    eq(turnLimitText(90), '90 分鐘');
+    eq(readJson(f, {}).discord.token, FAKE, 'token 原樣保留');
+  });
+  await t('bind --max-turns：預設不限；整數寫進綁定，0 代表不限，none 移除；小數、負數拒絕', () => {
+    const f = path.join(tmp, 'max-turns.json');
+    writeJson(f, { discord: { token: FAKE }, channels: {} });
+    eq(configSummary(f).maxTurns, 0, '預設不限');
+    bindChannel(f, { channel: CH, cwd: tmp, maxTurns: '80' });
+    eq(configSummary(f).channels[CH].max_turns, 80);
+    bindChannel(f, { channel: CH, maxTurns: 'none' });
+    eq('max_turns' in readJson(f, {}).channels[CH], false);
+    throws(() => bindChannel(f, { channel: CH, maxTurns: '2.5' }), /max-turns/);
+    throws(() => bindChannel(f, { channel: CH, maxTurns: '-1' }), /max-turns/);
+    bindDm(f, { cwd: tmp, maxTurns: '0' });
+    eq(configSummary(f).dm.max_turns, 0);
+    eq([stepLimitText(0), stepLimitText(40)], ['不限', '40 步']);
   });
 
   console.log('雙擊用的 .bat');

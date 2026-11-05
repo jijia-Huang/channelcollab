@@ -39,8 +39,8 @@ const HINTS: { test: (f: FailureFacts, text: string) => boolean; hint: string }[
     test: (f, t) => f.apiError === 'overloaded' || f.apiError === 'server_error' || /overloaded|\b5\d\d\b|ECONNRESET|ETIMEDOUT|ENOTFOUND|network|fetch failed|socket hang up/i.test(t),
     hint: 'Anthropic 服務暫時忙碌或網路不穩，稍後再試一次（可以打 !retry）。',
   },
-  { test: (f) => f.subtype === 'error_max_turns', hint: '這一輪的步驟太多被中止了，可以拆成小一點的請求再試。' },
-  { test: (f) => f.subtype === 'timeout', hint: '這一輪做太久（超過 10 分鐘的工作時間）被中止了，可以拆成小一點的請求再試。' },
+  { test: (f) => f.subtype === 'error_max_turns', hint: '這一輪達到設定的步數上限（max_turns）被停止了；對話已保存，回覆「繼續」就會接著做。' },
+  { test: (f) => f.subtype === 'timeout', hint: '這一輪超過設定的工作時間上限（turn_timeout_minutes）被停止了；對話已保存，回覆「繼續」就會接著做。' },
 ];
 
 /** The hint for a failure; a generic one when nothing matches. */

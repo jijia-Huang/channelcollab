@@ -152,6 +152,8 @@
 | `channels.<頻道 ID>.permission_mode` | 覆寫 `defaults.permission_mode` |
 | `channels.<頻道 ID>.tools` | 真正限縮可用的工具集；省略表示全部 |
 | `channels.<頻道 ID>.external` | 簡易模式：外部指令，只做文字往來（見第 9 節）。設定這個欄位時不使用 `launcher` |
+| `defaults.turn_timeout_minutes` | 一輪的工作時間上限（分鐘），**預設 0 = 不限**；頻道綁定和 `dm` 可以用同名欄位覆寫（`bind --turn-timeout`）。等人按按鈕的時間不算。見第 20 節 |
+| `defaults.max_turns` | 一輪的步數上限（SDK 的 `maxTurns`），**預設 0 = 不限**；頻道綁定和 `dm` 可以覆寫（`bind --max-turns`）。見第 20 節 |
 | `defaults.owner_wait_minutes` | 權限請求等主人多久（預設 2，和 `permission_timeout_minutes` 取短的），之後改成稍後核准（第 18 節） |
 | `dm` | 私訊設定（0.1.5），欄位同頻道綁定（`cwd`、`model`、`permission_mode`、`launcher`）；沒有就是關閉。`bind --dm` 設定 |
 | `security.pin_unlock_minutes` | PIN 正確後多久內免輸入（預設 30） |
@@ -267,7 +269,7 @@
   - 「從某個 Claude Code session 裡啟動」才會有的標記：`CLAUDECODE`、`CLAUDE_PID`、`CLAUDE_EFFORT`、`CLAUDE_AGENT_SDK_VERSION`，以及 `CLAUDE_CODE_` 開頭的 `ENTRYPOINT`、`EXECPATH`、`SESSION_ID`、`SESSION_KIND`、`SESSION_ATTENDED`、`CHILD_SESSION`、`REMOTE_SESSION_ID`、`MESSAGING_SOCKET`、`MESSAGING_TOKEN`、`SSE_PORT`。
   - 其餘都保留，包括使用者自己的設定：`CLAUDE_CONFIG_DIR`、`CLAUDE_CODE_USE_BEDROCK`／`USE_VERTEX`、`CLAUDE_CODE_GIT_BASH_PATH`、`CLAUDE_CODE_OAUTH_TOKEN` 等。所以不能用「`CLAUDE_CODE_*` 全部拿掉」這種前綴規則。
   - 實測（Phase 2 spike）：沒拿掉 `CLAUDE_CODE_MESSAGING_SOCKET` 時，子程序曾經把訊息送回啟動 Bot 的那個 session。建議從一般終端機啟動 Bot，不要從 Claude Code 或其他代理工具的 session 裡啟動。
-- `maxTurns` 在 streaming 模式下是**每則訊息各自計算**，不是整個 session 累計（實測）。
+- `maxTurns` 在 streaming 模式下是**每則訊息各自計算**，不是整個 session 累計（實測）。0.1.7 起預設不限（不傳給 SDK），只有設了 `max_turns` 才傳（第 20 節）。
 - **啟動成本**：從啟動程序到 session 就緒（init）約 20～40 秒（含載入使用者的 skills、MCP、plugins）。只有啟動或 resume 時要付；常駐期間的後續訊息不用。啟動期間觸發訊息掛 ⚙️。
 
 **什麼時候關閉**
@@ -277,7 +279,7 @@
 | 閒置超過 `idle_close_minutes` | 正常結束（關閉 stdin，讓 CLI 自己收尾），15 秒內沒結束才強制結束整棵程序樹 |
 | 常駐數超過 `max_live_sessions` | 關掉閒置最久的那個（方式同上）；正在執行或還有排隊訊息的不會被選中，全部都忙時暫時超過上限並記 log |
 | Bot 收到停止要求（`npm run stop`、Ctrl+C） | 不再開新 session；閒置的正常結束，執行中的直接強制結束並把那一輪標 ❌；確認程序樹都結束後 Bot 才退出 |
-| 一輪的工作時間超過 10 分鐘 | 強制結束這個 session，這一輪標 ❌。等人回應權限請求或問題的時間**不算**在內（等待期間計時暫停） |
+| 一輪的工作時間超過 `turn_timeout_minutes`（0.1.7 起**預設 0 = 不限**，只有使用者自己設定才有上限；第 20 節） | 像 🛑 一樣中斷這一輪（session 保留），Bot 自己發說明；30 秒內這一輪沒結束才強制結束 session。等人回應權限請求或問題的時間**不算**在內（等待期間計時暫停） |
 | 有人按 🛑 | 不關閉 session：用 `query.interrupt()` 中斷這一輪，標 ⏹️；下一則訊息接著同一個 session（見第 7 節） |
 | query 意外結束或丟出例外 | 這一輪標 ❌，在討論串簡短說明；Bot 本身不受影響 |
 
@@ -850,6 +852,35 @@ PreToolUse hook 最前面判斷（比 retry 放行、always allow、auto 分類�
 - `src/slash.test.ts`（20 項，假的 Discord 物件，不連線）：只有 dm 設定時讀設定、上線（log 模式、整批註冊 10 個指令）、私訊處理（PIN 未解鎖先擋並送解鎖按鈕、別人私訊被擋、解鎖後 `!help`）；斜線和 `!` 解析成同一個 Command、`/model sonnet` 與 `!model sonnet` 結果相同；`/help`、`/status` ephemeral 且先 defer；權限拒絕回 ephemeral（私訊非主人、未綁定頻道）、別的 App 的互動不處理、鎖定時斜線回 ephemeral 而 `!` 不回；commandGate 各規則；註冊清單內容；skill 清單過濾、autocomplete、名稱驗證。
 - 總控 self-test 加：只用私訊的模式與 status 顯示、警告過濾、捷徑檔名與名稱來源、兩個 HOME 同資料夾不互相覆蓋並換掉舊檔、PIN 提示指向實際檔案或顯示指令。create-bot self-test 加 `--dm-only` 邀請網址。
 - 尚未在 Discord 實測：斜線指令實際出現與點擊、autocomplete 顯示、真實的只用私訊環境。
+
+---
+
+## 20. 0.1.7：拿掉單輪的工作時間與步數上限（hotfix）
+
+### 原因
+
+- 0.1.6 以前寫死兩個上限：一輪**工作 10 分鐘**（`TURN_TIMEOUT_MS`，從推入訊息起算，含 20～40 秒的啟動時間，不含等人按按鈕的時間）與**40 步**（`maxTurns: 40`）。
+- 實際發生（團隊頻道的一個真實改程式任務）：Claude 照常工作、三次回報進度，工作到第 10 分鐘時計時器觸發。舊做法是 `abortController.abort()` 砍整個 session，但 SDK 的 abort 有寬限時間，CLI 又跑了 73 秒、把 result（success）送回來才被殺。這段期間 Claude 的下一個工具呼叫失敗，它以為是「被擋下」並在 reply 裡這樣告訴主人；log 寫成 `aborted by user`、`clean=false`（沒存 cost）。主人看到的是「說正在寫，然後就沒了」。
+- 真實的改程式、編譯任務常超過 10 分鐘、40 步；使用者決定 Agent 做任務不該有逾時，停止一律靠主人的 🛑、`/stop`、`!stop`。
+
+### 做法
+
+- 新設定 `defaults.turn_timeout_minutes`、`defaults.max_turns`，頻道綁定與 `dm` 可以用同名欄位覆寫；**預設都是 0 = 不限**。總控 `bind --turn-timeout <分鐘>|none`、`bind --max-turns <步數>|none`（`none` 移除欄位、回到 defaults）。`/status`、`!status` 與總控 `status` 顯示目前的上限。
+- `max_turns` 是 0 時不傳 `maxTurns` 給 SDK（CLI 沒有預設上限）。
+- 計時抽成 `src/runner/turn-clock.ts` 的 `TurnClock`（純邏輯，可測）：0 不啟動；等人時 `pause`、回來 `resume`；上限至少 10 分鐘時，剩 5 分鐘發一則「⏳ 快到上限」。
+- 真的逾時（有人設定了上限）：
+  1. 標記這一輪 `timedOut`，取消等待中的按鈕，用 `query.interrupt()` 中斷這一輪（和 🛑 一樣，**session 保留**），30 秒內這一輪沒結束才強制結束 session。
+  2. 從這一刻起 `reply` 一律不送出、PreToolUse hook 一律 deny，理由寫「這一輪到了工作時間上限、Bot 會自己說明，不要再呼叫工具也不要回覆」，不會讀起來像權限擋下。
+  3. Bot 自己發一則訊息（新訊息，不是編輯進度訊息，編輯不會通知人）：「⏱️ 這一輪工作超過 N 的上限，已停止（不是被擋下）。對話已保存，回覆『繼續』就會接著做。要調整上限請改設定的 turn_timeout_minutes（0 代表不限）」，討論串 @ 提出需求的人和主人，私訊不 @。
+  4. log：`[live …] turn N timeout: … interrupting the turn`、`[timeout] …`、`[result] … subtype=timeout timeout=true`；被迫強制結束時 `error timeout (killed after …)`，不再寫 `aborted by user`。
+- 達到步數上限（`error_max_turns`）：一樣由 Bot 發「⏹️ 這一輪已達 N 步上限，已停止（不是被擋下）。對話已保存，回覆『繼續』就會接著做…」並 @ 同樣的人；錯誤提示改成引導回覆「繼續」。
+- 正在工作的 session 被正常關閉時，最多等這一輪 10 分鐘再強制結束（原本借用單輪上限的常數，現在是獨立的常數）。
+- 順手修正 status 的「最近的錯誤」誤判：原本只要 log 行裡有 `failed`、`cannot `、`❌` 就算錯誤，所以工具輸入裡的分支名稱（例如 `…_failed_…`）、Claude 的回覆內容也被列進去。改成只看 log 的分類標籤（`[error]`、`[config]`、`[stop] error`、`[start] cannot listen`、`[commands] … registration failed`、`[pool] … failed`、`[live …] error …`），總控的 `isErrorLine`。
+
+### 驗證
+
+- 單元測試：`src/features.test.ts` 加 7 項（預設不限、defaults／頻道／私訊覆寫、0 代表不限、等待時間不計入、stop 後不觸發、快到時提醒、逾時與步數上限的訊息與 @、錯誤提示）；總控 self-test 加 3 項（`--turn-timeout`、`--max-turns` 的寫入與驗證、錯誤行只看標籤）。
+- 實測（`spike/v017-timeout.ts`，haiku，sandbox）：上限設 20 秒、要求執行 `sleep 40`：這一輪以 `subtype=timeout` 結束、沒有任何 reply 送出、session 仍可用；下一輪「繼續」接在同一個 session ID，Claude 正常 reply；最後正常關閉 `clean=true`。計時包含啟動時間（這次 30 秒的啟動就用完了 20 秒的上限）。
 
 ---
 

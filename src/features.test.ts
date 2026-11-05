@@ -50,6 +50,8 @@ const OTHER_BOT = '100000000000000002';
 const OWNER = '200000000000000001';
 const MEMBER = '200000000000000003';
 const STRANGER = '300000000000000009';
+const CH_A = '400000000000000001';
+const CH_B = '400000000000000002';
 
 console.log('指令解析');
 await t('只有指令本身才算；大小寫不分；只有 !model 可以帶一個參數；前面的 @ 會略過', () => {
@@ -210,7 +212,7 @@ await t('各種錯誤的建議；只取前 3 行；token 樣式的字串會遮�
   has(text, '服務暫時忙碌');
   has(failure.explainFailure({ subtype: 'success', apiError: 'rate_limit', error: '' }), '額度');
   has(failure.explainFailure({ subtype: 'success', error: 'Prompt is too long' }), '!compact');
-  has(failure.explainFailure({ subtype: 'timeout' }), '10 分鐘');
+  has(failure.explainFailure({ subtype: 'timeout' }), 'turn_timeout_minutes');
   eq(failure.maskSecrets('Authorization: Bearer abcdefghijklmnopqrstuvwxyz'), 'Authorization: Bearer ***');
   eq(failure.maskSecrets('D:\\work\\game\\assets\\scripts\\GameMain.ts 第 12 行'), 'D:\\work\\game\\assets\\scripts\\GameMain.ts 第 12 行');
 });
@@ -408,6 +410,111 @@ await t('私訊：名冊仍列出團隊，但沒有 <@ID> 與交棒守則，並�
   has(p, '<@', false);
   has(p, '【和其他 Bot 協作】', false);
   has(p, '不要 @ 任何人');
+});
+
+console.log('單輪工作上限（0.1.7）');
+const clockMod = await import('./runner/turn-clock.js');
+const configMod = await import('./config.js');
+const { writeFileSync } = await import('node:fs');
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+await t('預設不限時：defaults 沒設時是 0；綁定與私訊可以各自覆寫；0 代表不限；負數、非數字當作不限', () => {
+  const base = { discord: { token: 'x' }, channels: { [CH_A]: { cwd: HOME }, [CH_B]: { cwd: HOME, turn_timeout_minutes: 45 } }, dm: { cwd: HOME, turn_timeout_minutes: 0 } };
+  writeFileSync(configMod.CONFIG_PATH, JSON.stringify(base));
+  let c = configMod.loadConfig();
+  eq(c.defaults.turn_timeout_minutes, 0);
+  eq(configMod.resolveChannel(c, CH_A)!.turnTimeoutMs, 0, '沒設：不限');
+  eq(configMod.resolveChannel(c, CH_B)!.turnTimeoutMs, 45 * 60000, '頻道覆寫');
+  writeFileSync(configMod.CONFIG_PATH, JSON.stringify({ ...base, defaults: { turn_timeout_minutes: 90 } }));
+  c = configMod.loadConfig();
+  eq(configMod.resolveChannel(c, CH_A)!.turnTimeoutMs, 90 * 60000, '沿用 defaults');
+  eq(configMod.resolveDm(c)!.turnTimeoutMs, 0, '私訊設 0 = 不限，蓋過 defaults');
+  eq([configMod.minutesOrZero(-5), configMod.minutesOrZero('30'), configMod.minutesOrZero(undefined), configMod.minutesOrZero(2.5)], [0, 0, 0, 2.5]);
+});
+await t('步數上限 max_turns：預設不限（不傳給 SDK）；defaults、頻道、私訊可以覆寫；0 代表不限', () => {
+  writeFileSync(configMod.CONFIG_PATH, JSON.stringify({ discord: { token: 'x' }, channels: { [CH_A]: { cwd: HOME }, [CH_B]: { cwd: HOME, max_turns: 0 } }, dm: { cwd: HOME, max_turns: 120 } }));
+  let c = configMod.loadConfig();
+  eq(c.defaults.max_turns, 0);
+  eq(configMod.resolveChannel(c, CH_A)!.maxTurns, 0, '沒設：不限');
+  eq(configMod.resolveDm(c)!.maxTurns, 120, '私訊覆寫');
+  writeFileSync(configMod.CONFIG_PATH, JSON.stringify({ discord: { token: 'x' }, defaults: { max_turns: 60 }, channels: { [CH_A]: { cwd: HOME }, [CH_B]: { cwd: HOME, max_turns: 0 } } }));
+  c = configMod.loadConfig();
+  eq(configMod.resolveChannel(c, CH_A)!.maxTurns, 60, '沿用 defaults');
+  eq(configMod.resolveChannel(c, CH_B)!.maxTurns, 0, '頻道設 0 = 不限，蓋過 defaults');
+});
+await t('達到步數上限：Bot 自己說明 N 步上限、不是被擋下、回覆「繼續」；@ 提出需求的人和主人；提示改成引導「繼續」', () => {
+  const n = clockMod.maxTurnsNotice(80, 'thread', { ownerId: OWNER, requesterId: MEMBER });
+  has(n.content, '80 步');
+  has(n.content, '不是被擋下');
+  has(n.content, '繼續');
+  has(n.content, 'max_turns');
+  eq(n.users, [MEMBER, OWNER]);
+  eq(clockMod.maxTurnsNotice(80, 'dm', { ownerId: OWNER }).users, []);
+  const hint = failure.failureHint({ subtype: 'error_max_turns' });
+  has(hint, '繼續');
+  has(hint, '拆成小一點', false);
+});
+await t('不限時的計時器永遠不觸發；有上限時時間到才觸發', async () => {
+  let fired = 0;
+  const off = new clockMod.TurnClock(0, () => fired++);
+  off.resume();
+  eq(off.limited, false);
+  eq(off.left, Infinity);
+  const on = new clockMod.TurnClock(40, () => fired++);
+  on.resume();
+  await sleep(80);
+  eq(fired, 1);
+});
+await t('等人按按鈕的時間不算：pause 期間不計時，resume 後接著算剩下的', async () => {
+  let fired = 0;
+  const c = new clockMod.TurnClock(100, () => fired++);
+  c.resume();
+  await sleep(50);
+  c.pause();
+  const left = c.left;
+  await sleep(150);
+  eq(fired, 0, '暫停中不該觸發');
+  eq(c.left, left, '暫停中剩餘時間不變');
+  c.resume();
+  await sleep(20);
+  eq(fired, 0, '剩下的時間還沒到');
+  await sleep(100);
+  eq(fired, 1);
+});
+await t('一輪結束（stop）後不再觸發；快到時提醒一次（只有上限夠長時）', async () => {
+  let fired = 0;
+  let warned = 0;
+  const c = new clockMod.TurnClock(60, () => fired++, () => warned++, 20);
+  c.resume();
+  await sleep(50);
+  eq(warned, 1, '剩 20ms 時提醒');
+  c.stop();
+  await sleep(40);
+  eq(fired, 0, 'stop 之後不觸發');
+  const short = new clockMod.TurnClock(30, () => {}, () => warned++, 20);
+  short.resume();
+  await sleep(40);
+  eq(warned, 1, '上限不到提醒時間的兩倍：不提醒');
+});
+await t('逾時訊息由 Bot 自己發：寫明上限、不是被擋下、回覆「繼續」接著做；討論串 @ 提出需求的人和主人，私訊不 @', () => {
+  const n = clockMod.timeoutNotice(60 * 60000, 'thread', { ownerId: OWNER, requesterId: MEMBER });
+  has(n.content, '1 小時');
+  has(n.content, '不是被擋下');
+  has(n.content, '繼續');
+  has(n.content, 'turn_timeout_minutes');
+  has(n.content, `<@${MEMBER}>`);
+  has(n.content, `<@${OWNER}>`);
+  eq(n.users, [MEMBER, OWNER]);
+  eq(clockMod.timeoutNotice(30 * 60000, 'thread', { ownerId: OWNER, requesterId: OWNER }).users, [OWNER], '同一人只 @ 一次');
+  const dm = clockMod.timeoutNotice(90 * 60000, 'dm', { ownerId: OWNER });
+  eq(dm.users, []);
+  has(dm.content, '<@', false);
+  has(dm.content, '1 小時 30 分');
+  eq(clockMod.limitLabel(0), '不限');
+  has(clockMod.timeoutWarning(60 * 60000, 5 * 60000), '剩約 5 分鐘');
+  // What Claude sees after the limit must not look like a permission block.
+  has(clockMod.TIMEOUT_TOOL_MESSAGE, 'time limit');
+  has(clockMod.TIMEOUT_TOOL_MESSAGE.toLowerCase(), 'permission', false);
+  has(failure.failureHint({ subtype: 'timeout' }), '繼續');
 });
 
 rmSync(HOME, { recursive: true, force: true });

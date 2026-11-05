@@ -24,6 +24,10 @@ export type ChannelConfig = {
   model?: string;
   permission_mode?: PermissionMode;
   tools?: string[];
+  /** Working minutes per turn before it is stopped; 0 = no limit. Overrides defaults.turn_timeout_minutes. */
+  turn_timeout_minutes?: number;
+  /** Steps (API round trips) per turn before it is stopped; 0 = no limit. Overrides defaults.max_turns. */
+  max_turns?: number;
 };
 
 export type Defaults = {
@@ -37,6 +41,10 @@ export type Defaults = {
   permission_timeout_minutes: number;
   /** A permission request waits this long (or permission_timeout_minutes, if shorter); then it goes on the approve-later list. */
   owner_wait_minutes: number;
+  /** Working minutes per turn before it is stopped (waiting for people not counted); 0 = no limit (the default). */
+  turn_timeout_minutes: number;
+  /** Steps per turn before it is stopped (SDK maxTurns); 0 = no limit (the default). */
+  max_turns: number;
 };
 
 export type Config = {
@@ -70,6 +78,10 @@ export type ResolvedChannel = {
   permissionTimeoutMs: number;
   /** How long a permission request waits for the owner before it is deferred (approve later). */
   ownerWaitMs: number;
+  /** Working time per turn before it is stopped; 0 = no limit. */
+  turnTimeoutMs: number;
+  /** Steps per turn before it is stopped; 0 = no limit. */
+  maxTurns: number;
 };
 
 const BUILTIN_DEFAULTS: Defaults = {
@@ -81,6 +93,10 @@ const BUILTIN_DEFAULTS: Defaults = {
   permission_mode: 'default',
   permission_timeout_minutes: 10,
   owner_wait_minutes: 2,
+  // No limit: a turn runs until it ends; only the owner stops it (🛑, /stop, !stop).
+  turn_timeout_minutes: 0,
+  // No step limit either.
+  max_turns: 0,
 };
 
 // bypassPermissions would skip every check on the owner's machine; not allowed from Discord.
@@ -136,5 +152,12 @@ function resolve(config: Config, channelId: string, ch: ChannelConfig, what: str
     maxHops: config.defaults.max_hops,
     permissionTimeoutMs: config.defaults.permission_timeout_minutes * 60 * 1000,
     ownerWaitMs: Math.min(config.defaults.owner_wait_minutes, config.defaults.permission_timeout_minutes) * 60 * 1000,
+    turnTimeoutMs: minutesOrZero(ch.turn_timeout_minutes ?? config.defaults.turn_timeout_minutes) * 60 * 1000,
+    maxTurns: Math.floor(minutesOrZero(ch.max_turns ?? config.defaults.max_turns)),
   };
+}
+
+/** A limit (minutes, steps): a positive number; anything else (missing, 0, negative, not a number) is 0 = no limit. */
+export function minutesOrZero(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0;
 }

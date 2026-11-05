@@ -22,6 +22,7 @@ import { enqueue, isPending } from '../router/queue.js';
 import { canAct } from '../runner/policy.js';
 import { liveSession, release } from '../runner/pool.js';
 import { NO_LIST_TEXT, skillPrompt, type SkillItem } from '../runner/skills.js';
+import { limitLabel } from '../runner/turn-clock.js';
 import { latestRateLimit, rateSummary } from '../runner/usage.js';
 import { pinGate } from '../security/pin.js';
 import { allThreads, DM_KEY, dmHistory, getThread, saveState, skillsFor, switchDm, type DmState } from '../store/state.js';
@@ -82,6 +83,8 @@ async function statusText(c: Conv): Promise<string> {
     `・權限模式：${modeName(s?.mode ?? ch.permissionMode)}${ts.plan ? '，用 !plan 可切回' : ''}`,
     `・對話：${s?.usable ? `session 已開 ${duration(Date.now() - s.startedAt)}${s.busy ? '，正在工作' : '，閒置中'}` : ts.sessionId ? '已暫停（下一則訊息會接回）' : '還沒有對話'}`,
     ...(c.kind === 'dm' && (ts as DmState).source ? [`・來源：${(ts as DmState).source}`] : []),
+    `・單輪工作上限：${ch.turnTimeoutMs ? `${limitLabel(ch.turnTimeoutMs)}（等人按按鈕的時間不算）` : '不限（要停止請按 🛑 或用 /stop）'}`,
+    `・單輪步數上限：${ch.maxTurns ? `${ch.maxTurns} 步` : '不限'}`,
     `・本段對話花費：約 $${ts.lastCostTotal.toFixed(2)}`,
     `・上下文：${ts.ctx ? `${ts.ctx.pct}%${ts.ctx.tokens && ts.ctx.max ? `（${k(ts.ctx.tokens)} / ${k(ts.ctx.max)} tokens）` : ''}` : '未知（跑過一輪後才知道）'}`,
     `・額度：${rateSummary(latestRateLimit())}`,

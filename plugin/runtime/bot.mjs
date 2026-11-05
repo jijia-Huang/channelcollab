@@ -22,7 +22,11 @@ var BUILTIN_DEFAULTS = {
   max_live_sessions: 4,
   permission_mode: "default",
   permission_timeout_minutes: 10,
-  owner_wait_minutes: 2
+  owner_wait_minutes: 2,
+  // No limit: a turn runs until it ends; only the owner stops it (🛑, /stop, !stop).
+  turn_timeout_minutes: 0,
+  // No step limit either.
+  max_turns: 0
 };
 var ALLOWED_MODES = ["default", "acceptEdits", "plan", "dontAsk", "auto"];
 function loadConfig() {
@@ -68,8 +72,13 @@ function resolve(config2, channelId, ch, what) {
     history: config2.defaults.history,
     maxHops: config2.defaults.max_hops,
     permissionTimeoutMs: config2.defaults.permission_timeout_minutes * 60 * 1e3,
-    ownerWaitMs: Math.min(config2.defaults.owner_wait_minutes, config2.defaults.permission_timeout_minutes) * 60 * 1e3
+    ownerWaitMs: Math.min(config2.defaults.owner_wait_minutes, config2.defaults.permission_timeout_minutes) * 60 * 1e3,
+    turnTimeoutMs: minutesOrZero(ch.turn_timeout_minutes ?? config2.defaults.turn_timeout_minutes) * 60 * 1e3,
+    maxTurns: Math.floor(minutesOrZero(ch.max_turns ?? config2.defaults.max_turns))
   };
+}
+function minutesOrZero(v) {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
 }
 
 // src/discord/bot.ts
@@ -781,8 +790,8 @@ var HINTS = [
     test: (f, t) => f.apiError === "overloaded" || f.apiError === "server_error" || /overloaded|\b5\d\d\b|ECONNRESET|ETIMEDOUT|ENOTFOUND|network|fetch failed|socket hang up/i.test(t),
     hint: "Anthropic \u670D\u52D9\u66AB\u6642\u5FD9\u788C\u6216\u7DB2\u8DEF\u4E0D\u7A69\uFF0C\u7A0D\u5F8C\u518D\u8A66\u4E00\u6B21\uFF08\u53EF\u4EE5\u6253 !retry\uFF09\u3002"
   },
-  { test: (f) => f.subtype === "error_max_turns", hint: "\u9019\u4E00\u8F2A\u7684\u6B65\u9A5F\u592A\u591A\u88AB\u4E2D\u6B62\u4E86\uFF0C\u53EF\u4EE5\u62C6\u6210\u5C0F\u4E00\u9EDE\u7684\u8ACB\u6C42\u518D\u8A66\u3002" },
-  { test: (f) => f.subtype === "timeout", hint: "\u9019\u4E00\u8F2A\u505A\u592A\u4E45\uFF08\u8D85\u904E 10 \u5206\u9418\u7684\u5DE5\u4F5C\u6642\u9593\uFF09\u88AB\u4E2D\u6B62\u4E86\uFF0C\u53EF\u4EE5\u62C6\u6210\u5C0F\u4E00\u9EDE\u7684\u8ACB\u6C42\u518D\u8A66\u3002" }
+  { test: (f) => f.subtype === "error_max_turns", hint: "\u9019\u4E00\u8F2A\u9054\u5230\u8A2D\u5B9A\u7684\u6B65\u6578\u4E0A\u9650\uFF08max_turns\uFF09\u88AB\u505C\u6B62\u4E86\uFF1B\u5C0D\u8A71\u5DF2\u4FDD\u5B58\uFF0C\u56DE\u8986\u300C\u7E7C\u7E8C\u300D\u5C31\u6703\u63A5\u8457\u505A\u3002" },
+  { test: (f) => f.subtype === "timeout", hint: "\u9019\u4E00\u8F2A\u8D85\u904E\u8A2D\u5B9A\u7684\u5DE5\u4F5C\u6642\u9593\u4E0A\u9650\uFF08turn_timeout_minutes\uFF09\u88AB\u505C\u6B62\u4E86\uFF1B\u5C0D\u8A71\u5DF2\u4FDD\u5B58\uFF0C\u56DE\u8986\u300C\u7E7C\u7E8C\u300D\u5C31\u6703\u63A5\u8457\u505A\u3002" }
 ];
 function failureHint(f) {
   const text = `${f.error ?? ""}`;
@@ -1086,11 +1095,105 @@ function skillPrompt(list, name, args = "") {
   return { ok: true, prompt: a ? `/${n} ${a}` : `/${n}` };
 }
 
+// src/runner/turn-clock.ts
+var WARN_BEFORE_MS = 5 * 60 * 1e3;
+var TurnClock = class {
+  /** `limitMs` 0 (or less) means no limit: neither callback ever fires. */
+  constructor(limitMs, onTimeout, onWarn, warnBeforeMs = WARN_BEFORE_MS) {
+    this.limitMs = limitMs;
+    this.onTimeout = onTimeout;
+    this.onWarn = onWarn;
+    this.remaining = limitMs;
+    this.warnAt = limitMs > 0 && onWarn && limitMs >= 2 * warnBeforeMs ? warnBeforeMs : -1;
+  }
+  limitMs;
+  onTimeout;
+  onWarn;
+  remaining;
+  warnAt;
+  started = 0;
+  timer;
+  warnTimer;
+  running = false;
+  done = false;
+  get limited() {
+    return this.limitMs > 0;
+  }
+  /** Working time left (ms); Infinity without a limit. */
+  get left() {
+    if (!this.limited) return Infinity;
+    return Math.max(0, this.remaining - (this.running ? Date.now() - this.started : 0));
+  }
+  /** Start or continue counting. */
+  resume() {
+    if (!this.limited || this.running || this.done) return;
+    this.running = true;
+    this.started = Date.now();
+    this.timer = setTimeout(() => {
+      this.done = true;
+      this.clear();
+      this.onTimeout();
+    }, this.remaining);
+    this.timer.unref?.();
+    if (this.warnAt > 0 && this.remaining > this.warnAt) {
+      this.warnTimer = setTimeout(() => {
+        this.warnAt = -1;
+        this.onWarn?.();
+      }, this.remaining - this.warnAt);
+      this.warnTimer.unref?.();
+    }
+  }
+  /** Stop counting while someone is being waited for. */
+  pause() {
+    if (!this.running) return;
+    this.remaining = Math.max(0, this.remaining - (Date.now() - this.started));
+    this.clear();
+  }
+  /** The turn ended: nothing fires after this. */
+  stop() {
+    this.done = true;
+    this.clear();
+  }
+  clear() {
+    this.running = false;
+    clearTimeout(this.timer);
+    clearTimeout(this.warnTimer);
+    this.timer = this.warnTimer = void 0;
+  }
+};
+function limitLabel(ms) {
+  if (!ms || ms <= 0) return "\u4E0D\u9650";
+  if (ms < 6e4) return `${Math.round(ms / 1e3)} \u79D2`;
+  const min = Math.round(ms / 6e4);
+  const h = Math.floor(min / 60);
+  return h ? `${h} \u5C0F\u6642${min % 60 ? ` ${min % 60} \u5206` : ""}` : `${min} \u5206\u9418`;
+}
+function timeoutNotice(limitMs, kind, who = {}) {
+  const users = kind === "dm" ? [] : [who.requesterId, who.ownerId].filter((v, i, a) => !!v && a.indexOf(v) === i);
+  const at = users.map((u) => `<@${u}>`).join(" ");
+  return {
+    content: `${at ? `${at} ` : ""}\u23F1\uFE0F \u9019\u4E00\u8F2A\u5DE5\u4F5C\u8D85\u904E ${limitLabel(limitMs)}\u7684\u4E0A\u9650\uFF0C\u5DF2\u505C\u6B62\uFF08\u4E0D\u662F\u88AB\u64CB\u4E0B\uFF09\u3002\u5C0D\u8A71\u5DF2\u4FDD\u5B58\uFF0C\u56DE\u8986\u300C\u7E7C\u7E8C\u300D\u5C31\u6703\u63A5\u8457\u505A\u3002\u8981\u8ABF\u6574\u4E0A\u9650\u8ACB\u6539\u8A2D\u5B9A\u7684 turn_timeout_minutes\uFF080 \u4EE3\u8868\u4E0D\u9650\uFF09\u3002`,
+    users
+  };
+}
+function maxTurnsNotice(maxTurns, kind, who = {}) {
+  const users = kind === "dm" ? [] : [who.requesterId, who.ownerId].filter((v, i, a) => !!v && a.indexOf(v) === i);
+  const at = users.map((u) => `<@${u}>`).join(" ");
+  return {
+    content: `${at ? `${at} ` : ""}\u23F9\uFE0F \u9019\u4E00\u8F2A\u5DF2\u9054 ${maxTurns > 0 ? `${maxTurns} \u6B65` : "\u6B65\u6578"}\u4E0A\u9650\uFF0C\u5DF2\u505C\u6B62\uFF08\u4E0D\u662F\u88AB\u64CB\u4E0B\uFF09\u3002\u5C0D\u8A71\u5DF2\u4FDD\u5B58\uFF0C\u56DE\u8986\u300C\u7E7C\u7E8C\u300D\u5C31\u6703\u63A5\u8457\u505A\u3002\u8981\u8ABF\u6574\u4E0A\u9650\u8ACB\u6539\u8A2D\u5B9A\u7684 max_turns\uFF080 \u4EE3\u8868\u4E0D\u9650\uFF09\u3002`,
+    users
+  };
+}
+function timeoutWarning(limitMs, leftMs) {
+  return `\u23F3 \u9019\u4E00\u8F2A\u5FEB\u5230 ${limitLabel(limitMs)}\u7684\u5DE5\u4F5C\u4E0A\u9650\u4E86\uFF08\u5269\u7D04 ${Math.max(1, Math.round(leftMs / 6e4))} \u5206\u9418\uFF09\u3002\u6642\u9593\u5230\u6703\u505C\u6B62\u9019\u4E00\u8F2A\uFF0C\u5C0D\u8A71\u6703\u4FDD\u5B58\u3002`;
+}
+var TIMEOUT_TOOL_MESSAGE = "This turn hit its working-time limit and is being stopped by the bot. Do not call any more tools and do not reply; the bot tells the people in the conversation itself.";
+
 // src/runner/session.ts
 var OWN_PREFIX = "mcp__channelcollab__";
 var REPLY_TOOL = `${OWN_PREFIX}reply`;
-var TURN_TIMEOUT_MS = 10 * 60 * 1e3;
-var MAX_TURNS = 40;
+var BUSY_CLOSE_WAIT_MS = 10 * 60 * 1e3;
+var INTERRUPT_GRACE_MS = 30 * 1e3;
 var CLOSE_GRACE_MS = 15 * 1e3;
 var MAX_REPLY_FILES = 10;
 function guidelines(selfId, auto, kind = "thread") {
@@ -1178,6 +1281,7 @@ var LiveSession = class {
     this.alwaysAllowed = new Set(alwaysAllowed);
     this.mode = channel.permissionMode;
     this.cwd = channel.cwd;
+    this.turnTimeoutMs = channel.turnTimeoutMs;
     const roots = [channel.cwd, path6.join(INBOX_DIR, threadId)];
     const zones = { homes: [DATA_DIR], allow: [roots[1]] };
     const server = createSdkMcpServer({
@@ -1197,6 +1301,7 @@ var LiveSession = class {
             const checked = checkFiles(files ?? [], roots, zones);
             log("reply", `${threadId} ${brief(text, 300)}${files?.length ? ` files=${JSON.stringify(checked.ok)} rejected=${JSON.stringify(checked.rejected)}` : ""}`);
             if (!t) return { content: [{ type: "text", text: "Not delivered: no active turn." }], isError: true };
+            if (t.timedOut) return { content: [{ type: "text", text: `Not delivered. ${TIMEOUT_TOOL_MESSAGE}` }], isError: true };
             try {
               await t.sendReply(text, checked.ok);
             } catch (e) {
@@ -1214,6 +1319,10 @@ var LiveSession = class {
       if (hookInput.hook_event_name !== "PreToolUse") return {};
       const name = hookInput.tool_name;
       const toolInput = hookInput.tool_input ?? {};
+      if (this.turn?.timedOut) {
+        log("permission", `${threadId} deny ${name} (turn timeout) id=${toolUseId ?? "-"}`);
+        return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: TIMEOUT_TOOL_MESSAGE } };
+      }
       const zone = forbiddenUse(name, toolInput, channel.cwd, zones, OWN_PREFIX);
       if (zone) {
         this.turn?.denials.push(name);
@@ -1279,7 +1388,7 @@ var LiveSession = class {
       log(this.tag, `spawned pid=${child.pid}`);
     };
     const hookTimeout = Math.ceil(channel.permissionTimeoutMs / 1e3) + 60;
-    log(this.tag, `start kind=${kind} cwd=${channel.cwd} model=${channel.model ?? "-"} mode=${channel.permissionMode} launcher=${channel.launcher || "builtin"} resume=${resume ?? "-"} always=${JSON.stringify([...this.alwaysAllowed])}`);
+    log(this.tag, `start kind=${kind} cwd=${channel.cwd} model=${channel.model ?? "-"} mode=${channel.permissionMode} launcher=${channel.launcher || "builtin"} resume=${resume ?? "-"} turn_limit=${limitLabel(this.turnTimeoutMs)} max_turns=${channel.maxTurns || "none"} always=${JSON.stringify([...this.alwaysAllowed])}`);
     this.q = query({
       prompt: this.input(),
       options: {
@@ -1301,7 +1410,8 @@ var LiveSession = class {
           PermissionDenied: [{ hooks: [permissionDenied], timeout: hookTimeout }]
         },
         canUseTool,
-        maxTurns: MAX_TURNS,
+        // max_turns (counted per user message in streaming mode, spike/live-check.ts): off by default, so not sent.
+        ...channel.maxTurns > 0 ? { maxTurns: channel.maxTurns } : {},
         abortController: this.abort,
         stderr: onStderr,
         ...resume ? { resume } : {}
@@ -1343,6 +1453,8 @@ var LiveSession = class {
   /** When this process was started (for !status). */
   startedAt = Date.now();
   cwd;
+  /** Working time per turn before it is stopped; 0 = no limit. */
+  turnTimeoutMs;
   /** A turn is running. */
   get busy() {
     return !!this.turn;
@@ -1403,16 +1515,23 @@ var LiveSession = class {
         denials: [],
         replies: 0,
         lastText: "",
-        remainingMs: TURN_TIMEOUT_MS,
-        timerStarted: 0,
+        clock: void 0,
         waits: 0,
         abort: new AbortController(),
         retries: /* @__PURE__ */ new Map(),
         resolve: resolve2
       };
+      t.clock = new TurnClock(
+        this.turnTimeoutMs,
+        () => this.onTimeout(t),
+        () => {
+          log(this.tag, `turn ${n} close to the time limit (${limitLabel(this.turnTimeoutMs)})`);
+          t.notice?.(timeoutWarning(this.turnTimeoutMs, t.clock.left)).catch((e) => log(this.tag, `time limit warning failed: ${e.message}`));
+        }
+      );
       for (const k2 of opts.preapproved ?? []) t.retries.set(k2, { allow: true });
       this.turn = t;
-      this.startClock(t);
+      t.clock.resume();
       if (!this.usable) {
         this.finishTurn(void 0, "session is closed");
         return;
@@ -1460,7 +1579,7 @@ var LiveSession = class {
       if (!force) log(this.tag, `close (${reason}) pid=${this.pid ?? "-"} busy=${this.busy}`);
       this.inputEnded = true;
       this.wake?.();
-      const limit = CLOSE_GRACE_MS + (this.busy ? TURN_TIMEOUT_MS : 0);
+      const limit = CLOSE_GRACE_MS + (this.busy ? BUSY_CLOSE_WAIT_MS : 0);
       const exited = await Promise.race([this.done.then(() => true), sleep(limit).then(() => false)]);
       if (!exited) {
         log(this.tag, `close (${reason}) still running after ${limit} ms, killing`);
@@ -1492,26 +1611,33 @@ var LiveSession = class {
   /** Wait for a person with the turn clock paused (prompts may run in parallel). */
   async waitFor(wait) {
     const t = this.turn;
-    if (t && t.waits++ === 0) this.stopClock(t);
+    if (t && t.waits++ === 0) t.clock.pause();
     try {
       return await wait();
     } finally {
-      if (t && --t.waits === 0 && this.turn === t) this.startClock(t);
+      if (t && --t.waits === 0 && this.turn === t) t.clock.resume();
     }
   }
-  startClock(t) {
-    t.timerStarted = Date.now();
-    t.timer = setTimeout(() => {
-      log(this.tag, `turn ${t.n} timeout after ${TURN_TIMEOUT_MS} ms of work, killing the session`);
+  /**
+   * The turn used up its working time (turn_timeout_minutes; off by default).
+   * Interrupt it like 🛑 so the session stays and "繼續" picks it up; from now
+   * on replies and tools are refused, and the bot posts the notice itself.
+   * Only if the turn does not end soon is the session killed.
+   */
+  onTimeout(t) {
+    if (this.turn !== t) return;
+    t.timedOut = true;
+    log(this.tag, `turn ${t.n} timeout: ${limitLabel(this.turnTimeoutMs)} of work used, interrupting the turn`);
+    t.abort.abort();
+    this.q.interrupt().catch((e) => log(this.tag, `turn ${t.n} timeout interrupt failed: ${e.message}`));
+    t.killTimer = setTimeout(() => {
+      if (this.turn !== t) return;
+      log(this.tag, `turn ${t.n} timeout: still running ${INTERRUPT_GRACE_MS} ms after the interrupt, killing the session`);
       this.failure = "timeout";
       this.forced = true;
-      t.abort.abort();
       this.abort.abort();
-    }, t.remainingMs);
-  }
-  stopClock(t) {
-    clearTimeout(t.timer);
-    t.remainingMs = Math.max(0, t.remainingMs - (Date.now() - t.timerStarted));
+    }, INTERRUPT_GRACE_MS);
+    t.killTimer.unref?.();
   }
   /** Streaming input: yields queued user messages; returning closes stdin and ends the session. */
   async *input() {
@@ -1533,6 +1659,7 @@ var LiveSession = class {
       for await (const msg of this.q) this.onMessage(msg, started);
     } catch (e) {
       error = e.message;
+      if (this.failure === "timeout") error = `timeout (killed after ${limitLabel(this.turnTimeoutMs)} of work; SDK: ${error})`;
       log(this.tag, `error ${error}`);
       if (this.stderrTail.length) log(this.tag, `stderr tail: ${this.stderrTail.join("").slice(-1500)}`);
     }
@@ -1600,7 +1727,8 @@ var LiveSession = class {
       return;
     }
     this.turn = void 0;
-    clearTimeout(t.timer);
+    t.clock.stop();
+    clearTimeout(t.killTimer);
     t.abort.abort();
     this.lastActivity = Date.now();
     const costTotal = result ? result.total_cost_usd : this.cost;
@@ -1613,9 +1741,9 @@ var LiveSession = class {
       error = result.subtype === "success" ? result.result : result.errors?.join("\n");
     }
     const out = {
-      ok: !!result && result.subtype === "success" && !result.is_error,
+      ok: !t.timedOut && !!result && result.subtype === "success" && !result.is_error,
       // An interrupted turn ends as error_during_execution; report it as what it was.
-      subtype: t.stoppedBy && result ? "interrupted" : result?.subtype ?? this.failure ?? "error",
+      subtype: t.timedOut ? "timeout" : t.stoppedBy && result ? "interrupted" : result?.subtype ?? this.failure ?? "error",
       sessionId: this.sessionId,
       model: this.model,
       costTotal,
@@ -1627,10 +1755,11 @@ var LiveSession = class {
       lastText: result?.subtype === "success" && result.result.trim() ? result.result : t.lastText,
       denials: t.denials,
       stoppedBy: t.stoppedBy,
+      timedOut: t.timedOut,
       error,
       apiError: t.apiError
     };
-    log("result", `${this.threadId} turn=${t.n} pid=${this.pid ?? "-"} ok=${out.ok} subtype=${out.subtype} session=${out.sessionId} turns=${out.numTurns} replies=${out.replies} tools=${out.tools.length} denials=${JSON.stringify(out.denials)}${out.stoppedBy ? ` stopped_by=${out.stoppedBy}` : ""} turn_cost_usd=${turnCost.toFixed(4)} total_cost_usd=${costTotal.toFixed(4)} duration_ms=${out.durationMs}`);
+    log("result", `${this.threadId} turn=${t.n} pid=${this.pid ?? "-"} ok=${out.ok} subtype=${out.subtype} session=${out.sessionId} turns=${out.numTurns} replies=${out.replies} tools=${out.tools.length} denials=${JSON.stringify(out.denials)}${out.stoppedBy ? ` stopped_by=${out.stoppedBy}` : ""}${out.timedOut ? " timeout=true" : ""} turn_cost_usd=${turnCost.toFixed(4)} total_cost_usd=${costTotal.toFixed(4)} duration_ms=${out.durationMs}`);
     t.resolve(out);
   }
 };
@@ -2367,6 +2496,17 @@ ${prompt}`;
     ts.lastAt = (/* @__PURE__ */ new Date()).toISOString();
     saveState();
     const notice = async (content) => progressMessage ? await progressMessage.edit({ content, components: [], allowedMentions: { parse: [] } }) : await room.send({ content, allowedMentions: { parse: [] } });
+    if (turn.timedOut || turn.subtype === "error_max_turns") {
+      const n = turn.timedOut ? timeoutNotice(channel.turnTimeoutMs, c.kind, who) : maxTurnsNotice(channel.maxTurns, c.kind, who);
+      log(turn.timedOut ? "timeout" : "max-turns", `${c.key} turn stopped at the ${turn.timedOut ? `${limitLabel(channel.turnTimeoutMs)} time` : `${channel.maxTurns}-step`} limit subtype=${turn.subtype} replies=${turn.replies}`);
+      await progressMessage?.delete().catch(() => {
+      });
+      const msg = await room.send({ content: n.content, allowedMentions: { users: n.users } });
+      await attachDetails(msg, rememberTurn(c.key, turn));
+      await status.set("failed");
+      await checkContext(c, session, ts);
+      return;
+    }
     if (turn.stoppedBy) {
       log("stopped", `${c.key} by ${turn.stoppedBy} subtype=${turn.subtype}`);
       const msg = await notice(`\u23F9\uFE0F \u5DF2\u7531 ${turn.stoppedBy} \u505C\u6B62\u3002\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u8457\u9019\u6BB5\u5C0D\u8A71\u3002`);
@@ -2663,6 +2803,8 @@ async function statusText(c) {
     `\u30FB\u6B0A\u9650\u6A21\u5F0F\uFF1A${modeName(s?.mode ?? ch.permissionMode)}${ts.plan ? "\uFF0C\u7528 !plan \u53EF\u5207\u56DE" : ""}`,
     `\u30FB\u5C0D\u8A71\uFF1A${s?.usable ? `session \u5DF2\u958B ${duration(Date.now() - s.startedAt)}${s.busy ? "\uFF0C\u6B63\u5728\u5DE5\u4F5C" : "\uFF0C\u9592\u7F6E\u4E2D"}` : ts.sessionId ? "\u5DF2\u66AB\u505C\uFF08\u4E0B\u4E00\u5247\u8A0A\u606F\u6703\u63A5\u56DE\uFF09" : "\u9084\u6C92\u6709\u5C0D\u8A71"}`,
     ...c.kind === "dm" && ts.source ? [`\u30FB\u4F86\u6E90\uFF1A${ts.source}`] : [],
+    `\u30FB\u55AE\u8F2A\u5DE5\u4F5C\u4E0A\u9650\uFF1A${ch.turnTimeoutMs ? `${limitLabel(ch.turnTimeoutMs)}\uFF08\u7B49\u4EBA\u6309\u6309\u9215\u7684\u6642\u9593\u4E0D\u7B97\uFF09` : "\u4E0D\u9650\uFF08\u8981\u505C\u6B62\u8ACB\u6309 \u{1F6D1} \u6216\u7528 /stop\uFF09"}`,
+    `\u30FB\u55AE\u8F2A\u6B65\u6578\u4E0A\u9650\uFF1A${ch.maxTurns ? `${ch.maxTurns} \u6B65` : "\u4E0D\u9650"}`,
     `\u30FB\u672C\u6BB5\u5C0D\u8A71\u82B1\u8CBB\uFF1A\u7D04 $${ts.lastCostTotal.toFixed(2)}`,
     `\u30FB\u4E0A\u4E0B\u6587\uFF1A${ts.ctx ? `${ts.ctx.pct}%${ts.ctx.tokens && ts.ctx.max ? `\uFF08${k(ts.ctx.tokens)} / ${k(ts.ctx.max)} tokens\uFF09` : ""}` : "\u672A\u77E5\uFF08\u8DD1\u904E\u4E00\u8F2A\u5F8C\u624D\u77E5\u9053\uFF09"}`,
     `\u30FB\u984D\u5EA6\uFF1A${rateSummary(latestRateLimit())}`,

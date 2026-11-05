@@ -12,6 +12,7 @@ import { deferItem, type DeferredItem } from '../runner/approvals.js';
 import { explainFailure } from '../runner/failure.js';
 import { acquire } from '../runner/pool.js';
 import type { LiveSession } from '../runner/session.js';
+import { limitLabel, maxTurnsNotice, timeoutNotice } from '../runner/turn-clock.js';
 import { contextAlert, contextFooter, contextNotice } from '../runner/usage.js';
 import { botOwner } from '../roster.js';
 import { DM_KEY, getConversation, getDm, getThread, saveState, type DmState, type ThreadState } from '../store/state.js';
@@ -189,6 +190,19 @@ export async function runTurn(c: Conv, trigger: Message, status: StatusReactions
     const notice = async (content: string): Promise<Message> =>
       progressMessage ? await progressMessage.edit({ content, components: [], allowedMentions: { parse: [] } }) : await room.send({ content, allowedMentions: { parse: [] } });
 
+    // Over the working-time limit (turn_timeout_minutes) or the step limit (max_turns), both off by default:
+    // the bot says so itself, with the people who need to know mentioned, so nobody reads it as "blocked" or "gone quiet".
+    if (turn.timedOut || turn.subtype === 'error_max_turns') {
+      const n = turn.timedOut ? timeoutNotice(channel.turnTimeoutMs, c.kind, who) : maxTurnsNotice(channel.maxTurns, c.kind, who);
+      log(turn.timedOut ? 'timeout' : 'max-turns', `${c.key} turn stopped at the ${turn.timedOut ? `${limitLabel(channel.turnTimeoutMs)} time` : `${channel.maxTurns}-step`} limit subtype=${turn.subtype} replies=${turn.replies}`);
+      // A new message rather than editing the progress one: an edit never notifies anyone.
+      await progressMessage?.delete().catch(() => {});
+      const msg = await room.send({ content: n.content, allowedMentions: { users: n.users } });
+      await attachDetails(msg, rememberTurn(c.key, turn));
+      await status.set('failed');
+      await checkContext(c, session, ts);
+      return;
+    }
     if (turn.stoppedBy) {
       log('stopped', `${c.key} by ${turn.stoppedBy} subtype=${turn.subtype}`);
       const msg = await notice(`⏹️ 已由 ${turn.stoppedBy} 停止。下一則訊息會接著這段對話。`);
