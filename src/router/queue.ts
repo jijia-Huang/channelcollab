@@ -28,6 +28,11 @@ export function isPending(key: string): boolean {
   return pending.has(key);
 }
 
+/** Conversations with a job running or waiting (for the control script's "who is working"). */
+export function pendingKeys(): string[] {
+  return [...pending.keys()];
+}
+
 /** Any job, in any thread, is running or waiting. */
 export function anyPending(): boolean {
   return pending.size > 0;

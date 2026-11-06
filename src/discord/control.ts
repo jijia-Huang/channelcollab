@@ -1,7 +1,7 @@
 /**
  * Control-pipe commands that need Discord (0.1.8, PLAN §21), used by the
  * control script on the same computer: `info`, `post`, `sessions`,
- * `takeover`, `release`, `handoff`. Every answer is a JSON object with `ok`.
+ * `takeover`, `release`, `handoff`, and (0.1.9) `working`. Every answer is a JSON object with `ok`.
  */
 import { existsSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -12,7 +12,7 @@ import { log } from '../log.js';
 import type { ControlHandler } from '../ipc/control.js';
 import { forbiddenPath } from '../security/zones.js';
 import { boundTargets, postReport } from './post.js';
-import { giveBack, handOff, sessionFolder, sessionRows, takeOver } from './takeover.js';
+import { giveBack, handOff, sessionFolder, sessionRows, takeOver, workingRows } from './takeover.js';
 
 const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
 
@@ -78,6 +78,10 @@ export function controlHandlers(getClient: () => Client | undefined): Record<str
       });
       log('control', `post ${r.ok ? `ok ${r.url}` : `failed: ${r.error}`}`);
       return { ...r, ...(files.rejected.length ? { rejected: files.rejected } : {}) };
+    },
+    /** Where Claude is working right now (0.1.9): stop and status list these. Needs no Discord login. */
+    async working() {
+      return { ok: true, working: workingRows() };
     },
     async sessions() {
       ready();

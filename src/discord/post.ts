@@ -38,7 +38,8 @@ export type PostRequest = {
 };
 
 export type PostResult =
-  | { ok: true; url: string; where: string; channelId: string; threadId?: string; messageId: string }
+  /** `continues`: a new thread that will continue from (a fork of) the writing session when someone @-mentions the bot there. */
+  | { ok: true; url: string; where: string; channelId: string; threadId?: string; messageId: string; continues: boolean }
   | { ok: false; error: string };
 
 /** The bound channels with their Discord names (from the cache; the ID when the name is not known). */
@@ -142,15 +143,19 @@ async function post(client: Client<true>, req: PostRequest): Promise<PostResult>
   }
   if (!first) return { ok: false, error: '沒有送出任何訊息' };
 
+  let continues = false;
   if (req.newThread && room) {
     // The bot opened it, so it is handled like a thread the bot opened from a mention (PLAN §6).
     const ts = getThread(room.id) ?? registerThread(room.id, target.id, room.name);
-    if (req.forkFrom) ts.forkFrom = req.forkFrom;
+    if (req.forkFrom) {
+      ts.forkFrom = req.forkFrom;
+      continues = true;
+    }
     ts.source = req.source.kind === 'cli' ? '電腦上的工作回報' : req.source.kind === 'dm' ? '私訊的工作回報' : '討論串的工作回報';
     // The report itself is already known to the session it forks from; later history starts after it.
     if (last) ts.lastSeenMessageId = last.id;
     saveState();
   }
   log('post', `posted to ${where} (${room?.id ?? target.id}) message=${first.id}${req.forkFrom ? ` fork-from=${req.forkFrom.sessionId}` : ''} ${brief(text, 120)}`);
-  return { ok: true, url: first.url, where, channelId: target.id, ...(room ? { threadId: room.id } : {}), messageId: first.id };
+  return { ok: true, url: first.url, where, channelId: target.id, ...(room ? { threadId: room.id } : {}), messageId: first.id, continues };
 }

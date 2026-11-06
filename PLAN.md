@@ -1,6 +1,6 @@
 # channelcollab — 多人 × 多 Bot 的 Discord 協作 實作計畫
 
-> 狀態：Phase 1、Phase 2 與 Phase 3 的大部分已完成並在 Discord 實測（見第 15 節）；0.1.5 加了私訊、`!` 指令、上下文與額度提醒、PIN、白名單、禁區、稍後核准（第 18 節）；0.1.7 拿掉單輪上限（第 20 節）；0.1.8 加了回報到群組、在電腦上接手與交棒、努力程度（第 21 節）
+> 狀態：Phase 1、Phase 2 與 Phase 3 的大部分已完成並在 Discord 實測（見第 15 節）；0.1.5 加了私訊、`!` 指令、上下文與額度提醒、PIN、白名單、禁區、稍後核准（第 18 節）；0.1.7 拿掉單輪上限（第 20 節）；0.1.8 加了回報到群組、在電腦上接手與交棒、努力程度（第 21 節）；0.1.9 加了多隻 Bot 一次處理（`--all`）與「正在工作」的提示（第 22 節）
 > 本資料夾之後會成為 plugin marketplace 的 repo。
 > 外部工具（例如決策類工具）不在本工具內，只透過 `channelcollab resume` 指令接回（見第 9 節）。
 
@@ -591,7 +591,8 @@ channelcollab 會在每個 session 附上一份協作守則（`--append-system-p
 - `start`：Bot 以 detached、隱藏視窗的子程序在背景執行，stdout／stderr 寫到 `<HOME>\bot.log`／`bot.err.log`（上一次的改名為 `bot.prev*.log`），等 log 出現 `[ready]`（最多 90 秒）後回報登入身分與綁定的頻道。已經在跑（停止用的 named pipe 連得上）就只回報「已在執行中」，不重複啟動。
   - 實測（0.1.2）：Bot 是 DETACHED_PROCESS（沒有 console），關閉 console 不會影響它；開發環境裡的程序都在一個工作階段層級的 job（允許 silent breakaway、沒有 KILL_ON_JOB_CLOSE），沒有會連帶結束 Bot 的 job。情境 A：在 headless Claude Code（`claude -p`）裡用 Bash 執行 `start`，Claude 結束 23 分鐘後 Bot 仍在線、log 沒有中斷，之後 `stop` 正常。情境 B：在 console 視窗執行啟動 `.bat`，上線後對視窗送 WM_CLOSE（等同按 X），cmd 與 console 都結束，Bot 仍在線。所以啟動方式維持 `spawn(detached)`，不需要另外脫離 job。
   - 未實測：關掉多工終端機面板本身（不只是結束其中的 Claude）、Windows Terminal 分頁、啟動等待期間（spawn 到 `[ready]`）就關掉啟動者。開發時曾有一個以 `Start-Process` 執行 `npm start` 的 Bot 在面板關閉時被一起結束，確切原因未查明；要在背景長時間執行，請用 `start`。
-- `stop`：執行 runtime 的 `stop.mjs`（同 `npm run stop`），再確認 Bot 程序和停止前記下的子孫程序都已結束。
+- `stop`：執行 runtime 的 `stop.mjs`（同 `npm run stop`），再確認 Bot 程序和停止前記下的子孫程序都已結束。0.1.9 起停止前先列出正在工作的對話。
+- 同一台電腦有好幾隻 Bot 時，`start`／`stop`／`status` 加 `--all` 一次處理全部；「啟動全部 Bot.bat」「停止全部 Bot.bat」放在預設 HOME 的 launchers 資料夾（第 22 節）。
 - **開機自動啟動暫不提供**：用工作排程器註冊登入工作的做法，在開發環境被 Claude Code 自動模式判定為未授權的常駐設定而擋下；使用者決定改成桌面雙擊。Phase 0-7 維持未驗證。
 
 ---
@@ -946,6 +947,39 @@ PreToolUse hook 最前面判斷（比 retry 放行、always allow、auto 分類�
 - `src/bridge.test.ts`（29 項，假的 Discord 物件，真的 named pipe）：post 只能貼到綁定頻道（ID、名稱、`#`、`<#>`、重名、沒綁定、別的頻道底下的討論串）、來源標示與通知對象、權限矩陣、新討論串記下分支來源；pipe 的舊指令與 JSON 指令、長中文內容分段到達；總控 post（含禁區附檔被拒、記下電腦的 session）、targets、sessions；takeover（工作中拒絕、標記、Bot 不能開 session、討論串說明）、接手中被觸發（回覆、記下、不開 session、retry 不排）、release（交還、處理記下的訊息、session 不變）、takeback（只有主人、提醒）、resume.cmd 只有 ASCII 與環境變數、選對話的規則；handoff 到私訊（資料夾說明、/clear 後回到私訊的資料夾）與頻道新討論串、找不到的 session；Bot 沒在執行；effort 解析、設定、state、/status。總控 self-test 加 `bind --effort`。
 - 實測：上面「實測結論」各項；開視窗兩種方式；產生的 resume.cmd 實際 resume 了 sandbox 的 session（內建 claude 與含特殊字元路徑的啟動器）。
 - Discord 實測：只在測試頻道用 `post --new-thread` 發一則測試訊息（見交回報告）。takeover／release／handoff／`post_to_channel` 在 Discord 上的實際操作尚未實測（避免動到使用者真實的討論串）。
+
+---
+
+## 22. 0.1.9：多隻 Bot 一次處理、正在工作的提示、回報接續的小修正
+
+### 原因
+
+- 同一台電腦可以有好幾隻 Bot（每隻一個 HOME、一個程序），但 `start`／`stop`／`status` 不帶 `--home` 時只處理預設那隻，要處理全部得一隻一隻來。
+- 停止或重啟前，看不出哪一隻正在工作（`sessions` 有 `busy`，但只列有 session ID 的對話，新討論串的第一輪還沒有 session ID，看不到）。
+- 0.1.8 的小錯：總控 `post` 開新討論串時，只要有開討論串就印「之後在那個討論串 @ Bot，就會接著這段對話」，但 session 找不到（或沒給）時 Bot 並沒有記下分支來源，那句話不成立。
+
+### 做法
+
+**架構不變**：每隻 Bot 仍是自己的 HOME、自己的程序；`--all` 只是用 `homes` 的同一套規則（`listHomes`：`%USERPROFILE%` 底下 `.channelcollab*`、有 `config.json`）逐一執行。
+
+- 總控 `start --all`、`stop --all`、`status --all`（`runAll`）：每隻前面印 `=== 1/2　<Bot 名稱>（<HOME>）`，各自 try/catch（沒有 token、Node 太舊等丟出的錯誤記成那一隻失敗），最後一行「總結：…」（各狀態幾隻、哪幾隻，以及正在工作的 Bot）。`--json` 時最後一行 `RESULT [...]`，每隻 `{home, name, ok, state, working, error?}`（status 另有完整的 `status`）。有任何一隻失敗時結束代碼是 1。`--all` 和 `--home` 一起給時報錯。
+- `start`／`stop` 改成回傳結果（`state`：running／started／launched／failed；stopped／not-running／still-running／leftover），輸出不變。
+- **正在工作**：Bot 的控制通道多一個 JSON 指令 `working`（不需要已登入 Discord），回傳正在跑一輪或有訊息排隊的對話（pool 裡 busy 的 session，加上 queue 裡 pending 的 key；第一輪還沒有 session ID 的也算）。總控 `workingNow`：先問 `working`，0.1.8 的 Bot 不認得時改用 `sessions` 的 `busy`，都問不到（沒登入完成、0.1.7 以前）回 `null`。
+  - `status` 多一行「⚙️ 正在工作：私訊、討論串「…」（ID）」／「工作中：沒有（閒置）」／「無法確認」；`--json` 的 `working`。
+  - `stop`（單獨一隻和 `--all` 都是）停止前先印出這一行，**照原本的停止流程處理**（進行中的這一輪會被中斷，對話保存），不另外等待，也沒有加任何時間限制；`--all` 的總結列出「停止時正在工作：<Bot>（<對話>）」。
+- **「全部」捷徑**：`shortcut --all` 在**預設 HOME 的 `launchers` 資料夾**建「啟動全部 Bot.bat」「停止全部 Bot.bat」（不放桌面；檔名和各 Bot 的「啟動 <Bot 名稱>.bat」不同，也不含 `--home`，所以 `makeLaunchers` 的舊檔清理不會動到它們，它們也不會覆蓋各 Bot 的捷徑）。
+  - **.bat 內容只有 ASCII**（第 21 節：.cmd 裡有中文時 cmd 會把指令切斷）。雙擊時沒有父程序幫忙放環境變數，所以路徑用系統本來就有的 `%USERPROFILE%`：`set "CC_CTL=%USERPROFILE%\<HOME 資料夾>\runtime\ctl.mjs"`，再 `"%CC_NODE%" "%CC_CTL%" start --all`。node 的路徑是 ASCII 就直接寫，否則把開頭的 `%LOCALAPPDATA%`、`%APPDATA%`、`%USERPROFILE%`、`%ProgramFiles%` 換成環境變數，還有非 ASCII 時改用 PATH 上的 node（`batAsciiPath`）。ctl.mjs 找不到時印英文說明後停下。
+  - 用哪一份 ctl.mjs：預設 HOME 有 runtime 就用它的，否則用第一個資料夾名稱是 ASCII、有 runtime 的 HOME。要處理哪些 HOME 由 ctl 執行時自己找，之後新增的 Bot 也會包含在內。
+  - 從一隻 Bot 的 runtime 複本（ctl.mjs）操作**別的** HOME 時（`--all` 就是這樣），那份複本不一定比對方新：對方已經裝好 runtime 時，不拿複本覆蓋它的 runtime 和 ctl.mjs（`foreignRuntime`），用它自己的版本啟動。從 plugin 執行（skill）時照舊會更新。
+- skill `start`／`stop`／`status`：沒指定資料夾時先 `homes --json`；兩隻以上用 AskUserQuestion 問處理哪一隻（每隻一個選項，加「全部」）；使用者說「兩隻」「全部」時直接 `--all`；只有一隻時照舊。`setup` 在有兩隻以上時提到 `shortcut --all`。
+- **回報接續的修正**：`postReport` 回傳 `continues`（開了新討論串、而且確實記下 `forkFrom` 才是 true）。總控 `post` 只在 `continues` 時印那句話（0.1.8 的 Bot 不回這個欄位時，用「有開新討論串、也送了 session」推測）；`post_to_channel` 的工具回覆也只在 `continues` 時告訴 Claude「之後在那個討論串 @ Bot 會接著這段對話」（`postedText`），避免 Claude 對使用者說了不成立的話。
+
+### 驗證
+
+- 總控 self-test 加 9 項（48 項）：假的 HOME 放在含中文與空白的暫存資料夾。0／1／2／3 個 HOME；一隻沒有 token（CliError）、一隻假 runtime 的 `bot.mjs` 直接以代碼 3 結束（啟動失敗），兩者都不影響其他隻；一隻是另一個 node 程序假扮的執行中 Bot（佔住 named pipe、回答 `working` 與 `stop`）：`start --all` 回報「已經在執行中」、`status --all --json` 列出它正在私訊裡工作、輸出不含 token、`stop --all` 先列出正在工作再照常停止、總結列出「停止時正在工作」。「全部」捷徑只有 ASCII、放在預設 HOME 的 launchers、各 Bot 自己的捷徑內容不變；**用 cmd 實際執行**「停止全部 Bot.bat」（`USERPROFILE` 指到含中文與空白的資料夾），找到 3 隻並印出總結。`postContinues` 的判斷。
+- `src/bridge.test.ts` 加 3 項（32 項）：新討論串有 `forkFrom` 時 `continues=true`、沒有時 false 且工具回覆不提接續；總控 `post` 沒給 session、session 找不到時不印那句話也不記分支；`working` 列出第一輪還沒有 session ID 的討論串與私訊，閒置時是空的。
+- 實際部署見交回報告（兩隻 Bot 是否閒置、有沒有重啟、`status --all`／`start --all` 的輸出）。
+- 未實測：Discord 上 `post_to_channel` 工具回覆的實際效果（避免在真實頻道發文）；從檔案總管雙擊「全部」捷徑（實測用的是 cmd 執行同一個檔案）。
 
 ---
 

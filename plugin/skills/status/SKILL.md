@@ -6,11 +6,31 @@ allowed-tools: Bash(node:*), PowerShell(node:*)
 
 # Bot 狀態
 
+## 先決定要處理哪一隻 Bot
+
+同一台電腦可以有好幾隻 Bot（每隻一個 HOME 資料夾、各自一個程序）。
+
+1. 使用者已經指定資料夾（`--home`）或 Bot 名稱：直接處理那一隻。
+2. 使用者說「兩隻」「全部」「所有 Bot」：直接加 `--all`，不用再問。
+3. 都沒說時，先列出這台電腦上的 Bot：
+
+   ```
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" homes --json
+   ```
+
+   最後一行是 `RESULT [{"home": …, "name": …, "running": …}, …]`。
+   - 0 或 1 隻：照舊，不加 `--home`（只有一隻且不在預設資料夾時，加那一隻的 `--home`）。
+   - 2 隻以上：用 AskUserQuestion 問「要查看哪一隻 Bot？」，每隻 Bot 一個選項（標籤用 Bot 名稱，說明寫目前執行中或沒有執行），再加一個「全部」。選了某一隻就加 `--home "<那一隻的 home>"`，選「全部」就加 `--all`。
+
+## 查看
+
 ```
-node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" status
+node "${CLAUDE_PLUGIN_ROOT}/scripts/channelcollab.mjs" status [--home "<資料夾>" | --all]
 ```
 
-使用者指定了別的 HOME 時加 `--home "<資料夾>"`。需要給程式判斷時加 `--json`（最後一行 `RESULT {...}`）。
+需要給程式判斷時加 `--json`（最後一行 `RESULT {...}`；`--all` 時是 `RESULT [ {...}, … ]`，每隻一筆，`working` 是正在工作的對話，`[]` 是閒置，`null` 是無法確認）。`--all` 時每隻前面有一行 `=== 1/2　<Bot 名稱>（<資料夾>）`，最後一行是「總結：…」，逐隻整理給使用者。
+
+執行中的 Bot 會多一行「⚙️ 正在工作：私訊、討論串「…」」或「工作中：沒有（閒置）」；使用者要停止或重啟前，用這一行判斷會不會打斷正在跑的工作。
 
 把結果用白話整理給使用者：在不在跑、登入成誰、**模式**、綁了哪些頻道、私訊有沒有開、PIN 和白名單的狀態。有問題時給下一步。
 

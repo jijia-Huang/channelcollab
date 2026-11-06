@@ -38,6 +38,11 @@ export function liveSession(threadId: string): LiveSession | undefined {
   return live.get(threadId);
 }
 
+/** Conversations whose live session is in the middle of a turn. */
+export function busyKeys(): string[] {
+  return [...live.values()].filter((s) => s.busy).map((s) => s.threadId);
+}
+
 function limits(): { idleMs: number; max: number } {
   const d = loadConfig().defaults;
   return { idleMs: d.idle_close_minutes * 60 * 1000, max: d.max_live_sessions };

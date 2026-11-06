@@ -20,8 +20,8 @@ import { getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
 import { ChannelType, ThreadAutoArchiveDuration, type AnyThreadChannel, type Client, type Message } from 'discord.js';
 import { loadConfig, resolveDm, type Config } from '../config.js';
 import { brief, log } from '../log.js';
-import { enqueue, isPending } from '../router/queue.js';
-import { hold, liveSession, release, unhold } from '../runner/pool.js';
+import { enqueue, isPending, pendingKeys } from '../router/queue.js';
+import { busyKeys, hold, liveSession, release, unhold } from '../runner/pool.js';
 import { botOwner } from '../roster.js';
 import { allThreads, DM_KEY, getDm, getThread, registerThread, saveState, switchDm, type ThreadState } from '../store/state.js';
 import { splitMessage } from './commands.js';
@@ -165,6 +165,17 @@ export type SessionRow = {
   takenOver: boolean;
   busy: boolean;
 };
+
+export type WorkingRow = { key: string; kind: 'thread' | 'dm'; name: string };
+
+/**
+ * Conversations where Claude is working right now: a turn running or messages waiting (0.1.9, for the
+ * control script's stop and status). Unlike sessionRows it also covers a first turn that has no session ID yet.
+ */
+export function workingRows(): WorkingRow[] {
+  const keys = [...new Set([...busyKeys(), ...pendingKeys()])];
+  return keys.map((key) => (key === DM_KEY ? { key, kind: 'dm' as const, name: '私訊' } : { key, kind: 'thread' as const, name: getThread(key)?.name ?? `討論串 ${key}` }));
+}
 
 /** This bot's recent conversations that have a session: the current direct message and the threads, newest first. */
 export function sessionRows(config: Config, max = 15): SessionRow[] {

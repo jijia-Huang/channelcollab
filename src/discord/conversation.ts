@@ -207,7 +207,7 @@ export async function runTurn(c: Conv, trigger: Message, status: StatusReactions
           // A new report thread continues from this conversation's session (forked on its first trigger).
           ...(session.sessionId ? { forkFrom: { sessionId: session.sessionId, cwd: channel.cwd } } : {}),
         });
-        return r.ok ? { ok: true, url: r.url, where: r.where } : r;
+        return r.ok ? { ok: true, url: r.url, where: r.where, continues: r.continues } : r;
       },
     }, { preapproved: input.preapproved, ownerTriggered: c.kind === 'dm' || (!!who.ownerId && who.requesterId === who.ownerId) });
     const progressMessage = await progress.end();

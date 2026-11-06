@@ -131,6 +131,9 @@ function enqueue(key, job) {
 function isPending(key) {
   return pending.has(key);
 }
+function pendingKeys() {
+  return [...pending.keys()];
+}
 function anyPending() {
   return pending.size > 0;
 }
@@ -1259,6 +1262,11 @@ function postGuideline(targets) {
     `  \u53EF\u4EE5\u8CBC\u7684\u983B\u9053\uFF1A${targets}`
   ].join("\n");
 }
+function postedText(r, rejected = []) {
+  const follow = r.continues ? " Later @-mentions of the bot in that new thread continue from a copy of this conversation." : "";
+  const note = rejected.length ? ` Not attached: ${rejected.join("; ")}` : "";
+  return `Posted to ${r.where}: ${r.url}.${follow}${note}`;
+}
 function modeDenyMessage(mode, toolName) {
   if (mode === "plan") return `\u76EE\u524D\u662F\u8A08\u756B\u6A21\u5F0F\uFF08\u4E3B\u4EBA\u6253\u4E86 !plan\uFF09\uFF1A\u53EA\u8A0E\u8AD6\u3001\u4E0D\u52D5\u624B\uFF0C\u4E0D\u80FD\u57F7\u884C ${toolName}\u3002\u8ACB\u7528 reply \u628A\u4F60\u7684\u8A08\u756B\u8AAA\u660E\u7D66\u4E3B\u4EBA\uFF0C\u7B49\u4E3B\u4EBA\u518D\u6253\u4E00\u6B21 !plan \u5207\u56DE\u5F8C\u518D\u52D5\u624B\u3002`;
   return `\u9019\u500B\u983B\u9053\u7684\u6B0A\u9650\u6A21\u5F0F\uFF08${mode}\uFF09\u4E0D\u5141\u8A31\u57F7\u884C ${toolName}\u3002`;
@@ -1375,8 +1383,7 @@ var LiveSession = class {
             log("post", `${threadId} -> ${target}${thread ? ` thread=${thread}` : ""}${newThread ? ` new thread "${newThread}"` : ""} ${brief(text, 200)}${files?.length ? ` files=${JSON.stringify(checked.ok)} rejected=${JSON.stringify(checked.rejected)}` : ""}`);
             const r = await t.postToChannel({ channel: target, text, files: checked.ok, thread, newThread }).catch((e) => ({ ok: false, error: e.message }));
             if (!r.ok) return { content: [{ type: "text", text: `Not posted: ${r.error}` }], isError: true };
-            const note = checked.rejected.length ? ` Not attached: ${checked.rejected.join("; ")}` : "";
-            return { content: [{ type: "text", text: `Posted to ${r.where}: ${r.url}.${note}` }] };
+            return { content: [{ type: "text", text: postedText(r, checked.rejected) }] };
           }
         )
       ]
@@ -1878,6 +1885,9 @@ var sweeper;
 function liveSession(threadId) {
   return live.get(threadId);
 }
+function busyKeys() {
+  return [...live.values()].filter((s) => s.busy).map((s) => s.threadId);
+}
 function limits() {
   const d = loadConfig().defaults;
   return { idleMs: d.idle_close_minutes * 60 * 1e3, max: d.max_live_sessions };
@@ -2057,15 +2067,19 @@ ${text}`);
     last = m;
   }
   if (!first) return { ok: false, error: "\u6C92\u6709\u9001\u51FA\u4EFB\u4F55\u8A0A\u606F" };
+  let continues = false;
   if (req.newThread && room) {
     const ts = getThread(room.id) ?? registerThread(room.id, target.id, room.name);
-    if (req.forkFrom) ts.forkFrom = req.forkFrom;
+    if (req.forkFrom) {
+      ts.forkFrom = req.forkFrom;
+      continues = true;
+    }
     ts.source = req.source.kind === "cli" ? "\u96FB\u8166\u4E0A\u7684\u5DE5\u4F5C\u56DE\u5831" : req.source.kind === "dm" ? "\u79C1\u8A0A\u7684\u5DE5\u4F5C\u56DE\u5831" : "\u8A0E\u8AD6\u4E32\u7684\u5DE5\u4F5C\u56DE\u5831";
     if (last) ts.lastSeenMessageId = last.id;
     saveState();
   }
   log("post", `posted to ${where} (${room?.id ?? target.id}) message=${first.id}${req.forkFrom ? ` fork-from=${req.forkFrom.sessionId}` : ""} ${brief(text, 120)}`);
-  return { ok: true, url: first.url, where, channelId: target.id, ...room ? { threadId: room.id } : {}, messageId: first.id };
+  return { ok: true, url: first.url, where, channelId: target.id, ...room ? { threadId: room.id } : {}, messageId: first.id, continues };
 }
 
 // src/discord/takeover.ts
@@ -2189,6 +2203,10 @@ async function replay(c, ids) {
     const { queued } = enqueue(c.key, () => runTurn(c, m, status, who));
     if (queued) await status.set("waiting");
   }
+}
+function workingRows() {
+  const keys = [.../* @__PURE__ */ new Set([...busyKeys(), ...pendingKeys()])];
+  return keys.map((key) => key === DM_KEY ? { key, kind: "dm", name: "\u79C1\u8A0A" } : { key, kind: "thread", name: getThread(key)?.name ?? `\u8A0E\u8AD6\u4E32 ${key}` });
 }
 function sessionRows(config2, max = 15) {
   const rows2 = [];
@@ -2945,7 +2963,7 @@ ${prompt}`;
           // A new report thread continues from this conversation's session (forked on its first trigger).
           ...session.sessionId ? { forkFrom: { sessionId: session.sessionId, cwd: channel.cwd } } : {}
         });
-        return r.ok ? { ok: true, url: r.url, where: r.where } : r;
+        return r.ok ? { ok: true, url: r.url, where: r.where, continues: r.continues } : r;
       }
     }, { preapproved: input.preapproved, ownerTriggered: c.kind === "dm" || !!who.ownerId && who.requesterId === who.ownerId });
     const progressMessage = await progress.end();
@@ -4007,6 +4025,10 @@ function controlHandlers(getClient) {
       });
       log("control", `post ${r.ok ? `ok ${r.url}` : `failed: ${r.error}`}`);
       return { ...r, ...files.rejected.length ? { rejected: files.rejected } : {} };
+    },
+    /** Where Claude is working right now (0.1.9): stop and status list these. Needs no Discord login. */
+    async working() {
+      return { ok: true, working: workingRows() };
     },
     async sessions() {
       ready();

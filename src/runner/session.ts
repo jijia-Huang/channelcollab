@@ -87,6 +87,16 @@ export function postGuideline(targets: string): string {
 }
 
 /** The deny reason Claude sees for a call refused by the current permission mode. */
+/**
+ * What post_to_channel tells Claude after posting. It only says the new thread continues this
+ * conversation when the bot really recorded that (0.1.9; before, Claude could tell people so when it was not true).
+ */
+export function postedText(r: { where: string; url: string; continues?: boolean }, rejected: string[] = []): string {
+  const follow = r.continues ? ' Later @-mentions of the bot in that new thread continue from a copy of this conversation.' : '';
+  const note = rejected.length ? ` Not attached: ${rejected.join('; ')}` : '';
+  return `Posted to ${r.where}: ${r.url}.${follow}${note}`;
+}
+
 export function modeDenyMessage(mode: PermissionMode, toolName: string): string {
   if (mode === 'plan') return `目前是計畫模式（主人打了 !plan）：只討論、不動手，不能執行 ${toolName}。請用 reply 把你的計畫說明給主人，等主人再打一次 !plan 切回後再動手。`;
   return `這個頻道的權限模式（${mode}）不允許執行 ${toolName}。`;
@@ -112,7 +122,8 @@ export type Question = { question: string; header: string; multiSelect: boolean;
 
 /** What post_to_channel asks for (files already checked against the session's folders). */
 export type PostArgs = { channel: string; text: string; files: string[]; thread?: string; newThread?: string };
-export type PostOutcome = { ok: true; url: string; where: string } | { ok: false; error: string };
+/** `continues`: a new thread that continues from a fork of this session when someone @-mentions the bot there. */
+export type PostOutcome = { ok: true; url: string; where: string; continues?: boolean } | { ok: false; error: string };
 
 export type TurnCallbacks = {
   sendReply: (text: string, files: string[]) => Promise<void>;
@@ -353,8 +364,7 @@ export class LiveSession {
             log('post', `${threadId} -> ${target}${thread ? ` thread=${thread}` : ''}${newThread ? ` new thread "${newThread}"` : ''} ${brief(text, 200)}${files?.length ? ` files=${JSON.stringify(checked.ok)} rejected=${JSON.stringify(checked.rejected)}` : ''}`);
             const r = await t.postToChannel({ channel: target, text, files: checked.ok, thread, newThread }).catch((e: Error) => ({ ok: false as const, error: e.message }));
             if (!r.ok) return { content: [{ type: 'text', text: `Not posted: ${r.error}` }], isError: true };
-            const note = checked.rejected.length ? ` Not attached: ${checked.rejected.join('; ')}` : '';
-            return { content: [{ type: 'text', text: `Posted to ${r.where}: ${r.url}.${note}` }] };
+            return { content: [{ type: 'text', text: postedText(r, checked.rejected) }] };
           },
         ),
       ],

@@ -14,7 +14,7 @@ Bot 可以把做完的事**回報到團隊頻道**（在 Discord 上請它回報
 |---|---|
 | `/channelcollab:setup` | 設定精靈：先選用途（只用私訊／團隊頻道協作／兩者都要），再檢查 Node、安裝執行環境、匯入交付檔、設定 PIN、綁定頻道或開私訊、啟動 Bot、建立捷徑 |
 | `/channelcollab:bind` | 新增、修改、移除頻道綁定；開關私訊（主人私訊 Bot）；設定核准用 PIN、白名單 |
-| `/channelcollab:start`、`/channelcollab:stop`、`/channelcollab:status` | 啟動、停止、查看狀態（也可以雙擊 setup 建立的「啟動 <Bot 名稱>.bat」等） |
+| `/channelcollab:start`、`/channelcollab:stop`、`/channelcollab:status` | 啟動、停止、查看狀態（也可以雙擊 setup 建立的「啟動 <Bot 名稱>.bat」等）。同一台電腦有好幾隻 Bot 時會先問處理哪一隻，也可以選「全部」；status 會顯示 Bot 是不是正在工作 |
 | `/channelcollab:roster` | 管理自己的名冊（Bot 認得哪些 Bot、哪些人）；加入只要 Discord ID |
 | `/channelcollab:guidelines` | 協作守則 |
 | `/channelcollab:report` | 把電腦上做完的事整理成摘要，經執行中的 Bot 貼到綁定的頻道（送出前先確認） |
@@ -32,3 +32,11 @@ Bot 可以把做完的事**回報到團隊頻道**（在 Discord 上請它回報
 ## 資料放在哪裡
 
 Bot 的設定（含 token）、名冊、log 和執行環境都放在 `%USERPROFILE%\.channelcollab`（或環境變數 `CHANNELCOLLAB_HOME` 指定的資料夾），不在 plugin 資料夾裡，所以更新 plugin 不會影響設定。
+
+## 同一台電腦有好幾隻 Bot
+
+每隻 Bot 有自己的資料夾（`%USERPROFILE%\.channelcollab`、`%USERPROFILE%\.channelcollab-<名稱>` …）和自己的程序，互不影響。要一次處理全部：
+
+- 在 Claude Code 說「啟動全部 Bot」「兩隻都停掉」，或執行總控的 `start --all`、`stop --all`、`status --all`。每隻分別回報結果，某一隻失敗不影響其他隻，最後一行是總結。
+- 停止前會先列出正在工作的 Bot 與對話（`stop` 單獨一隻時也一樣），停止方式和平常相同。
+- `shortcut --all` 在 `%USERPROFILE%\.channelcollab\launchers` 建「啟動全部 Bot.bat」「停止全部 Bot.bat」，雙擊就能一次啟動或停止全部；各 Bot 自己的捷徑不受影響。

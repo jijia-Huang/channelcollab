@@ -9,12 +9,13 @@
 //   set-pin | clear-pin | unlock   核准用 PIN（一律在主控台視窗裡輸入，不經過 Claude）、解除鎖定
 //   access --roster-only on|off    白名單：只有主人和名冊上的人／Bot 能叫 Bot（預設開）
 //   roster list|add|remove|import  管理自己的名冊 <HOME>\roster.json（Bot 和成員；add 只要 Discord ID）
-//   start | stop | status      啟動（背景執行）、停止、查看狀態
+//   start | stop | status      啟動（背景執行）、停止、查看狀態；加 --all 一次處理這台電腦上的所有 Bot
 //   homes | targets            這台電腦上的 Bot（各 HOME）；這隻 Bot 可以貼文的頻道
 //   post --channel ...         請執行中的 Bot 把回報貼到綁定的頻道（經 named pipe，腳本不讀 token）
 //   sessions | takeover | release   列出 Bot 的對話；在電腦上接手（開新視窗 resume）；交還給 Bot
 //   handoff ...                把電腦上的 session 交給 Bot（私訊或綁定頻道的新討論串）
 //   shortcut [--dir <資料夾>] [--name <名稱>]   產生雙擊用的「啟動／停止 <Bot 名稱>.bat」等（預設放桌面）
+//   shortcut --all             「啟動全部 Bot.bat」「停止全部 Bot.bat」（放在預設 HOME 的 launchers 資料夾）
 //   --self-test                不需要 token 的自我測試
 //
 // HOME：--home <路徑> 優先，其次環境變數 CHANNELCOLLAB_HOME，預設 %USERPROFILE%\.channelcollab。
@@ -32,7 +33,8 @@ import { fileURLToPath } from 'node:url';
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(SCRIPT_PATH);
 // 在 plugin 裡執行時 runtime 在 ../runtime；安裝到 <HOME>\runtime 的複本（ctl.mjs）旁邊就是 runtime 本身。
-const SOURCE_RUNTIME = fs.existsSync(path.join(SCRIPT_DIR, 'bot.mjs')) ? SCRIPT_DIR : path.resolve(SCRIPT_DIR, '..', 'runtime');
+const IS_RUNTIME_COPY = fs.existsSync(path.join(SCRIPT_DIR, 'bot.mjs'));
+const SOURCE_RUNTIME = IS_RUNTIME_COPY ? SCRIPT_DIR : path.resolve(SCRIPT_DIR, '..', 'runtime');
 const RUNTIME_FILES = ['bot.mjs', 'stop.mjs', 'package.json', 'package-lock.json'];
 const MIN_NODE_MAJOR = 22;
 /** Agent SDK 的提醒代碼（見 filterStderr）。 */
@@ -901,6 +903,7 @@ async function getStatus(p) {
     pid: running ? pid : null,
     stalePid: !running && pid && pidAlive(pid) ? pid : null,
     loggedInAs: running ? log.ready?.tag ?? null : null,
+    working: running ? await workingNow(p) : [],
     botId: running ? log.ready?.id ?? null : null,
     lastStart: log.start,
     recentErrors: log.errors,
@@ -924,20 +927,32 @@ function rotate(from, to) {
   }
 }
 
+/**
+ * 從另一隻 Bot 的 runtime 複本（ctl.mjs，例如「啟動全部 Bot.bat」）操作這個 HOME：那份複本的版本不一定比這隻新，
+ * 所以這隻已經裝好 runtime 時不拿複本覆蓋它（runtime 和 ctl.mjs 都不動），用它自己的版本。
+ */
+const foreignRuntime = (p) => IS_RUNTIME_COPY && path.resolve(SOURCE_RUNTIME).toLowerCase() !== path.resolve(p.runtime).toLowerCase();
+
+/**
+ * 啟動。回傳 { ok, state, tag? }：state 是 running（本來就在執行）、started（已上線）、launched（--wait 0，不等上線）、failed。
+ * 沒有 token、Node 太舊等設定問題丟 CliError。
+ */
 async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
   requireNode();
   const cfg = configSummary(p.config);
   if (!cfg.hasToken) throw new CliError(`${p.config} 裡沒有 Bot token。請先執行 setup，匯入管理員給的交付檔。`);
-  syncCtl(p);
+  const foreign = foreignRuntime(p);
+  if (!foreign) syncCtl(p);
   if (await isRunning(p)) {
     const s = parseLog(readLines(p.log));
     console.log(`✅ Bot 已經在執行中（${s.ready ? `登入成 ${s.ready.tag}` : '尚未登入完成'}），不用再啟動。`);
     printSetup(cfg, fs.existsSync(p.pin));
-    return true;
+    return { ok: true, state: 'running', tag: s.ready?.tag ?? null };
   }
   const rt = runtimeState(p);
   if (!rt.upToDate) {
-    if (!update && rt.installed) console.log('⚠️  runtime 不是最新版，這次先用舊版啟動。');
+    if (foreign && rt.installed) console.log('（用這隻 Bot 自己的 runtime 啟動；要更新 runtime，請用 /channelcollab:start 或它自己的啟動捷徑）');
+    else if (!update && rt.installed) console.log('⚠️  runtime 不是最新版，這次先用舊版啟動。');
     else await installRuntime(p);
   }
 
@@ -959,7 +974,7 @@ async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
   fs.closeSync(out);
   fs.closeSync(err);
   console.log(`Bot 啟動中（pid ${child.pid}，log：${p.log}）…`);
-  if (!wait) return true;
+  if (!wait) return { ok: true, state: 'launched' };
 
   const deadline = Date.now() + wait * 1000;
   while (Date.now() < deadline) {
@@ -969,7 +984,7 @@ async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
       console.log(`✅ Bot 已上線：登入成 ${s.ready.tag}（Discord ID ${s.ready.id}）`);
       printSetup(cfg, fs.existsSync(p.pin));
       console.log('Bot 在背景執行，關掉這個視窗或 Claude Code 都不會停；要停止請用 stop。');
-      return true;
+      return { ok: true, state: 'started', tag: s.ready.tag };
     }
     if (exited !== null) break;
   }
@@ -978,7 +993,7 @@ async function start(p, { wait = READY_WAIT_S, update = true } = {}) {
   for (const l of [...s.errors, ...filterStderr(readLines(p.errLog)).slice(-8)]) console.log(`   ${l}`);
   console.log('   常見原因：token 失效（請管理員重給交付檔）、網路連不到 discord.com、Message Content Intent 沒開。');
   process.exitCode = 1;
-  return false;
+  return { ok: false, state: 'failed', error: exited !== null ? `程序已結束（代碼 ${exited}）` : `${wait} 秒內沒有上線` };
 }
 
 /** Bot 程序底下的所有子孫程序（停止前記下，停止後確認都已結束）。 */
@@ -1007,13 +1022,38 @@ function descendants(pid) {
   }
 }
 
+/**
+ * Bot 正在哪些對話裡工作（這一輪還在跑或有訊息排隊）：[{ key, kind, name }]，閒置是 []。
+ * 問不到（沒在執行、還沒登入完成的舊版 Bot）回傳 null。0.1.8 的 Bot 沒有 working 指令，改用 sessions 的 busy。
+ * 這只是查詢，不影響 Bot 的工作。
+ */
+export async function workingNow(p, timeoutMs = 10000) {
+  const pipe = stopPipe(p.home);
+  const r = await pipeJson(pipe, { cmd: 'working' }, timeoutMs).catch(() => null);
+  if (r?.ok && Array.isArray(r.working)) return r.working;
+  if (r === null) return null;
+  const old = await pipeJson(pipe, { cmd: 'sessions' }, timeoutMs).catch(() => null);
+  if (old?.ok && Array.isArray(old.sessions)) return old.sessions.filter((x) => x.busy).map((x) => ({ key: x.key, kind: x.kind, name: x.kind === 'dm' ? '私訊' : x.name }));
+  return null;
+}
+
+export const workingText = (rows) => rows.map((r) => (r.kind === 'dm' ? '私訊' : `討論串「${r.name}」（${r.key}）`)).join('、');
+
+/**
+ * 停止。回傳 { ok, state, working }：state 是 stopped、not-running、still-running、leftover。
+ * 正在工作的 Bot 照一般的停止處理（和以前一樣），只是先列出它在哪裡工作；不另外等待、不加任何時間限制。
+ */
 async function stop(p) {
   if (!(await isRunning(p))) {
     const pid = readPid(p);
     console.log('Bot 沒有在執行。');
     if (pid && pidAlive(pid)) console.log(`⚠️  ${p.pid} 記錄的程序 ${pid} 還在，如果確定是卡住的 Bot，可以執行：taskkill /T /F /PID ${pid}`);
-    return true;
+    return { ok: true, state: 'not-running', working: [] };
   }
+  const working = await workingNow(p);
+  if (working === null) console.log('⚠️  無法確認 Bot 是否正在工作（Bot 還沒登入完成，或是舊版）。照一般停止處理。');
+  else if (working.length) console.log(`⚙️  Bot 正在工作：${workingText(working)}。照一般停止處理：進行中的這一輪會被中斷（對話保存，之後可以接著做）。`);
+  else console.log('Bot 目前閒置（沒有進行中的工作）。');
   const pid = readPid(p);
   const kids = descendants(pid);
   if (!fs.existsSync(p.stop)) throw new CliError(`找不到 ${p.stop}，runtime 可能不完整。請執行 install-runtime。`);
@@ -1028,15 +1068,15 @@ async function stop(p) {
   if (await isRunning(p)) {
     console.log('❌ Bot 還在執行。');
     process.exitCode = 1;
-    return false;
+    return { ok: false, state: 'still-running', working };
   }
   if (left.length) {
     console.log(`⚠️  Bot 已停止，但還有殘留程序：${left.join(', ')}。可以用 taskkill /T /F /PID <pid> 結束。`);
     process.exitCode = 1;
-    return false;
+    return { ok: false, state: 'leftover', working, leftover: left };
   }
   console.log(`✅ Bot 已停止（pid ${pid ?? '?'}${kids.length ? `，連同 ${kids.length} 個子程序` : ''}），沒有殘留程序。`);
-  return true;
+  return { ok: true, state: 'stopped', working };
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,6 +1267,10 @@ function printStatus(s) {
   console.log(`HOME：${s.home}`);
   if (s.running) console.log(`✅ Bot 執行中（pid ${s.pid ?? '?'}）${s.loggedInAs ? `，登入成 ${s.loggedInAs}（ID ${s.botId}）` : '，尚未登入完成'}`);
   else console.log('⏹  Bot 沒有在執行');
+  if (s.running) {
+    if (s.working === null || s.working === undefined) console.log('工作中：無法確認（Bot 還沒登入完成，或是舊版）');
+    else console.log(s.working.length ? `⚙️  正在工作：${workingText(s.working)}` : '工作中：沒有（閒置）');
+  }
   if (s.stalePid) console.log(`⚠️  bot.pid 記錄的程序 ${s.stalePid} 還在，但沒有回應；可能卡住了`);
   const c = s.config;
   if (!c.exists) console.log('❌ 還沒有設定檔（請執行 setup）');
@@ -1256,6 +1300,16 @@ function printStatus(s) {
 // ---------------------------------------------------------------------------
 // 0.1.8：回報到群組、在電腦上接手、交給手機（經執行中 Bot 的 named pipe；腳本本身不讀 token）
 // ---------------------------------------------------------------------------
+/**
+ * 新討論串之後會不會接著電腦這段對話：以 Bot 的回答為準（0.1.9 起回 continues；Bot 確實記下分支來源才是 true）。
+ * 0.1.8 的 Bot 不回這個欄位，只能用「有開新討論串、也送了 session」推測。
+ */
+export function postContinues(r, sentSessionId) {
+  if (!r?.ok || !r.threadId) return false;
+  if (typeof r.continues === 'boolean') return r.continues;
+  return !!sentSessionId;
+}
+
 /** 經 pipe 送一個 JSON 指令、收一行 JSON 回應；Bot 沒在執行時回傳 null。 */
 export async function pipeJson(pipe, request, timeoutMs = 60000) {
   const r = await pipeRequest(pipe, JSON.stringify(request), timeoutMs);
@@ -1433,13 +1487,14 @@ export const bridgeCommands = {
     const text = readText(opts);
     const files = [].concat(opts.file ?? []).filter((f) => f && f !== true).map((f) => path.resolve(String(f)));
     if (!text.trim() && !files.length) throw new CliError('沒有要貼的內容：用 --text-file <檔案> 或從 stdin 傳文字');
-    const r = await askBot(p, { cmd: 'post', channel, text, files, thread: opt(opts.thread), newThread: opt(opts['new-thread']), sessionId: opt(opts.session) ?? process.env.CLAUDE_CODE_SESSION_ID, cwd: opt(opts.cwd) ?? process.cwd() }, 60000);
+    const sessionId = opt(opts.session) ?? process.env.CLAUDE_CODE_SESSION_ID;
+    const r = await askBot(p, { cmd: 'post', channel, text, files, thread: opt(opts.thread), newThread: opt(opts['new-thread']), sessionId, cwd: opt(opts.cwd) ?? process.cwd() }, 60000);
     if (opts.json) return console.log('RESULT ' + JSON.stringify(r));
     if (!r.ok) throw new CliError(`沒有貼出去：${r.error}`);
     console.log(`✅ 已貼到 ${r.where}`);
     console.log(`連結：${r.url}`);
     for (const x of r.rejected ?? []) console.log(`⚠️  沒附上：${x}`);
-    if (r.threadId) console.log('之後在那個討論串 @ Bot，就會接著這段對話（從這裡的對話複製一份）。');
+    if (postContinues(r, sessionId)) console.log('之後在那個討論串 @ Bot，就會接著這段對話（從這裡的對話複製一份）。');
   },
   async sessions(p, opts) {
     const r = await askBot(p, { cmd: 'sessions' }, 15000);
@@ -1503,6 +1558,152 @@ export const bridgeCommands = {
     console.log('   ⚠️ 請關掉電腦上的這個對話（/exit），不要再在這裡繼續，避免兩邊同時寫入。');
   },
 };
+
+// ---------------------------------------------------------------------------
+// 0.1.9：一次處理這台電腦上的所有 Bot（start／stop／status --all）
+// 每隻 Bot 仍是自己的 HOME、自己的程序；這裡只是用 homes 的清單逐一執行，某一隻失敗不影響其他隻。
+// ---------------------------------------------------------------------------
+const ALL_ACTIONS = {
+  start: (p, opts) => start(p, { wait: opts.wait === undefined || opts.wait === true ? READY_WAIT_S : Number(opts.wait), update: !opts['no-update'] }),
+  stop: (p) => stop(p),
+  async status(p, opts) {
+    const s = await getStatus(p);
+    if (!opts.json) printStatus(s);
+    return { ok: true, state: s.running ? 'running' : 'stopped', working: s.working, status: s };
+  },
+};
+
+/** 一行總結（--all 的最後一行）。 */
+export function allSummary(cmd, results) {
+  if (!results.length) return '總結：這台電腦上沒有 channelcollab 的 Bot。';
+  const names = (rows) => rows.map((r) => r.name).join('、');
+  const parts = [];
+  const add = (label, rows) => {
+    if (rows.length) parts.push(`${label} ${rows.length}（${names(rows)}）`);
+  };
+  const ok = (states) => results.filter((r) => r.ok && states.includes(r.state));
+  if (cmd === 'status') {
+    add('執行中', ok(['running']));
+    add('沒有執行', ok(['stopped']));
+  } else if (cmd === 'start') {
+    add('已上線', ok(['started', 'launched']));
+    add('原本就在執行', ok(['running']));
+  } else {
+    add('已停止', ok(['stopped']));
+    add('本來就沒在執行', ok(['not-running']));
+  }
+  add('失敗', results.filter((r) => !r.ok));
+  const busy = results.filter((r) => r.working?.length);
+  const unknown = results.filter((r) => r.working === null);
+  let tail = '';
+  if (busy.length) tail += `；${cmd === 'stop' ? '停止時正在工作' : '正在工作'}：${busy.map((r) => `${r.name}（${workingText(r.working)}）`).join('、')}`;
+  if (unknown.length) tail += `；無法確認是否在工作：${names(unknown)}`;
+  return `總結：${results.length} 隻 Bot，${parts.join('，')}${tail}。`;
+}
+
+/** 對 base（預設 %USERPROFILE%）底下的每個 HOME 執行 start／stop／status。回傳各 HOME 的結果。 */
+export async function runAll(cmd, opts = {}, { base = os.homedir() } = {}) {
+  const action = ALL_ACTIONS[cmd];
+  if (!action) throw new CliError(`--all 只能用在 ${Object.keys(ALL_ACTIONS).join('、')}`);
+  const list = listHomes(base);
+  const results = [];
+  if (!list.length) console.log('這台電腦上沒有 channelcollab 的 Bot（找不到 %USERPROFILE%\\.channelcollab* 的設定）。');
+  for (const [i, h] of list.entries()) {
+    console.log(`${i ? '\n' : ''}=== ${i + 1}/${list.length}　${h.name}（${h.home}）`);
+    let r;
+    try {
+      r = await action(paths(h.home), opts);
+    } catch (e) {
+      const error = e instanceof CliError ? e.message : String(e?.message ?? e);
+      console.log(`❌ ${error}`);
+      r = { ok: false, state: 'error', error };
+    }
+    results.push({ home: h.home, name: h.name, ...r });
+  }
+  console.log(`\n${allSummary(cmd, results)}`);
+  if (opts.json) console.log('RESULT ' + JSON.stringify(results));
+  process.exitCode = results.some((r) => !r.ok) ? 1 : 0;
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// 0.1.9：「啟動全部 Bot.bat」「停止全部 Bot.bat」（放在預設 HOME 的 launchers 資料夾）
+// ---------------------------------------------------------------------------
+export const ALL_LAUNCHER_NAMES = { start: '啟動全部 Bot.bat', stop: '停止全部 Bot.bat' };
+
+const isAscii = (x) => /^[\x20-\x7e]*$/.test(x);
+
+/**
+ * .bat 裡用的路徑，只用 ASCII：開頭是使用者資料夾等時換成 %USERPROFILE% 之類的環境變數（雙擊時由系統帶入）。
+ * 換完還有非 ASCII 字元時回傳 null。
+ */
+export function batAsciiPath(file, env = process.env) {
+  const f = path.resolve(String(file));
+  const esc = (x) => x.replace(/%/g, '%%');
+  if (isAscii(f)) return esc(f);
+  for (const k of ['LOCALAPPDATA', 'APPDATA', 'USERPROFILE', 'ProgramFiles(x86)', 'ProgramFiles']) {
+    const v = env[k];
+    if (!v) continue;
+    const rel = path.relative(path.resolve(v), f);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+    if (isAscii(rel)) return `%${k}%\\${esc(rel)}`;
+  }
+  return null;
+}
+
+/** HOME 資料夾名稱能不能直接寫進 .bat（英數字等 ASCII，沒有 % 和 "）。 */
+const batSafeName = (n) => /^[\x21-\x7e][\x20-\x7e]*$/.test(n) && !/[%"]/.test(n);
+
+/**
+ * 「全部」捷徑的內容。**只有 ASCII**：.cmd 裡有中文時，即使先 chcp 65001，cmd 也可能把指令從中間切斷（見 RESUME_SCRIPT）。
+ * 總控複本的路徑寫成 %USERPROFILE%\<HOME 資料夾>\runtime\ctl.mjs；要處理哪些 HOME，由 ctl 執行時用 homes 的規則自己找。
+ */
+export function allLauncherBat(action, { homeDir = '.channelcollab', nodePath = process.execPath, env = process.env } = {}) {
+  if (!ALL_LAUNCHER_NAMES[action]) throw new CliError(`沒有「全部」的 ${action} 捷徑`);
+  if (!batSafeName(homeDir)) throw new CliError(`HOME 資料夾名稱要是英數字：${homeDir}`);
+  const node = batAsciiPath(nodePath, env);
+  return [
+    '@echo off',
+    'chcp 65001 >nul',
+    `title channelcollab: ${action} all bots`,
+    `set "CC_NODE=${node ?? 'node'}"`,
+    'if not exist "%CC_NODE%" set "CC_NODE=node"',
+    `set "CC_CTL=%USERPROFILE%\\${homeDir}\\runtime\\ctl.mjs"`,
+    'if exist "%CC_CTL%" goto run',
+    'echo channelcollab: control script not found: "%CC_CTL%"',
+    'echo Start a bot once with /channelcollab:start in Claude Code, then create this shortcut again.',
+    'goto end',
+    ':run',
+    `"%CC_NODE%" "%CC_CTL%" ${action} --all`,
+    ':end',
+    'echo.',
+    'pause',
+    '',
+  ].join('\r\n');
+}
+
+/**
+ * 在預設 HOME 的 launchers 資料夾建「啟動全部 Bot.bat」「停止全部 Bot.bat」。各 Bot 自己的捷徑檔名不同，不會被覆蓋。
+ * 執行用的 ctl.mjs：預設 HOME 有 runtime 就用它的，否則用第一個資料夾名稱是英數字、有 runtime 的 HOME。
+ */
+export function makeAllLaunchers({ base = os.homedir(), nodePath = process.execPath, env = process.env } = {}) {
+  const def = paths(path.join(base, '.channelcollab'));
+  const homes = listHomes(base).map((h) => paths(h.home));
+  const candidates = [def, ...homes.filter((h) => h.home.toLowerCase() !== def.home.toLowerCase())];
+  const host = candidates.find((h) => batSafeName(path.basename(h.home)) && runtimeState(h).installed);
+  if (!host) throw new CliError('找不到已安裝 runtime 的 Bot。請先啟動過一次 Bot（/channelcollab:start），再建立「全部」捷徑。');
+  if (!foreignRuntime(host)) syncCtl(host);
+  if (!fs.existsSync(host.ctl)) throw new CliError(`找不到 ${host.ctl}。請先啟動過一次 Bot（/channelcollab:start）。`);
+  const dir = path.join(def.home, 'launchers');
+  fs.mkdirSync(dir, { recursive: true });
+  const files = [];
+  for (const action of Object.keys(ALL_LAUNCHER_NAMES)) {
+    const file = path.join(dir, ALL_LAUNCHER_NAMES[action]);
+    fs.writeFileSync(file, allLauncherBat(action, { homeDir: path.basename(host.home), nodePath, env }), 'ascii');
+    files.push(file);
+  }
+  return { files, ctl: host.ctl, homes: homes.length, nodeFromPath: batAsciiPath(nodePath, env) === null };
+}
 
 // ---------------------------------------------------------------------------
 // 參數與子命令
@@ -1613,7 +1814,7 @@ const commands = {
     console.log(v === 'on' ? '✅ 白名單已開啟：只有主人和名冊上的人、Bot 能叫 Bot。' : '⚠️ 白名單已關閉：伺服器裡任何人都能叫 Bot（權限核准仍只有主人能按）。');
   },
   async start(p, opts) {
-    await start(p, { wait: opts.wait === undefined ? READY_WAIT_S : Number(opts.wait), update: !opts['no-update'] });
+    await ALL_ACTIONS.start(p, opts);
   },
   async stop(p) {
     await stop(p);
@@ -1625,6 +1826,16 @@ const commands = {
   },
   ...bridgeCommands,
   async shortcut(p, opts) {
+    if (opts.all) {
+      const r = makeAllLaunchers();
+      console.log('✅ 已建立一次處理所有 Bot 的雙擊檔（各 Bot 自己的捷徑不變）：');
+      for (const f of r.files) console.log(`  - ${f}`);
+      console.log(`   目前這台電腦上有 ${r.homes} 隻 Bot；之後新增的 Bot 也會自動包含在內（雙擊時才找）。`);
+      console.log(`   使用的總控：${r.ctl}`);
+      if (r.nodeFromPath) console.log('   ⚠️ node 的路徑含非英數字，捷徑改用 PATH 上的 node。');
+      console.log('   想放到桌面的話，可以對檔案按右鍵「傳送到 → 桌面 (建立捷徑)」。');
+      return;
+    }
     const { files, removed } = makeLaunchers(p, typeof opts.dir === 'string' ? opts.dir : undefined, { name: opt(opts.name) });
     console.log('✅ 已建立雙擊用的檔案：');
     for (const f of files) console.log(`  - ${f}`);
@@ -1742,9 +1953,9 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
                                           加進名冊；名字和是不是 Bot 用自己 Bot 的 token 向 Discord 查
   roster remove <Discord ID>              從名冊移除
   roster import <檔案> [--theirs]         合併別人給的名冊（同一個 ID 預設保留自己的）
-  start [--wait <秒>] [--no-update]       在背景啟動 Bot，等它上線
-  stop                                    停止 Bot，並確認沒有殘留程序
-  status [--json]                         Bot 是否在跑、登入成誰、綁定、最近錯誤
+  start [--wait <秒>] [--no-update] [--all]  在背景啟動 Bot，等它上線（--all：這台電腦上的每一隻）
+  stop [--all]                            停止 Bot，並確認沒有殘留程序（會先列出正在工作的對話）
+  status [--json] [--all]                 Bot 是否在跑、是否正在工作、登入成誰、綁定、最近錯誤
   homes [--json]                          列出這台電腦上的 Bot（各 HOME 與 Bot 名稱）
   targets [--json]                        這隻 Bot 可以貼文的頻道（要 Bot 在執行）
   post --channel <頻道 ID 或名稱> [--thread <討論串 ID>] [--new-thread <標題>] [--file <檔案>]...
@@ -1755,9 +1966,11 @@ const HELP = `用法：node channelcollab.mjs <子命令> [選項] [--home <路�
   handoff [--session <ID>] [--channel <頻道> --title <標題>] [--summary-file <檔案>]
                                           把電腦上的這個 session 交給 Bot（預設私訊；--channel 開新討論串）
   shortcut [--dir <資料夾>] [--name <名稱>]  產生雙擊用的啟動／停止／PIN／解除鎖定 .bat，檔名帶 Bot 名稱（預設放桌面）
+  shortcut --all                          在預設 HOME 的 launchers 資料夾產生「啟動全部 Bot.bat」「停止全部 Bot.bat」
   --self-test                             自我測試
 
-HOME：--home 優先，其次 CHANNELCOLLAB_HOME，預設 %USERPROFILE%\\.channelcollab`;
+HOME：--home 優先，其次 CHANNELCOLLAB_HOME，預設 %USERPROFILE%\\.channelcollab
+--all：%USERPROFILE% 底下所有 .channelcollab* 的 HOME（和 homes 相同），逐一處理，某一隻失敗不影響其他隻`;
 
 // ---------------------------------------------------------------------------
 // 自我測試（不需要 token、不連網路、不啟動 Bot）
@@ -2281,6 +2494,199 @@ async function selfTest() {
     eq(path.basename(findLauncher(legacy, 'set-pin')), LAUNCHER_NAMES['set-pin']);
   });
 
+  console.log('0.1.9：--all（多隻 Bot 一次處理，假的 HOME）');
+  {
+    const capture = async (fn) => {
+      const lines = [];
+      const orig = console.log;
+      console.log = (...a) => lines.push(a.join(' '));
+      try {
+        return { r: await fn(), out: lines.join('\n') };
+      } finally {
+        console.log = orig;
+      }
+    };
+    // 路徑含中文與空白（和使用者資料夾可能的樣子一樣）。
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cc 測試 使用者 '));
+    const home = (n) => paths(path.join(base, n));
+    const writeCfg = (p, token) => writeJson(p.config, { discord: { ...(token ? { token } : {}), owner_id: CH }, channels: {}, defaults: {} });
+    // runtimeState.installed 成立的假 runtime：bot.mjs 由測試指定（不會連 Discord）。
+    const fakeRuntime = (p, botCode) => {
+      fs.mkdirSync(path.join(p.runtime, 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true });
+      fs.writeFileSync(path.join(p.runtime, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), '{}');
+      writeJson(p.version, { version: '0.0.0-test', hash: 'fake' });
+      fs.writeFileSync(p.bot, botCode);
+    };
+    const A = home('.channelcollab'); // 執行中、正在私訊裡工作
+    const B = home('.channelcollab-b'); // 沒有 token
+    const C = home('.channelcollab-c'); // 啟動失敗
+    const reset = () => (process.exitCode = 0);
+
+    await t('0 個 HOME：每個指令都只說沒有 Bot，結果是空陣列', async () => {
+      for (const cmd of ['start', 'stop', 'status']) {
+        const { r, out } = await capture(() => runAll(cmd, { json: true }, { base }));
+        eq(r, []);
+        if (!/沒有 channelcollab 的 Bot/.test(out) || !/RESULT \[\]/.test(out)) throw new Error(out);
+      }
+      reset();
+    });
+
+    await t('1 個 HOME（沒有 token）：start --all 記成失敗、不丟錯；status --all 照常', async () => {
+      writeCfg(B, null);
+      const { r, out } = await capture(() => runAll('start', { wait: '2', 'no-update': true }, { base }));
+      eq(r.length, 1);
+      eq([r[0].ok, r[0].state], [false, 'error']);
+      if (!/沒有 Bot token/.test(r[0].error) || !/總結：1 隻 Bot，失敗 1/.test(out)) throw new Error(out);
+      eq(process.exitCode, 1);
+      const st = await capture(() => runAll('status', { json: true }, { base }));
+      eq([st.r[0].ok, st.r[0].state], [true, 'stopped']);
+      reset();
+    });
+
+    writeCfg(C, FAKE);
+    fakeRuntime(C, "console.error('fake bot: cannot log in'); process.exit(3);\n");
+    await t('2 個 HOME（一隻沒 token、一隻啟動失敗）：兩隻都處理、都回報，stop --all 照常', async () => {
+      const { r, out } = await capture(() => runAll('start', { wait: '20', 'no-update': true, json: true }, { base }));
+      eq(r.map((x) => [path.basename(x.home), x.ok, x.state]), [['.channelcollab-b', false, 'error'], ['.channelcollab-c', false, 'failed']]);
+      if (!/=== 1\/2/.test(out) || !/=== 2\/2/.test(out) || !/fake bot: cannot log in/.test(out)) throw new Error(out);
+      eq(JSON.parse(out.split('\n').pop().slice(7)).length, 2);
+      eq(process.exitCode, 1);
+      reset();
+      const st = await capture(() => runAll('stop', {}, { base }));
+      eq(st.r.map((x) => x.state), ['not-running', 'not-running']);
+      if (!/總結：2 隻 Bot，本來就沒在執行 2（channelcollab-b、channelcollab-c）。/.test(st.out)) throw new Error(st.out);
+      eq(process.exitCode, 0);
+    });
+
+    // A：假的執行中 Bot（另一個 node 程序佔住 A 的 named pipe，回答 working 和 stop）。
+    writeCfg(A, FAKE);
+    fakeRuntime(A, '');
+    const pipe = stopPipe(A.home);
+    const server = path.join(base, 'fake-bot-server.mjs');
+    fs.writeFileSync(server, [
+      "import net from 'node:net';",
+      "import fs from 'node:fs';",
+      'const [pipe, log, pidFile] = process.argv.slice(2);',
+      "fs.writeFileSync(log, `[00:00:00.000] [start] pid=${process.pid}\\n[00:00:00.001] [ready] logged in as FakeBot#0 id=123456789012345670\\n`);",
+      'fs.writeFileSync(pidFile, String(process.pid));',
+      'const srv = net.createServer((sock) => {',
+      "  sock.setEncoding('utf8');",
+      "  let buf = '';",
+      "  sock.on('data', (d) => {",
+      '    buf += d;',
+      "    const nl = buf.indexOf('\\n');",
+      '    if (nl < 0) return;',
+      '    const line = buf.slice(0, nl).trim();',
+      "    if (line === 'stop') { sock.end(`stopping pid=${process.pid}\\n`); srv.close(); setTimeout(() => process.exit(0), 100); return; }",
+      "    if (line === 'pin-state') return void sock.end('{}\\n');",
+      "    let o = null; try { o = JSON.parse(line); } catch {}",
+      "    if (o?.cmd === 'working') return void sock.end(JSON.stringify({ ok: true, working: [{ key: 'dm', kind: 'dm', name: '私訊' }] }) + '\\n');",
+      "    sock.end('unknown command\\n');",
+      '  });',
+      '});',
+      "srv.listen(pipe, () => console.log('listening'));",
+    ].join('\n'));
+    // 假的 stop.mjs：照 runtime 的 stop 送 stop、等程序結束。
+    fs.writeFileSync(A.stop, [
+      "import net from 'node:net';",
+      `const pipe = ${JSON.stringify(pipe)};`,
+      "const answer = await new Promise((res) => { let a = ''; const s = net.connect(pipe, () => s.write('stop\\n')); s.setEncoding('utf8'); s.on('data', (d) => (a += d)); s.on('end', () => res(a.trim())); s.on('error', () => res('')); });",
+      'console.log(`bot: ${answer}`);',
+      'const pid = Number(/pid=(\\d+)/.exec(answer)?.[1]);',
+      'const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };',
+      'const end = Date.now() + 10000;',
+      'while (pid && alive() && Date.now() < end) await new Promise((r) => setTimeout(r, 100));',
+      'console.log(`pid ${pid} exited`);',
+    ].join('\n'));
+    const child = spawn(process.execPath, [server, pipe, A.log, A.pid], { stdio: ['ignore', 'pipe', 'inherit'], windowsHide: true });
+    await new Promise((res, rej) => {
+      child.stdout.once('data', res);
+      child.once('exit', () => rej(new Error('假的 Bot 沒有啟動')));
+    });
+
+    await t('3 個 HOME：start --all 逐一處理，沒 token、啟動失敗都不影響其他隻，最後一行總結', async () => {
+      const { r, out } = await capture(() => runAll('start', { wait: '20', 'no-update': true }, { base }));
+      eq(r.map((x) => [path.basename(x.home), x.ok, x.state]), [['.channelcollab', true, 'running'], ['.channelcollab-b', false, 'error'], ['.channelcollab-c', false, 'failed']]);
+      if (!/已經在執行中/.test(out) || !/程序已結束（代碼 3）/.test(out)) throw new Error(out);
+      if (!/總結：3 隻 Bot，原本就在執行 1（FakeBot），失敗 2（channelcollab-b、channelcollab-c）/.test(out)) throw new Error(out.split('\n').pop());
+      eq(process.exitCode, 1);
+      reset();
+    });
+
+    await t('status --all --json：每隻一筆，執行中的那隻列出正在工作的對話', async () => {
+      const { r, out } = await capture(() => runAll('status', { json: true }, { base }));
+      const last = out.split('\n').pop();
+      if (!last.startsWith('RESULT ')) throw new Error(last);
+      const rows = JSON.parse(last.slice(7));
+      eq(rows.map((x) => [x.name, x.state]), [['FakeBot', 'running'], ['channelcollab-b', 'stopped'], ['channelcollab-c', 'stopped']]);
+      eq(rows[0].working, [{ key: 'dm', kind: 'dm', name: '私訊' }]);
+      eq(rows[0].status.loggedInAs, 'FakeBot#0');
+      if (JSON.stringify(rows).includes(FAKE)) throw new Error('輸出含 token');
+      if (!/正在工作：FakeBot（私訊）/.test(out)) throw new Error(out);
+      eq(r.length, 3);
+      reset();
+    });
+
+    await t('stop --all：正在工作的照一般停止處理，並清楚列出哪一隻在哪裡工作', async () => {
+      const { r, out } = await capture(() => runAll('stop', {}, { base }));
+      eq(r.map((x) => [x.name, x.ok, x.state]), [['FakeBot', true, 'stopped'], ['channelcollab-b', true, 'not-running'], ['channelcollab-c', true, 'not-running']]);
+      eq(r[0].working, [{ key: 'dm', kind: 'dm', name: '私訊' }]);
+      if (!/Bot 正在工作：私訊。照一般停止處理/.test(out)) throw new Error(out);
+      if (!/總結：3 隻 Bot，已停止 1（FakeBot），本來就沒在執行 2（channelcollab-b、channelcollab-c）；停止時正在工作：FakeBot（私訊）。/.test(out)) throw new Error(out.split('\n').pop());
+      eq(await pipeAlive(pipe), false);
+      reset();
+    });
+    if (child.exitCode === null) child.kill();
+
+    await t('「全部」捷徑：只有 ASCII、放在預設 HOME 的 launchers、不動各 Bot 自己的捷徑', () => {
+      const launchers = path.join(A.home, 'launchers');
+      fs.mkdirSync(launchers, { recursive: true });
+      const own = path.join(launchers, '啟動 FakeBot.bat');
+      fs.writeFileSync(own, launcherBat(A, 'start'), 'utf8');
+      const before = fs.readFileSync(own, 'utf8');
+      const env = { USERPROFILE: base, LOCALAPPDATA: path.join(base, 'AppData', 'Local') };
+      const r = makeAllLaunchers({ base, nodePath: path.join(base, 'AppData', 'Local', 'node', 'node.exe'), env });
+      eq(r.files.map((f) => path.basename(f)), Object.values(ALL_LAUNCHER_NAMES));
+      eq(r.files.map((f) => path.dirname(f)), [launchers, launchers]);
+      eq(r.ctl, A.ctl);
+      eq(r.homes, 3);
+      for (const f of r.files) {
+        const text = fs.readFileSync(f, 'latin1');
+        if (!/^[\x20-\x7e\r\n]*$/.test(text)) throw new Error(`${f} 不是只有 ASCII`);
+        if (!/set "CC_NODE=%LOCALAPPDATA%\\node\\node\.exe"/.test(text)) throw new Error(text);
+        if (!/set "CC_CTL=%USERPROFILE%\\\.channelcollab\\runtime\\ctl\.mjs"/.test(text)) throw new Error(text);
+      }
+      eq(fs.readFileSync(own, 'utf8'), before);
+      eq(fs.existsSync(A.ctl), true);
+      // node 在換不掉的中文路徑時改用 PATH 上的 node；% 要寫成 %%。
+      eq(batAsciiPath('D:\\工具\\node.exe', {}), null);
+      eq(batAsciiPath('C:\\a%b\\node.exe', {}), 'C:\\a%%b\\node.exe');
+      if (!/set "CC_NODE=node"/.test(allLauncherBat('stop', { nodePath: 'D:\\工具\\node.exe', env: {} }))) throw new Error('沒有退回 PATH 上的 node');
+      throws(() => allLauncherBat('stop', { homeDir: '.channelcollab-小明' }), /英數字/);
+    });
+
+    if (process.platform === 'win32') {
+      await t('「全部」捷徑實際用 cmd 執行（使用者資料夾含中文與空白）：找到每一隻並印出總結', () => {
+        const file = path.join(A.home, 'launchers', ALL_LAUNCHER_NAMES.stop);
+        const r = spawnSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', file], { input: '\r\n', encoding: 'utf8', windowsHide: true, env: { ...process.env, USERPROFILE: base }, timeout: 120000 });
+        const out = `${r.stdout}${r.stderr}`;
+        if (!/總結：3 隻 Bot，本來就沒在執行 3/.test(out)) throw new Error(out.slice(-600));
+        if (!out.includes(base)) throw new Error('輸出裡沒有含中文與空白的 HOME 路徑');
+      });
+    }
+
+    await t('post：只有 Bot 確實記下分支來源時，才說「之後在那個討論串 @ Bot 會接著」', () => {
+      eq(postContinues({ ok: true, threadId: '1', continues: true }, 'sid'), true);
+      eq(postContinues({ ok: true, threadId: '1', continues: false }, 'sid'), false);
+      eq(postContinues({ ok: true, threadId: '1', continues: false }, undefined), false);
+      eq(postContinues({ ok: true, url: 'u' }, 'sid'), false); // 沒開新討論串
+      // 0.1.8 的 Bot 不回 continues：有送 session 才推測會接上
+      eq(postContinues({ ok: true, threadId: '1' }, undefined), false);
+      eq(postContinues({ ok: true, threadId: '1' }, 'sid'), true);
+    });
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+
   console.log('Node 版本');
   await t('主版本解析', () => {
     eq(nodeMajor('v22.22.0'), 22);
@@ -2296,6 +2702,12 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts['self-test']) return selfTest();
   const cmd = opts._[0];
+  if (opts.all && cmd !== 'shortcut') {
+    if (!ALL_ACTIONS[cmd]) throw new CliError(`--all 只能用在 start、stop、status、shortcut（收到：${cmd ?? '沒有子命令'}）`);
+    if (opts.home && opts.home !== true) throw new CliError('--all 和 --home 不能一起用：--all 會處理這台電腦上所有的 Bot');
+    await runAll(cmd, opts);
+    return;
+  }
   if (!commands[cmd]) {
     console.log(HELP);
     process.exitCode = cmd ? 2 : 0;

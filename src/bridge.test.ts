@@ -72,6 +72,7 @@ const ctl = (await import(CTL)) as unknown as {
   cleanEnv: (env: NodeJS.ProcessEnv) => Record<string, string | undefined>;
   parseArgs: (argv: string[]) => Record<string, unknown>;
   listHomes: (base: string) => { home: string; name: string }[];
+  workingNow: (p: unknown, timeoutMs?: number) => Promise<{ key: string; kind: string; name: string }[] | null>;
 };
 
 let pass = 0;
@@ -280,11 +281,22 @@ await t('開新討論串：Bot 開的、內容在討論串裡；記下要從哪�
   eq(ts.sessionId, undefined, '還沒複製');
   eq(!!ts.lastSeenMessageId, true);
   has((r as { where: string }).where, '新討論串「本週進度」');
+  eq((r as { continues: boolean }).continues, true, '會接上 session');
+  has(session.postedText(r as { where: string; url: string; continues: boolean }), 'continue from a copy of this conversation');
+});
+await t('開新討論串但沒有 session 可以接：continues=false，工具回覆不說「之後 @ Bot 會接著」', async () => {
+  const r = await post.postReport(C, { channel: CH, text: '沒有 session', newThread: '單純回報', source: { kind: 'dm' } });
+  eq(r.ok, true);
+  eq((r as { continues: boolean }).continues, false);
+  eq(state.getThread((r as { threadId: string }).threadId)?.forkFrom, undefined);
+  has(session.postedText(r as { where: string; url: string; continues: boolean }), 'continue from', false);
+  has(session.postedText(r as { where: string; url: string; continues: boolean }, ['x：禁區']), 'Not attached: x：禁區');
 });
 await t('既有的討論串（在綁定頻道底下）可以貼', async () => {
   const r = await post.postReport(C, { channel: CH, thread: THREAD, text: '補充', source: { kind: 'thread', threadId: THREAD } });
   eq(r.ok, true);
   has(existing.sent.at(-1)?.content, '補充');
+  eq((r as { continues: boolean }).continues, false, '既有的討論串不接 session');
 });
 
 console.log('控制通道（named pipe）');
@@ -331,6 +343,23 @@ await t('post（電腦上）：經 pipe 請 Bot 發文，印出連結；附檔�
   has(th.sent[0].content, `📣 由 <@${OWNER}> 在電腦上的工作回報\n測試回報`);
   eq((th.sent[0].files ?? []).length, 1, '只附上工作資料夾的檔案');
   eq(state.getThread(th.id)?.forkFrom, { sessionId: CLI_SID, cwd: OTHER });
+  has(out, '之後在那個討論串 @ Bot，就會接著這段對話');
+});
+await t('post 開新討論串但接不上 session（沒給 --session、或找不到那個 session）：不印「之後 @ Bot 會接著」，也不記分支來源', async () => {
+  const saved = process.env.CLAUDE_CODE_SESSION_ID;
+  delete process.env.CLAUDE_CODE_SESSION_ID;
+  try {
+    const out1 = await run('post', { channel: 'planning', 'new-thread': '沒給 session', 'text-file': path.join(HOME, 'note.txt'), cwd: OTHER });
+    has(out1, '✅ 已貼到');
+    has(out1, '之後在那個討論串 @ Bot', false);
+    eq(state.getThread([...threads.values()].find((x) => x.name === '沒給 session')!.id)?.forkFrom, undefined);
+    const out2 = await run('post', { channel: 'planning', 'new-thread': '找不到的 session', 'text-file': path.join(HOME, 'note.txt'), session: '99999999-9999-4999-8999-999999999999', cwd: OTHER });
+    has(out2, '✅ 已貼到');
+    has(out2, '之後在那個討論串 @ Bot', false);
+    eq(state.getThread([...threads.values()].find((x) => x.name === '找不到的 session')!.id)?.forkFrom, undefined);
+  } finally {
+    if (saved !== undefined) process.env.CLAUDE_CODE_SESSION_ID = saved;
+  }
 });
 await t('post 到沒綁定的頻道：腳本報錯，不發文', async () => {
   let err = '';
@@ -364,6 +393,23 @@ await t('Claude 正在工作時不能接手', async () => {
   release();
   await tick();
   eq(state.getThread(THREAD)?.takeover, undefined);
+});
+await t('working（0.1.9）：列出正在工作的對話（第一輪還沒有 session ID 的討論串、私訊都算）；閒置時是空的', async () => {
+  eq(await ctl.workingNow(P), []);
+  const NEW = '987654321098765432';
+  let r1!: () => void;
+  let r2!: () => void;
+  queue.enqueue(NEW, () => new Promise<void>((r) => (r1 = r)));
+  queue.enqueue('dm', () => new Promise<void>((r) => (r2 = r)));
+  await tick();
+  const w = (await ctl.workingNow(P)) ?? [];
+  eq(w.map((x) => x.key).sort(), ['dm', NEW].sort());
+  eq(w.find((x) => x.key === 'dm')?.name, '私訊');
+  eq(w.find((x) => x.key === NEW)?.name, `討論串 ${NEW}`);
+  r1();
+  r2();
+  await tick();
+  eq(await ctl.workingNow(P), []);
 });
 await t('接手：標記成接手中、Bot 不能再開這個 session、討論串發一則說明；回傳 session、cwd、啟動器', async () => {
   const out = await run('takeover', { key: THREAD, 'no-window': true });

@@ -258,7 +258,7 @@ PIN 是主人在 Discord 上按「允許」、以及用私訊時要輸入的密�
 
 ## 共用步驟：捷徑
 
-執行總控 `shortcut`，在桌面建立四個檔案，**檔名帶 Bot 名稱**（同一台電腦有好幾隻 Bot 也不會互相覆蓋）：「啟動 <Bot 名稱>.bat」「停止 <Bot 名稱>.bat」「設定 <Bot 名稱> PIN.bat」「解除 <Bot 名稱> 鎖定.bat」（後兩個：設定或更換 PIN；PIN 輸錯 3 次被鎖定時解除）。使用者想放別的資料夾時加 `--dir "<資料夾>"`。把腳本印出的完整路徑告訴使用者。之後有兩種方式啟動、停止 Bot，效果一樣：
+執行總控 `shortcut`，在桌面建立四個檔案，**檔名帶 Bot 名稱**（同一台電腦有好幾隻 Bot 也不會互相覆蓋）：「啟動 <Bot 名稱>.bat」「停止 <Bot 名稱>.bat」「設定 <Bot 名稱> PIN.bat」「解除 <Bot 名稱> 鎖定.bat」（後兩個：設定或更換 PIN；PIN 輸錯 3 次被鎖定時解除）。使用者想放別的資料夾時加 `--dir "<資料夾>"`。把腳本印出的完整路徑告訴使用者。這台電腦上有兩隻以上的 Bot（`homes`）時，問使用者要不要另外建「一次處理全部」的捷徑：`shortcut --all` 會在 `%USERPROFILE%\.channelcollab\launchers` 建「啟動全部 Bot.bat」「停止全部 Bot.bat」（不放桌面，也不會動各 Bot 自己的捷徑）。之後有兩種方式啟動、停止 Bot，效果一樣：
 
 - 雙擊「啟動／停止 <Bot 名稱>」，看到結果後按任意鍵關閉視窗；
 - 在 Claude Code 輸入 `/channelcollab:start`、`/channelcollab:stop`。
